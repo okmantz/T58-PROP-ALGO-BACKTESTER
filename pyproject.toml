@@ -1,0 +1,17 @@
+[project]
+name = "t58-prop-algo-backtester"
+version = "0.1.0"
+description = "MVP desktop app for backtesting trading strategies against prop-firm evaluation rules and estimating probability of pass/payout via Monte Carlo simulation."
+authors = [{name = "T58 Trading"}]
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0"
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

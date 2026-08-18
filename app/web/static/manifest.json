@@ -1,0 +1,14 @@
+{
+  "name": "T58 Prop Algo Backtester",
+  "short_name": "T58 Backtester",
+  "description": "Backtest strategies against prop-firm rules and estimate pass/payout probability via Monte Carlo simulation.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d0d0d",
+  "theme_color": "#111111",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

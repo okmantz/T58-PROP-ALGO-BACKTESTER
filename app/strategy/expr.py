@@ -76,7 +76,3 @@ def safe_eval_bool(frame: pd.DataFrame, expr: str, field_name: str) -> pd.Series
     if not isinstance(result, pd.Series):
         result = pd.Series(result, index=frame.index)
     return result.fillna(False).astype(bool)
-        result = frame.eval(expr, engine="python")
-    except Exception as exc:  # noqa: BLE001
-        raise StrategyError(f"Failed to evaluate expression '{expr}' ({field_name}): {exc}") from exc
-    return result.fillna(False).astype(bool)

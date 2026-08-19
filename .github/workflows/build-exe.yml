@@ -29,12 +29,61 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed `
             --name T58-Prop-Algo-Backtester `
             --add-data "data/examples;data/examples" `
+            --add-data "data/raw;data/raw" `
             app/main.py
 
       - name: Create application package
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force release -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force -Path release
+          New-Item -ItemType Directory -Force -Path release\data
+          New-Item -ItemType Directory -Force -Path release\data\examples
+          New-Item -ItemType Directory -Force -Path release\data\raw
+
+          Copy-Item `
+            "dist\T58-Prop-Algo-Backtester.exe" `
+            "release\T58-Prop-Algo-Backtester.exe"
+
+          if (Test-Path "data\examples") {
+            Copy-Item `
+              "data\examples\*" `
+              "release\data\examples\" `
+              -Recurse `
+              -Force
+          }
+
+          if (Test-Path "data\raw") {
+            Copy-Item `
+              "data\raw\*" `
+              "release\data\raw\" `
+              -Recurse `
+              -Force
+          }
+
+          Write-Host "=== PACKAGED FILES ==="
+          Get-ChildItem release -Recurse | Select-Object FullName, Length
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "release\*" `
+            -DestinationPath "T58-Prop-Algo-Backtester-Windows.zip" `
+            -Force
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: T58-Prop-Algo-Backtester-Windows
+          path: T58-Prop-Algo-Backtester-Windows.zip
+
+      - name: Attach Windows application to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: T58-Prop-Algo-Backtester-Windows.zip          Remove-Item -Recurse -Force release -ErrorAction SilentlyContinue
 
           New-Item -ItemType Directory -Force -Path release
           New-Item -ItemType Directory -Force -Path release\data

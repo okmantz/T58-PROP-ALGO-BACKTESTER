@@ -26,10 +26,12 @@ jobs:
 
       - name: Build Windows executable
         run: |
-          pyinstaller --noconfirm --onefile --windowed `
+          pyinstaller --clean --noconfirm --onefile --windowed `
             --name T58-Prop-Algo-Backtester `
             --add-data "data/examples;data/examples" `
             --add-data "data/raw;data/raw" `
+            --hidden-import "app.strategy.expr" `
+            --collect-submodules "app.strategy" `
             app/main.py
 
       - name: Create application package
@@ -63,7 +65,8 @@ jobs:
           }
 
           Write-Host "=== PACKAGED FILES ==="
-          Get-ChildItem release -Recurse | Select-Object FullName, Length
+          Get-ChildItem release -Recurse |
+            Select-Object FullName, Length
 
       - name: Create ZIP
         shell: pwsh

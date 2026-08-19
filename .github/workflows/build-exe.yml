@@ -32,6 +32,8 @@ jobs:
             --add-data "data/raw;data/raw" `
             --hidden-import "app.strategy.expr" `
             --collect-submodules "app.strategy" `
+            --hidden-import "app.ui.main_window" `
+            --collect-submodules "app.ui" `
             app/main.py
 
       - name: Create application package

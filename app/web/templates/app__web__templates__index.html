@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Prop Algo Backtester</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#111111">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    margin: 0; background: #0d0d0d; color: #eee;
+  }
+  header { padding: 18px 16px 8px; border-bottom: 1px solid #262626; }
+  header h1 { font-size: 18px; margin: 0; }
+  header p { margin: 4px 0 0; font-size: 12px; color: #888; }
+  main { padding: 16px; max-width: 640px; margin: 0 auto; }
+  .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #aaa; margin: 0 0 10px; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid #333;
+    background: #0d0d0d; color: #eee; font-size: 15px;
+  }
+  textarea { min-height: 140px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tabs button {
+    flex: 1; min-width: 70px; padding: 10px 6px; border-radius: 8px; border: 1px solid #333;
+    background: #111; color: #ccc; font-size: 13px;
+  }
+  .tabs button.active { background: #eee; color: #111; font-weight: 600; border-color: #eee; }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: none; background: #eee; color: #111;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .headline { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat { background: #0d0d0d; border: 1px solid #262626; border-radius: 10px; padding: 12px; }
+  .stat .label { font-size: 11px; color: #888; text-transform: uppercase; }
+  .stat .value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .links a { display: block; color: #9ecbff; font-size: 14px; margin-top: 8px; text-decoration: none; }
+  details summary { font-size: 13px; color: #999; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>T58 Trading — Prop Algo Backtester</h1>
+  <p>Backtest &rarr; prop-firm simulation &rarr; Monte Carlo probability of passing &amp; getting paid.</p>
+</header>
+<main>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+{% if result %}
+<div class="card">
+  <h2>Result</h2>
+  {% if result.import_note %}
+  <p style="font-size:13px;color:#9ecbff;margin-bottom:10px;">{{ result.import_note }}</p>
+  {% endif %}
+  <p style="font-size:12px;color:#888;margin-bottom:10px;">Ran against: <b>{{ result.active_dataset }}</b></p>
+  <div class="headline">
+    <div class="stat"><div class="label">Eval Pass Probability</div><div class="value">{{ "%.1f"|format(result.eval_pass_prob) }}%</div></div>
+    <div class="stat"><div class="label">First Payout Probability</div><div class="value">{{ "%.1f"|format(result.first_payout_prob) }}%</div></div>
+    <div class="stat"><div class="label">Risk of Ruin</div><div class="value">{{ "%.1f"|format(result.risk_of_ruin) }}%</div></div>
+    <div class="stat"><div class="label">Expected Payout</div><div class="value">${{ "{:,.0f}".format(result.expected_payout) }}</div></div>
+  </div>
+  <p style="font-size:13px;color:#999;margin-top:12px;">
+    {{ result.trades }} historical trades &middot; net profit ${{ "{:,.0f}".format(result.net_profit) }} &middot;
+    win rate {{ "%.1f"|format(result.win_rate) }}% &middot; max DD {{ "%.1f"|format(result.max_dd) }}% &middot;
+    {{ result.n_sims }} Monte Carlo runs
+  </p>
+  <div class="links">
+    <a href="{{ result.report_html }}" target="_blank">Open full HTML report &rarr;</a>
+    <a href="{{ result.report_json }}" target="_blank">Download JSON &rarr;</a>
+    <a href="{{ result.report_csv }}" target="_blank">Download summary CSV &rarr;</a>
+  </div>
+</div>
+{% endif %}
+
+<form method="post" action="/run" enctype="multipart/form-data">
+
+  <div class="card">
+    <h2>1. Market Data</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none, I'm uploading new file(s) below —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }} ({{ (ds.size_bytes / 1024) | round(1) }} KB)</option>
+      {% endfor %}
+    </select>
+    <p style="font-size:12px;color:#888;margin-top:6px;">{{ stored_datasets|length }} dataset(s) currently in data/raw/.</p>
+    {% endif %}
+    <label>Or upload new CSV file(s) (timestamp, open, high, low, close, volume)</label>
+    <input type="file" name="csv_file" accept=".csv" multiple>
+    <p style="font-size:12px;color:#888;margin-top:6px;">
+      You can select multiple files at once. Each one is validated and automatically saved to
+      data/raw/ so it's already there next time you open the app.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>2. Strategy</h2>
+    <div class="tabs" id="strategy-tabs">
+      <button type="button" data-mode="manual" class="active">Manual</button>
+      <button type="button" data-mode="python">Python</button>
+      <button type="button" data-mode="pinescript">PineScript</button>
+      <button type="button" data-mode="mql5">MQL5</button>
+    </div>
+    <input type="hidden" name="strategy_mode" id="strategy_mode" value="manual">
+
+    <div id="manual-fields">
+      <div class="row">
+        <div><label>SMA fast</label><input type="number" name="sma_fast" value="20"></div>
+        <div><label>SMA slow</label><input type="number" name="sma_slow" value="50"></div>
+      </div>
+      <div class="row">
+        <div><label>Stop loss (pips)</label><input type="number" name="sl_pips" value="20"></div>
+        <div><label>Take profit (pips)</label><input type="number" name="tp_pips" value="40"></div>
+      </div>
+    </div>
+
+    <div id="code-fields" style="display:none;">
+      <label>Paste strategy source</label>
+      <textarea name="strategy_code" placeholder="Paste your Python / PineScript / MQL5 strategy here"></textarea>
+    </div>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>3. Prop-Firm Rules</summary>
+      <div class="row">
+        <div><label>Account size ($)</label><input type="number" name="account_size" value="100000"></div>
+        <div><label>Eval profit target (%)</label><input type="number" name="profit_target" value="8"></div>
+      </div>
+      <div class="row">
+        <div><label>Daily loss limit (%)</label><input type="number" name="daily_loss" value="5"></div>
+        <div><label>Max drawdown (%)</label><input type="number" name="max_dd" value="10"></div>
+      </div>
+      <div class="row">
+        <div><label>Drawdown type</label>
+          <select name="dd_type"><option value="trailing">Trailing</option><option value="static">Static</option></select>
+        </div>
+        <div><label>Consistency rule (%)</label><input type="number" name="consistency" value="30"></div>
+      </div>
+      <div class="row">
+        <div><label>Min trading days</label><input type="number" name="min_days" value="5"></div>
+        <div><label>Payout frequency (days)</label><input type="number" name="payout_freq" value="14"></div>
+      </div>
+      <div class="row">
+        <div><label>Payout threshold (%)</label><input type="number" name="payout_threshold" value="0"></div>
+        <div><label>Required buffer (%)</label><input type="number" name="buffer" value="0"></div>
+      </div>
+      <label>Payout cap (% of profit, blank = 100%)</label>
+      <input type="text" name="payout_cap" value="">
+    </details>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>4. Risk &amp; Execution</summary>
+      <div class="row">
+        <div><label>Initial balance ($)</label><input type="number" name="initial_balance" value="100000"></div>
+        <div><label>Risk mode</label>
+          <select name="risk_mode"><option value="percent">Percent</option><option value="fixed">Fixed $</option></select>
+        </div>
+      </div>
+      <div class="row">
+        <div><label>Risk per trade</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
+        <div><label>Max trades/day</label><input type="number" name="max_trades_day" value="10"></div>
+      </div>
+      <div class="row">
+        <div><label>Commission ($)</label><input type="number" step="0.01" name="commission" value="0"></div>
+        <div><label>Slippage (pips)</label><input type="number" step="0.1" name="slippage_pips" value="0.5"></div>
+      </div>
+      <div class="row">
+        <div><label>Spread (pips)</label><input type="number" step="0.1" name="spread_pips" value="1.0"></div>
+        <div><label>Pip size</label><input type="number" step="0.0001" name="pip_size" value="0.0001"></div>
+      </div>
+    </details>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>5. Monte Carlo</summary>
+      <div class="row">
+        <div><label>Simulations</label><input type="number" name="n_sims" value="5000"></div>
+        <div><label>Method</label>
+          <select name="mc_method">
+            <option value="bootstrap">Bootstrap</option>
+            <option value="shuffle">Shuffle</option>
+            <option value="block_bootstrap">Block bootstrap (loss-streak stress)</option>
+          </select>
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <button class="submit-btn" type="submit">Run Full Pipeline</button>
+</form>
+
+</main>
+
+<script>
+  const tabs = document.querySelectorAll('#strategy-tabs button');
+  const modeInput = document.getElementById('strategy_mode');
+  const manualFields = document.getElementById('manual-fields');
+  const codeFields = document.getElementById('code-fields');
+  tabs.forEach(btn => btn.addEventListener('click', () => {
+    tabs.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    modeInput.value = btn.dataset.mode;
+    if (btn.dataset.mode === 'manual') {
+      manualFields.style.display = 'block';
+      codeFields.style.display = 'none';
+    } else {
+      manualFields.style.display = 'none';
+      codeFields.style.display = 'block';
+    }
+  }));
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

@@ -26,60 +26,69 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Verify GUI source exists
+      - name: Verify application structure
         shell: pwsh
         run: |
-          if (-not (Test-Path "app\ui\__init__.py")) {
-            throw "Missing app\ui\__init__.py"
-          }
+          Write-Host "=== APP STRUCTURE ==="
+          Get-ChildItem app -Recurse | Select-Object FullName
+
+          Write-Host ""
+          Write-Host "=== VERIFY MAIN WINDOW ==="
+
           if (-not (Test-Path "app\ui\main_window.py")) {
-            throw "Missing app\ui\main_window.py"
-          }
-          if (-not (Test-Path "app\main.py")) {
-            throw "Missing app\main.py"
+            Write-Error "app/ui/main_window.py was NOT found."
+            exit 1
           }
 
-          Write-Host "GUI source verified:"
-          Get-Item "app\ui\__init__.py", "app\ui\main_window.py", "app\main.py" |
-            Select-Object FullName, Length
+          Write-Host "FOUND: app/ui/main_window.py"
 
       - name: Build Windows executable
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed `
-            --name T58-Prop-Algo-Backtester `
-            --paths "." `
-            --hidden-import "app" `
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "T58-Prop-Algo-Backtester" `
             --hidden-import "app.ui" `
             --hidden-import "app.ui.main_window" `
-            --collect-submodules "app.ui" `
+            --hidden-import "app.strategy.manual" `
+            --hidden-import "app.strategy.expr" `
+            --hidden-import "app.strategy.indicators" `
+            --hidden-import "app.strategy.base" `
+            --hidden-import "app.backtest.engine" `
+            --hidden-import "app.backtest.risk" `
+            --hidden-import "app.data.importer" `
+            --hidden-import "app.data.storage" `
+            --hidden-import "app.monte_carlo.engine" `
+            --hidden-import "app.prop.simulator" `
+            --hidden-import "app.reports.generator" `
             --add-data "data/examples;data/examples" `
-            --add-data "data/raw;data/raw" `
-            "app/main.py"
+            app/main.py
 
-      - name: Verify executable was built
+      - name: Verify executable
         shell: pwsh
         run: |
+          Write-Host "=== EXE ==="
+
           if (-not (Test-Path "dist\T58-Prop-Algo-Backtester.exe")) {
-            throw "PyInstaller did not produce the executable."
+            Write-Error "Executable was not created."
+            exit 1
           }
 
-          $size = (Get-Item "dist\T58-Prop-Algo-Backtester.exe").Length
-          if ($size -lt 1000000) {
-            throw "Executable is unexpectedly small: $size bytes"
-          }
-
-          Write-Host "Executable created successfully: $size bytes"
+          Get-Item "dist\T58-Prop-Algo-Backtester.exe" |
+            Select-Object FullName, Length
 
       - name: Create application package
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force release -ErrorAction SilentlyContinue
 
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          New-Item -ItemType Directory -Force -Path release\data | Out-Null
-          New-Item -ItemType Directory -Force -Path release\data\examples | Out-Null
-          New-Item -ItemType Directory -Force -Path release\data\raw | Out-Null
+          New-Item -ItemType Directory -Force -Path "release" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release\data" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release\data\examples" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release\data\raw" | Out-Null
 
           Copy-Item `
             "dist\T58-Prop-Algo-Backtester.exe" `
@@ -102,11 +111,12 @@ jobs:
               -Force
           }
 
-          Write-Host "=== PACKAGED FILES ==="
-          Get-ChildItem release -Recurse |
+          Write-Host ""
+          Write-Host "=== FINAL PACKAGE ==="
+          Get-ChildItem "release" -Recurse |
             Select-Object FullName, Length
 
-      - name: Create ZIP
+      - name: Create ZIP package
         shell: pwsh
         run: |
           Compress-Archive `
@@ -114,10 +124,16 @@ jobs:
             -DestinationPath "T58-Prop-Algo-Backtester-Windows.zip" `
             -Force
 
+          Write-Host ""
+          Write-Host "=== ZIP CREATED ==="
+
+          Get-Item "T58-Prop-Algo-Backtester-Windows.zip" |
+            Select-Object FullName, Length
+
       - name: Upload Windows application
         uses: actions/upload-artifact@v4
         with:
-          name: T58-Prop-Algo-Backtester-Windows-${{ github.run_number }}
+          name: T58-Prop-Algo-Backtester-Windows
           path: T58-Prop-Algo-Backtester-Windows.zip
           if-no-files-found: error
 

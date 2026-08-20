@@ -11,7 +11,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -19,34 +20,71 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+
+      - name: Verify GUI source exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "app\ui\__init__.py")) {
+            throw "Missing app\ui\__init__.py"
+          }
+          if (-not (Test-Path "app\ui\main_window.py")) {
+            throw "Missing app\ui\main_window.py"
+          }
+          if (-not (Test-Path "app\main.py")) {
+            throw "Missing app\main.py"
+          }
+
+          Write-Host "GUI source verified:"
+          Get-Item "app\ui\__init__.py", "app\ui\main_window.py", "app\main.py" |
+            Select-Object FullName, Length
 
       - name: Build Windows executable
         shell: pwsh
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name T58-Prop-Algo-Backtester `
-            --hidden-import app.ui.main_window `
+            --paths "." `
+            --hidden-import "app" `
+            --hidden-import "app.ui" `
+            --hidden-import "app.ui.main_window" `
+            --collect-submodules "app.ui" `
             --add-data "data/examples;data/examples" `
             --add-data "data/raw;data/raw" `
-            app/main.py
+            "app/main.py"
+
+      - name: Verify executable was built
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\T58-Prop-Algo-Backtester.exe")) {
+            throw "PyInstaller did not produce the executable."
+          }
+
+          $size = (Get-Item "dist\T58-Prop-Algo-Backtester.exe").Length
+          if ($size -lt 1000000) {
+            throw "Executable is unexpectedly small: $size bytes"
+          }
+
+          Write-Host "Executable created successfully: $size bytes"
 
       - name: Create application package
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force release -ErrorAction SilentlyContinue
 
-          New-Item -ItemType Directory -Force -Path release
-          New-Item -ItemType Directory -Force -Path release\data
-          New-Item -ItemType Directory -Force -Path release\data\examples
-          New-Item -ItemType Directory -Force -Path release\data\raw
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          New-Item -ItemType Directory -Force -Path release\data | Out-Null
+          New-Item -ItemType Directory -Force -Path release\data\examples | Out-Null
+          New-Item -ItemType Directory -Force -Path release\data\raw | Out-Null
 
           Copy-Item `
             "dist\T58-Prop-Algo-Backtester.exe" `
-            "release\T58-Prop-Algo-Backtester.exe"
+            "release\T58-Prop-Algo-Backtester.exe" `
+            -Force
 
           if (Test-Path "data\examples") {
             Copy-Item `
@@ -65,7 +103,8 @@ jobs:
           }
 
           Write-Host "=== PACKAGED FILES ==="
-          Get-ChildItem release -Recurse | Select-Object FullName, Length
+          Get-ChildItem release -Recurse |
+            Select-Object FullName, Length
 
       - name: Create ZIP
         shell: pwsh
@@ -78,8 +117,9 @@ jobs:
       - name: Upload Windows application
         uses: actions/upload-artifact@v4
         with:
-          name: T58-Prop-Algo-Backtester-Windows
+          name: T58-Prop-Algo-Backtester-Windows-${{ github.run_number }}
           path: T58-Prop-Algo-Backtester-Windows.zip
+          if-no-files-found: error
 
       - name: Attach Windows application to release
         if: startsWith(github.ref, 'refs/tags/v')

@@ -85,8 +85,10 @@ on Windows or `ifconfig`/`ip addr` on Mac/Linux). From there:
 
 1. **Upload Market Data** — CSV import with auto column-mapping, timestamp/OHLC
    validation, duplicate & gap detection (`app/data/importer.py`). A sample
-   dataset is included at `data/examples/EURUSD_5M_sample.csv`.
-2. **Import/Create a Strategy** — four adapters, all reduced to the same
+   dataset is included at `data/examples/EURUSD_5M_sample.csv`. Historical
+   backtesting datasets for instruments such as XAUUSD, EURUSD, GBPUSD, S&P500,
+   NASDAQ, etc. are also included (`data/raw`).
+3. **Import/Create a Strategy** — four adapters, all reduced to the same
    standardized `-1/0/1` signal series before hitting the backtest engine
    (`app/strategy/`):
    - **Manual Builder** — entry/exit rules, SL/TP, built-in SMA/EMA/WMA/RSI
@@ -98,14 +100,14 @@ on Windows or `ifconfig`/`ip addr` on Mac/Linux). From there:
      each language (see below), not full language implementations.
      Anything outside the supported subset raises a clear, specific
      `StrategyError` instead of silently producing an inaccurate backtest.
-3. **Enter Prop-Firm Rules** — account size, eval profit target, daily loss
+4. **Enter Prop-Firm Rules** — account size, eval profit target, daily loss
    limit, max drawdown (trailing or static), consistency rule, minimum
    trading days, payout threshold/cap/frequency, required buffer, max
    position size (`app/prop/simulator.py::PropRules`).
-4. **Configure Risk & Execution** — fixed-$ or %-of-equity risk per trade,
+5. **Configure Risk & Execution** — fixed-$ or %-of-equity risk per trade,
    max trades/day, commission, slippage, spread, pip size
    (`app/backtest/risk.py::RiskConfig`).
-5. **Backtest -> Prop Simulation -> Monte Carlo -> Report** — one click in
+6. **Backtest -> Prop Simulation -> Monte Carlo -> Report** — one click in
    the GUI/web app's run step, or the `--cli` flag.
 
 ### PineScript support (subset)
@@ -198,6 +200,7 @@ T58-Prop-Algo-Backtester/
 │   ├── monte_carlo/engine.py
 │   └── reports/generator.py     # JSON / CSV / HTML report export
 ├── data/examples/                # sample OHLCV dataset for immediate testing
+├── data/raw/                     # dataset for common forex pairs (1min, 5min, 15min, 1hr, 4hr, and daily timeframes)
 ├── tests/                        # pytest unit tests for every engine
 └── .github/workflows/
     ├── build.yml                 # runs pytest on push/PR

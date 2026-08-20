@@ -1,22 +1,7 @@
-"""
-Persistent local data storage.
-
-Resolves a stable, writable `data/raw/` directory both in normal `python -m
-app.main` development runs and inside a PyInstaller-frozen `.exe`, and
-provides helpers to list and store market-data CSVs there so datasets a
-user has imported (or dropped in manually) are automatically available the
-next time the app starts -- no re-upload needed.
-
-Why this matters for the packaged .exe specifically: PyInstaller's
-`--onefile` build extracts bundled data into a temporary, read-only folder
-(`sys._MEIPASS`) that's wiped after the process exits, so anything written
-there (or expected to already be there, like a hand-placed `data/raw/`
-folder) will not persist and will not be found. This module always resolves
-`data/raw/` next to the actual `.exe` (or, in dev mode, at the project
-root) instead -- a normal, writable, persistent folder on disk.
-"""
+"""Persistent local market-data storage for development and packaged builds."""
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -24,21 +9,47 @@ from pathlib import Path
 
 
 def get_app_base_dir() -> Path:
-    """Directory the app should treat as 'home' for user data.
-
-    - Frozen .exe (PyInstaller): the folder containing the .exe itself.
-    - Normal `python -m app.main` run: the project root.
-    """
+    """Return a writable persistent application-data root."""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        preferred = Path(sys.executable).resolve().parent
+        try:
+            preferred.mkdir(parents=True, exist_ok=True)
+            probe = preferred / ".t58_write_test"
+            probe.touch(exist_ok=True)
+            probe.unlink(missing_ok=True)
+            return preferred
+        except OSError:
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            fallback = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+            return fallback / "T58 Prop Algo Backtester"
     return Path(__file__).resolve().parents[2]
 
 
+def _seed_bundled_raw_data(raw_dir: Path) -> None:
+    """Copy CSVs embedded by PyInstaller into the persistent raw-data folder."""
+    if not getattr(sys, "frozen", False):
+        return
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if not bundle_root:
+        return
+    bundled_raw = Path(bundle_root) / "data" / "raw"
+    if not bundled_raw.exists():
+        return
+    for source in bundled_raw.glob("*.csv"):
+        destination = raw_dir / source.name
+        if not destination.exists():
+            try:
+                shutil.copy2(source, destination)
+            except OSError:
+                continue
+
+
 def get_raw_data_dir() -> Path:
-    """The persistent data/raw/ folder, created if it doesn't exist yet."""
-    d = get_app_base_dir() / "data" / "raw"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """Return the persistent data/raw directory, creating and seeding it."""
+    raw_dir = get_app_base_dir() / "data" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    _seed_bundled_raw_data(raw_dir)
+    return raw_dir
 
 
 @dataclass
@@ -49,14 +60,13 @@ class StoredDataset:
 
 
 def list_stored_datasets() -> list[StoredDataset]:
-    """All CSVs currently sitting in data/raw/, newest first."""
+    """Return all CSVs in data/raw/, newest first."""
     raw_dir = get_raw_data_dir()
     files = sorted(raw_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
     return [StoredDataset(name=f.name, path=f, size_bytes=f.stat().st_size) for f in files]
 
 
 def _unique_destination(raw_dir: Path, filename: str) -> Path:
-    """Avoid clobbering an existing file with different content under the same name."""
     dest = raw_dir / filename
     if not dest.exists():
         return dest
@@ -68,12 +78,12 @@ def _unique_destination(raw_dir: Path, filename: str) -> Path:
 
 
 def store_csv_path(source_path: str | Path) -> Path:
-    """Copy an on-disk CSV into data/raw/ (unless it's already there) and return its stored path."""
+    """Copy an external CSV into persistent data/raw/ unless already there."""
     source_path = Path(source_path)
     raw_dir = get_raw_data_dir()
     try:
         if source_path.resolve().parent == raw_dir.resolve():
-            return source_path  # already stored, nothing to do
+            return source_path
     except OSError:
         pass
     dest = _unique_destination(raw_dir, source_path.name)
@@ -82,7 +92,7 @@ def store_csv_path(source_path: str | Path) -> Path:
 
 
 def store_csv_bytes(content: bytes, filename: str) -> Path:
-    """Write uploaded CSV bytes into data/raw/ and return the stored path."""
+    """Write uploaded CSV bytes into persistent data/raw/."""
     raw_dir = get_raw_data_dir()
     dest = _unique_destination(raw_dir, filename)
     dest.write_bytes(content)

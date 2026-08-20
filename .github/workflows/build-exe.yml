@@ -31,9 +31,195 @@ jobs:
         run: |
           Write-Host "=== VERIFYING REPOSITORY ==="
 
+          if (-not (Test-Path "run_app.py")) {
+            Write-Error "run_app.py was NOT found."
+            exit 1
+          }
+
           if (-not (Test-Path "app\main.py")) {
             Write-Error "app/main.py was NOT found."
             exit 1
+          }
+
+          if (-not (Test-Path "app\ui\main_window.py")) {
+            Write-Error "app/ui/main_window.py was NOT found."
+            exit 1
+          }
+
+          if (-not (Test-Path "app\ui\__init__.py")) {
+            Write-Error "app/ui/__init__.py was NOT found."
+            exit 1
+          }
+
+          if (-not (Test-Path "data\raw")) {
+            Write-Error "data/raw directory was NOT found."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "=== RAW DATA FILES ==="
+
+          $rawFiles = Get-ChildItem "data\raw" -File -ErrorAction SilentlyContinue
+
+          if ($rawFiles.Count -eq 0) {
+            Write-Warning "data/raw exists but contains no files."
+          }
+          else {
+            $rawFiles | Select-Object Name, Length
+          }
+
+          Write-Host ""
+          Write-Host "=== UI FILES ==="
+          Get-ChildItem "app\ui" -Recurse |
+            Select-Object FullName, Length
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "T58-Prop-Algo-Backtester" `
+            --paths . `
+            --hidden-import "app" `
+            --hidden-import "app.ui" `
+            --hidden-import "app.ui.main_window" `
+            --hidden-import "app.strategy" `
+            --hidden-import "app.strategy.manual" `
+            --hidden-import "app.strategy.expr" `
+            --hidden-import "app.strategy.indicators" `
+            --hidden-import "app.strategy.base" `
+            --hidden-import "app.strategy.mql5" `
+            --hidden-import "app.strategy.pinescript" `
+            --hidden-import "app.strategy.python" `
+            --hidden-import "app.backtest" `
+            --hidden-import "app.backtest.engine" `
+            --hidden-import "app.backtest.risk" `
+            --hidden-import "app.backtest.statistics" `
+            --hidden-import "app.backtest.execution" `
+            --hidden-import "app.data" `
+            --hidden-import "app.data.importer" `
+            --hidden-import "app.data.storage" `
+            --hidden-import "app.data.multi_timeframe" `
+            --hidden-import "app.monte_carlo" `
+            --hidden-import "app.monte_carlo.engine" `
+            --hidden-import "app.prop" `
+            --hidden-import "app.prop.simulator" `
+            --hidden-import "app.reports" `
+            --hidden-import "app.reports.generator" `
+            --add-data "data/examples;data/examples" `
+            run_app.py
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          Write-Host "=== VERIFYING EXE ==="
+
+          if (-not (Test-Path "dist\T58-Prop-Algo-Backtester.exe")) {
+            Write-Error "Executable was not created."
+            exit 1
+          }
+
+          $exe = Get-Item "dist\T58-Prop-Algo-Backtester.exe"
+
+          Write-Host "EXE CREATED:"
+          Write-Host "Path: $($exe.FullName)"
+          Write-Host "Size: $($exe.Length) bytes"
+
+      - name: Create application package
+        shell: pwsh
+        run: |
+          Write-Host "=== CREATING RELEASE PACKAGE ==="
+
+          Remove-Item -Recurse -Force "release" -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force -Path "release" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release\data" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release\data\examples" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release\data\raw" | Out-Null
+
+          Copy-Item `
+            "dist\T58-Prop-Algo-Backtester.exe" `
+            "release\T58-Prop-Algo-Backtester.exe" `
+            -Force
+
+          if (Test-Path "data\examples") {
+            $exampleFiles = Get-ChildItem "data\examples" -File -ErrorAction SilentlyContinue
+
+            if ($exampleFiles.Count -gt 0) {
+              Copy-Item `
+                "data\examples\*" `
+                "release\data\examples\" `
+                -Recurse `
+                -Force
+            }
+          }
+
+          if (Test-Path "data\raw") {
+            $rawFiles = Get-ChildItem "data\raw" -File -ErrorAction SilentlyContinue
+
+            if ($rawFiles.Count -gt 0) {
+              Copy-Item `
+                "data\raw\*" `
+                "release\data\raw\" `
+                -Recurse `
+                -Force
+            }
+          }
+
+          Write-Host ""
+          Write-Host "=== FINAL RELEASE STRUCTURE ==="
+
+          Get-ChildItem "release" -Recurse |
+            Select-Object FullName, Length
+
+      - name: Verify packaged CSV files
+        shell: pwsh
+        run: |
+          Write-Host "=== VERIFYING PACKAGED DATA ==="
+
+          $rawFiles = Get-ChildItem "release\data\raw" -File -ErrorAction SilentlyContinue
+
+          if ($rawFiles.Count -eq 0) {
+            Write-Warning "No CSV files were packaged into release/data/raw."
+          }
+          else {
+            Write-Host "Packaged CSV files:"
+            $rawFiles |
+              Where-Object { $_.Extension -ieq ".csv" } |
+              Select-Object Name, Length
+          }
+
+      - name: Create ZIP package
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "release\*" `
+            -DestinationPath "T58-Prop-Algo-Backtester-Windows.zip" `
+            -Force
+
+          Write-Host ""
+          Write-Host "=== ZIP CREATED ==="
+
+          $zip = Get-Item "T58-Prop-Algo-Backtester-Windows.zip"
+
+          Write-Host "Path: $($zip.FullName)"
+          Write-Host "Size: $($zip.Length) bytes"
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: T58-Prop-Algo-Backtester-Windows
+          path: T58-Prop-Algo-Backtester-Windows.zip
+          if-no-files-found: error
+
+      - name: Attach Windows application to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: T58-Prop-Algo-Backtester-Windows.zip
           }
 
           if (-not (Test-Path "app\ui\main_window.py")) {

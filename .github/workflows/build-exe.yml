@@ -26,21 +26,47 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Verify application structure
+      - name: Verify repository structure
         shell: pwsh
         run: |
-          Write-Host "=== APP STRUCTURE ==="
-          Get-ChildItem app -Recurse | Select-Object FullName
+          Write-Host "=== VERIFYING REPOSITORY ==="
 
-          Write-Host ""
-          Write-Host "=== VERIFY MAIN WINDOW ==="
+          if (-not (Test-Path "app\main.py")) {
+            Write-Error "app/main.py was NOT found."
+            exit 1
+          }
 
           if (-not (Test-Path "app\ui\main_window.py")) {
             Write-Error "app/ui/main_window.py was NOT found."
             exit 1
           }
 
-          Write-Host "FOUND: app/ui/main_window.py"
+          if (-not (Test-Path "app\ui\__init__.py")) {
+            Write-Error "app/ui/__init__.py was NOT found."
+            exit 1
+          }
+
+          if (-not (Test-Path "data\raw")) {
+            Write-Error "data/raw directory was NOT found."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "=== RAW DATA FILES ==="
+
+          $rawFiles = Get-ChildItem "data\raw" -File -ErrorAction SilentlyContinue
+
+          if ($rawFiles.Count -eq 0) {
+            Write-Warning "data/raw exists but contains no files."
+          }
+          else {
+            $rawFiles | Select-Object Name, Length
+          }
+
+          Write-Host ""
+          Write-Host "=== UI FILES ==="
+          Get-ChildItem "app\ui" -Recurse |
+            Select-Object FullName, Length
 
       - name: Build Windows executable
         shell: pwsh
@@ -51,18 +77,25 @@ jobs:
             --onefile `
             --windowed `
             --name "T58-Prop-Algo-Backtester" `
+            --hidden-import "app" `
             --hidden-import "app.ui" `
             --hidden-import "app.ui.main_window" `
+            --hidden-import "app.strategy" `
             --hidden-import "app.strategy.manual" `
             --hidden-import "app.strategy.expr" `
             --hidden-import "app.strategy.indicators" `
             --hidden-import "app.strategy.base" `
+            --hidden-import "app.backtest" `
             --hidden-import "app.backtest.engine" `
             --hidden-import "app.backtest.risk" `
+            --hidden-import "app.data" `
             --hidden-import "app.data.importer" `
             --hidden-import "app.data.storage" `
+            --hidden-import "app.monte_carlo" `
             --hidden-import "app.monte_carlo.engine" `
+            --hidden-import "app.prop" `
             --hidden-import "app.prop.simulator" `
+            --hidden-import "app.reports" `
             --hidden-import "app.reports.generator" `
             --add-data "data/examples;data/examples" `
             app/main.py
@@ -70,20 +103,25 @@ jobs:
       - name: Verify executable
         shell: pwsh
         run: |
-          Write-Host "=== EXE ==="
+          Write-Host "=== VERIFYING EXE ==="
 
           if (-not (Test-Path "dist\T58-Prop-Algo-Backtester.exe")) {
             Write-Error "Executable was not created."
             exit 1
           }
 
-          Get-Item "dist\T58-Prop-Algo-Backtester.exe" |
-            Select-Object FullName, Length
+          $exe = Get-Item "dist\T58-Prop-Algo-Backtester.exe"
+
+          Write-Host "EXE CREATED:"
+          Write-Host "Path: $($exe.FullName)"
+          Write-Host "Size: $($exe.Length) bytes"
 
       - name: Create application package
         shell: pwsh
         run: |
-          Remove-Item -Recurse -Force release -ErrorAction SilentlyContinue
+          Write-Host "=== CREATING RELEASE PACKAGE ==="
+
+          Remove-Item -Recurse -Force "release" -ErrorAction SilentlyContinue
 
           New-Item -ItemType Directory -Force -Path "release" | Out-Null
           New-Item -ItemType Directory -Force -Path "release\data" | Out-Null
@@ -96,25 +134,51 @@ jobs:
             -Force
 
           if (Test-Path "data\examples") {
-            Copy-Item `
-              "data\examples\*" `
-              "release\data\examples\" `
-              -Recurse `
-              -Force
+            $exampleFiles = Get-ChildItem "data\examples" -File -ErrorAction SilentlyContinue
+
+            if ($exampleFiles.Count -gt 0) {
+              Copy-Item `
+                "data\examples\*" `
+                "release\data\examples\" `
+                -Recurse `
+                -Force
+            }
           }
 
           if (Test-Path "data\raw") {
-            Copy-Item `
-              "data\raw\*" `
-              "release\data\raw\" `
-              -Recurse `
-              -Force
+            $rawFiles = Get-ChildItem "data\raw" -File -ErrorAction SilentlyContinue
+
+            if ($rawFiles.Count -gt 0) {
+              Copy-Item `
+                "data\raw\*" `
+                "release\data\raw\" `
+                -Recurse `
+                -Force
+            }
           }
 
           Write-Host ""
-          Write-Host "=== FINAL PACKAGE ==="
+          Write-Host "=== FINAL RELEASE STRUCTURE ==="
+
           Get-ChildItem "release" -Recurse |
             Select-Object FullName, Length
+
+      - name: Verify packaged CSV files
+        shell: pwsh
+        run: |
+          Write-Host "=== VERIFYING PACKAGED DATA ==="
+
+          $rawFiles = Get-ChildItem "release\data\raw" -File -ErrorAction SilentlyContinue
+
+          if ($rawFiles.Count -eq 0) {
+            Write-Warning "No CSV files were packaged into release/data/raw."
+          }
+          else {
+            Write-Host "Packaged CSV files:"
+            $rawFiles |
+              Where-Object { $_.Extension -ieq ".csv" } |
+              Select-Object Name, Length
+          }
 
       - name: Create ZIP package
         shell: pwsh
@@ -127,8 +191,10 @@ jobs:
           Write-Host ""
           Write-Host "=== ZIP CREATED ==="
 
-          Get-Item "T58-Prop-Algo-Backtester-Windows.zip" |
-            Select-Object FullName, Length
+          $zip = Get-Item "T58-Prop-Algo-Backtester-Windows.zip"
+
+          Write-Host "Path: $($zip.FullName)"
+          Write-Host "Size: $($zip.Length) bytes"
 
       - name: Upload Windows application
         uses: actions/upload-artifact@v4

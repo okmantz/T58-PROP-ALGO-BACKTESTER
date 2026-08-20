@@ -23,6 +23,7 @@ from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
 from app.strategy.manual import ManualStrategy
+from app.ui.main_window import launch
 
 DEFAULT_MANUAL_STRATEGY = {
     "name": "SMA 20/50 Cross",
@@ -116,7 +117,6 @@ def main():
     if args.cli:
         run_cli(args.csv, args.sims, args.output)
     else:
-        from app.ui.main_window import launch
         launch()
 
 

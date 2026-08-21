@@ -39,6 +39,10 @@ def run_backtest(df: pd.DataFrame, strategy: Strategy, risk: RiskConfig) -> Back
         risk=risk,
         stop_loss_pips=strat_result.stop_loss_pips,
         take_profit_pips=strat_result.take_profit_pips,
+        stop_loss_distance=strat_result.stop_loss_distance,
+        take_profit_distance=strat_result.take_profit_distance,
+        trailing_stop_distance=strat_result.trailing_stop_distance,
+        breakeven_trigger_r=strat_result.breakeven_trigger_r,
     )
 
     stats = compute_statistics(trades, equity_curve, initial_balance=risk.initial_balance)

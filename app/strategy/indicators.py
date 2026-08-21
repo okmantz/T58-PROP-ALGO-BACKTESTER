@@ -156,14 +156,3 @@ INDICATOR_FUNCS = {
     "wma": wma,
     "rsi": rsi,
 }
-def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
-    """True on the bar where `a` crosses above `b`."""
-    return (a > b) & (a.shift(1) <= b.shift(1))
-
-
-def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
-    """True on the bar where `a` crosses below `b`."""
-    return (a < b) & (a.shift(1) >= b.shift(1))
-
-
-INDICATOR_FUNCS = {"sma": sma, "ema": ema, "wma": wma, "rsi": rsi}

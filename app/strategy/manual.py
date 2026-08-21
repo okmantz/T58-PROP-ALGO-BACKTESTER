@@ -360,6 +360,73 @@ class ManualStrategy(Strategy):
         return out
 
     # ------------------------------------------------------------------
+    # Risk management: ATR-aware stop loss / take profit / trailing stop
+    # ------------------------------------------------------------------
+    def _atr_series(self, work: pd.DataFrame, cache: dict[int, pd.Series], period: int) -> pd.Series:
+        period = max(int(period or 14), 1)
+        if period not in cache:
+            cache[period] = build_indicator_series(work, "atr", period=period, column="close")
+        return cache[period]
+
+    def _build_risk_management(self, work: pd.DataFrame) -> dict[str, Any]:
+        """
+        Resolve the `risk_management` block (plus legacy top-level
+        stop_loss_pips/take_profit_pips) into the values StrategyResult /
+        the execution engine need. Every field is optional: anything not
+        configured is simply left out, so a user who only wants a fixed
+        stop loss and nothing else never has to touch ATR, trailing stop,
+        or break-even settings.
+        """
+        cfg = self.config
+        rm = cfg.get("risk_management", {}) or {}
+        atr_cache: dict[int, pd.Series] = {}
+
+        stop_loss_pips = None
+        stop_loss_distance = None
+        stop_type = str(rm.get("stop_type", "")).lower()
+        if stop_type == "fixed" and rm.get("stop_value") not in (None, ""):
+            stop_loss_pips = float(rm["stop_value"])
+        elif stop_type == "atr" and rm.get("stop_value") not in (None, ""):
+            mult = float(rm["stop_value"])
+            stop_loss_distance = self._atr_series(work, atr_cache, rm.get("stop_atr_period", 14)) * mult
+        elif cfg.get("stop_loss_pips") not in (None, ""):
+            stop_loss_pips = float(cfg["stop_loss_pips"])
+
+        take_profit_pips = None
+        take_profit_distance = None
+        target_type = str(rm.get("target_type", "")).lower()
+        if target_type == "fixed" and rm.get("target_value") not in (None, ""):
+            take_profit_pips = float(rm["target_value"])
+        elif target_type == "atr" and rm.get("target_value") not in (None, ""):
+            mult = float(rm["target_value"])
+            take_profit_distance = self._atr_series(work, atr_cache, rm.get("target_atr_period", 14)) * mult
+        elif cfg.get("take_profit_pips") not in (None, ""):
+            take_profit_pips = float(cfg["take_profit_pips"])
+
+        trailing_stop_distance = None
+        ts = rm.get("trailing_stop", {}) or {}
+        if ts.get("enabled") and ts.get("value") not in (None, ""):
+            mult = float(ts["value"])
+            trailing_stop_distance = self._atr_series(work, atr_cache, ts.get("atr_period", 14)) * mult
+
+        breakeven_trigger_r = None
+        be = rm.get("break_even", {}) or {}
+        if be.get("enabled") and be.get("trigger_r") not in (None, ""):
+            try:
+                breakeven_trigger_r = max(float(be["trigger_r"]), 0.0)
+            except (TypeError, ValueError):
+                breakeven_trigger_r = None
+
+        return {
+            "stop_loss_pips": stop_loss_pips,
+            "take_profit_pips": take_profit_pips,
+            "stop_loss_distance": stop_loss_distance,
+            "take_profit_distance": take_profit_distance,
+            "trailing_stop_distance": trailing_stop_distance,
+            "breakeven_trigger_r": breakeven_trigger_r,
+        }
+
+    # ------------------------------------------------------------------
     # Public strategy API
     # ------------------------------------------------------------------
     def generate(self, df: pd.DataFrame) -> StrategyResult:
@@ -381,67 +448,26 @@ class ManualStrategy(Strategy):
             short_entry_sig = safe_eval_bool(work, short_entry, "short_entry") if short_entry else pd.Series(False, index=work.index)
             short_exit_sig = safe_eval_bool(work, short_exit, "short_exit") if short_exit else pd.Series(False, index=work.index)
 
-        raw_signals = signals_from_conditions(work.index, long_entry_sig, long_exit_sig, short_entry_sig, short_exit_sig)
+        rm_cfg = cfg.get("risk_management", {}) or {}
+        opposite_signal_exit = bool(rm_cfg.get("opposite_signal_exit", True))
+
+        raw_signals = signals_from_conditions(
+            work.index, long_entry_sig, long_exit_sig, short_entry_sig, short_exit_sig,
+            allow_opposite_signal_flip=opposite_signal_exit,
+        )
         signals = self._apply_signal_exits(raw_signals, work)
         signals = self._validate_signals(signals, df)
 
-        rm = cfg.get("risk_management", {})
-        fixed_sl = cfg.get("stop_loss_pips")
-        fixed_tp = cfg.get("take_profit_pips")
-        if fixed_sl is None and str(rm.get("stop_type", "")).lower() == "fixed":
-            fixed_sl = rm.get("stop_value")
-        if fixed_tp is None and str(rm.get("target_type", "")).lower() == "fixed":
-            fixed_tp = rm.get("target_value")
+        risk = self._build_risk_management(work)
 
         return StrategyResult(
             name=cfg.get("name", "Manual Strategy"),
             source_type=self.source_type,
             signals=signals,
-            stop_loss_pips=float(fixed_sl) if fixed_sl not in (None, "") else None,
-            take_profit_pips=float(fixed_tp) if fixed_tp not in (None, "") else None,
-        )
-
-    def __init__(self, config: dict[str, Any]):
-        self.config = config
-
-    def _build_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        work = df.copy()
-        for ind in self.config.get("indicators", []):
-            itype = ind.get("type")
-            if itype not in INDICATOR_FUNCS:
-                raise StrategyError(f"Unsupported indicator type '{itype}'. Supported: {list(INDICATOR_FUNCS)}")
-            col = ind.get("column", "close")
-            if col not in work.columns:
-                raise StrategyError(f"Indicator references unknown column '{col}'.")
-            period = int(ind.get("period", 14))
-            alias = ind.get("as") or f"{itype}_{period}_{col}"
-            work[alias] = INDICATOR_FUNCS[itype](work[col], period)
-        return work
-
-    def generate(self, df: pd.DataFrame) -> StrategyResult:
-        cfg = self.config
-        work = self._build_indicators(df)
-
-        long_entry = cfg.get("long_entry")
-        long_exit = cfg.get("long_exit")
-        short_entry = cfg.get("short_entry")
-        short_exit = cfg.get("short_exit")
-
-        if not long_entry and not short_entry:
-            raise StrategyError("At least one of 'long_entry' or 'short_entry' must be defined.")
-
-        long_entry_sig = safe_eval_bool(work, long_entry, "long_entry") if long_entry else pd.Series(False, index=work.index)
-        long_exit_sig = safe_eval_bool(work, long_exit, "long_exit") if long_exit else pd.Series(False, index=work.index)
-        short_entry_sig = safe_eval_bool(work, short_entry, "short_entry") if short_entry else pd.Series(False, index=work.index)
-        short_exit_sig = safe_eval_bool(work, short_exit, "short_exit") if short_exit else pd.Series(False, index=work.index)
-
-        raw_signals = signals_from_conditions(work.index, long_entry_sig, long_exit_sig, short_entry_sig, short_exit_sig)
-        signals = self._validate_signals(raw_signals, df)
-
-        return StrategyResult(
-            name=cfg.get("name", "Manual Strategy"),
-            source_type=self.source_type,
-            signals=signals,
-            stop_loss_pips=cfg.get("stop_loss_pips"),
-            take_profit_pips=cfg.get("take_profit_pips"),
+            stop_loss_pips=risk["stop_loss_pips"],
+            take_profit_pips=risk["take_profit_pips"],
+            stop_loss_distance=risk["stop_loss_distance"],
+            take_profit_distance=risk["take_profit_distance"],
+            trailing_stop_distance=risk["trailing_stop_distance"],
+            breakeven_trigger_r=risk["breakeven_trigger_r"],
         )

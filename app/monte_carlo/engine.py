@@ -60,6 +60,11 @@ class MonteCarloResult:
     return_percentiles: dict = field(default_factory=dict)      # {5,25,50,75,95: pct}
     drawdown_percentiles: dict = field(default_factory=dict)
     days_to_payout_distribution: list = field(default_factory=list)
+    # Full per-simulation distributions, kept for charting (e.g. a return
+    # histogram). Not shown in the flat summary tables, only used by the
+    # HTML report's charts.
+    return_distribution: list = field(default_factory=list)
+    drawdown_distribution: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -178,5 +183,7 @@ def run_monte_carlo(
         return_percentiles={q: pct(return_arr, q) for q in (5, 25, 50, 75, 95)},
         drawdown_percentiles={q: pct(dd_arr, q) for q in (5, 25, 50, 75, 95)},
         days_to_payout_distribution=days_to_first_payout_list,
+        return_distribution=return_arr.tolist(),
+        drawdown_distribution=dd_arr.tolist(),
     )
     return result

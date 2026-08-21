@@ -19,6 +19,7 @@ from pathlib import Path
 from tkinter import (
     Tk, Frame, Label, Button, Entry, StringVar, Text, END,
     filedialog, messagebox, ttk, Listbox, SINGLE, EXTENDED, BooleanVar, Canvas,
+    Checkbutton,
 )
 
 from app.backtest.engine import run_backtest
@@ -34,6 +35,7 @@ from app.strategy.manual import ManualStrategy
 from app.strategy.mql5 import MQL5Strategy
 from app.strategy.pinescript import PineScriptStrategy
 from app.strategy.python import PythonStrategy
+from app.ui.condition_builder import ConditionList
 
 OUTPUT_DIR = Path.cwd() / "reports"
 
@@ -73,33 +75,9 @@ AMBER = "#D9A441"
 FONT = "Segoe UI"
 MONO = "Consolas"
 
-CONDITION_SOURCES = [
-    "Price", "EMA", "SMA", "VWAP", "RSI", "MACD", "MACD Signal", "MACD Histogram",
-    "ATR", "Bollinger Bands", "Bollinger Upper", "Bollinger Lower", "Highest High", "Lowest Low", "Volume", "Average Volume",
-    "Candle Direction", "Candle Range", "Percentage Change", "Swing High", "Swing Low",
-    "Liquidity Sweep", "Break of Structure", "Change of Character", "Fair Value Gap", "Order Block",
-    "Session High", "Session Low", "Previous Day High", "Previous Day Low", "Previous Day Close",
-    "Opening Range High", "Opening Range Low", "ATR Regime", "Volatility Regime",
-]
-RIGHT_SOURCES = ["Value"] + CONDITION_SOURCES
-OPERATORS = [
-    "Greater Than", "Greater Than or Equal", "Less Than", "Less Than or Equal",
-    "Equal To", "Not Equal", "Cross Above", "Cross Below", "Is True", "Is False",
-]
-SOURCE_KIND = {
-    "Price": "price", "EMA": "ema", "SMA": "sma", "VWAP": "vwap", "RSI": "rsi",
-    "MACD": "macd", "MACD Signal": "macd_signal", "MACD Histogram": "macd_histogram",
-    "ATR": "atr", "Bollinger Bands": "bollinger_mid", "Bollinger Upper": "bollinger_upper", "Bollinger Lower": "bollinger_lower", "Highest High": "highest_high",
-    "Lowest Low": "lowest_low", "Volume": "volume", "Average Volume": "average_volume",
-    "Candle Direction": "candle_direction", "Candle Range": "candle_range",
-    "Percentage Change": "percentage_change", "Swing High": "swing_high", "Swing Low": "swing_low",
-    "Liquidity Sweep": "liquidity_sweep", "Break of Structure": "break_of_structure",
-    "Change of Character": "change_of_character", "Fair Value Gap": "fair_value_gap",
-    "Order Block": "order_block", "Session High": "session_high", "Session Low": "session_low",
-    "Previous Day High": "previous_day_high", "Previous Day Low": "previous_day_low",
-    "Previous Day Close": "previous_day_close", "Opening Range High": "opening_range_high",
-    "Opening Range Low": "opening_range_low", "ATR Regime": "atr_regime", "Volatility Regime": "volatility_regime",
-}
+# NOTE: the condition-row vocabulary (sources/operators/kind mapping) used
+# to live here, but now lives in app.ui.condition_builder alongside the
+# widget that uses it, so there's a single source of truth.
 
 
 def _safe_font(size=10, weight="normal"):
@@ -155,6 +133,48 @@ class LabeledEntry(Frame):
 
     def get_str(self):
         return self.var.get()
+
+
+class LabeledCombo(Frame):
+    def __init__(self, parent, label, values, default=""):
+        super().__init__(parent, bg=PANEL)
+
+        Label(
+            self, text=label, width=31, anchor="w",
+            bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9),
+        ).pack(side="left")
+
+        self.var = StringVar(value=str(default))
+        self.combo = ttk.Combobox(
+            self, textvariable=self.var, values=values, state="readonly",
+            width=18, font=_safe_font(9), style="T58.TCombobox",
+        )
+        self.combo.pack(side="left", padx=(4, 0))
+        self.pack(fill="x", pady=3, padx=18)
+
+    def get_str(self):
+        return self.var.get()
+
+
+class LabeledCheckbox(Frame):
+    def __init__(self, parent, label, default=False):
+        super().__init__(parent, bg=PANEL)
+
+        self.var = BooleanVar(value=default)
+        cb = Checkbutton(
+            self, variable=self.var, bg=PANEL, activebackground=PANEL,
+            highlightthickness=0, bd=0, selectcolor=PANEL_3,
+        )
+        cb.pack(side="left")
+
+        Label(
+            self, text=label, anchor="w",
+            bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9),
+        ).pack(side="left", padx=(2, 0))
+        self.pack(fill="x", pady=3, padx=18)
+
+    def get(self) -> bool:
+        return bool(self.var.get())
 
 
 class MainWindow:
@@ -244,6 +264,29 @@ class MainWindow:
             bordercolor=BG,
             arrowcolor=TEXT_DIM,
         )
+
+        style.configure(
+            "T58.TCombobox",
+            fieldbackground=PANEL_3,
+            background=PANEL_3,
+            foreground=TEXT,
+            arrowcolor=TEXT_MUTED,
+            bordercolor=BORDER,
+            lightcolor=PANEL_3,
+            darkcolor=PANEL_3,
+            selectbackground=PANEL_3,
+            selectforeground=TEXT,
+            padding=4,
+        )
+        style.map(
+            "T58.TCombobox",
+            fieldbackground=[("readonly", PANEL_3)],
+            foreground=[("readonly", TEXT)],
+            background=[("readonly", PANEL_3)],
+        )
+        self.root.option_add("*TCombobox*Listbox.background", PANEL_3)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", BORDER_LIGHT)
 
         style.configure(
             "T58.Horizontal.TProgressbar",
@@ -367,6 +410,42 @@ class MainWindow:
             kwargs["width"] = width
 
         return Button(parent, **kwargs)
+
+    def _scrollable(self, parent) -> Frame:
+        """Wraps `parent` in a mouse-wheel-scrollable canvas and returns an
+        inner Frame to build content into. Used for tabs long enough to
+        overflow the window (the Manual Strategy Builder, in particular)."""
+        outer = Frame(parent, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        canvas = Canvas(outer, bg=BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview, style="T58.Vertical.TScrollbar")
+        inner = Frame(canvas, bg=BG)
+
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _wheel(event):
+            delta = -1 * (event.delta // 120) if event.delta else (-1 if event.num == 4 else 1)
+            canvas.yview_scroll(int(delta), "units")
+
+        canvas.bind("<Enter>", lambda _e: (
+            canvas.bind_all("<MouseWheel>", _wheel),
+            canvas.bind_all("<Button-4>", _wheel),
+            canvas.bind_all("<Button-5>", _wheel),
+        ))
+        canvas.bind("<Leave>", lambda _e: (
+            canvas.unbind_all("<MouseWheel>"),
+            canvas.unbind_all("<Button-4>"),
+            canvas.unbind_all("<Button-5>"),
+        ))
+
+        return inner
 
     def _section(self, parent, title, subtitle=""):
         box = Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
@@ -586,13 +665,14 @@ class MainWindow:
     # -----------------------------------------------------------------------
 
     def _build_strategy_tab(self):
-        f = self.tab_strategy
+        f = self._scrollable(self.tab_strategy)
 
         self._page_header(
             f,
             "02 / Strategy",
             "Strategy Configuration",
-            "Choose a strategy source or build a simple SMA crossover directly in the application.",
+            "Build a complete strategy visually — no code required — or bring your own "
+            "Python / PineScript / MQL5 file.",
         )
 
         section = self._section(
@@ -618,7 +698,7 @@ class MainWindow:
 
         self.strategy_mode_label = Label(
             section,
-            text="SELECTED  •  MANUAL — SMA 20/50 CROSS",
+            text="SELECTED  •  MANUAL STRATEGY BUILDER",
             bg=PANEL,
             fg=GREEN,
             font=_safe_font(9, "bold"),
@@ -640,22 +720,149 @@ class MainWindow:
         )
         self.strategy_file_status.pack(anchor="w", padx=18, pady=(0, 14))
 
-        manual = self._section(
+        # ------------------------------------------------------------
+        # 24.1  Strategy information
+        # ------------------------------------------------------------
+        info = self._section(
             f,
-            "Manual builder",
-            "Parameters used when strategy mode is MANUAL.",
+            "Strategy information",
+            "Descriptive info + the market this strategy is meant to trade. None of this "
+            "is required to run a backtest — it's just kept with the strategy for your own records.",
+        )
+        self.s_name = LabeledEntry(info, "Strategy name", "My Strategy")
+        self.s_description = LabeledEntry(info, "Description", "")
+        self.s_author = LabeledEntry(info, "Author", "")
+        self.s_version = LabeledEntry(info, "Version", "1.0")
+        self.s_instrument = LabeledEntry(info, "Instrument", "")
+        self.s_timeframe = LabeledEntry(info, "Timeframe", "5m")
+        self.s_session_start = LabeledEntry(info, "Session start (HH:MM, 24h)", "08:30")
+        self.s_session_end = LabeledEntry(info, "Session end (HH:MM, 24h)", "15:00")
+        Label(
+            info, text="Session Start/End is also used automatically by any Session High/Low "
+                       "or Opening Range condition below.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 8))
+        self.s_direction = LabeledCombo(info, "Trade direction", ["Both", "Long", "Short"], "Both")
+
+        # ------------------------------------------------------------
+        # 24.2  Entry conditions
+        # ------------------------------------------------------------
+        entry_section = self._section(
+            f,
+            "Entry conditions",
+            "Build one or more rules using AND / OR. A trade only enters once every "
+            "condition in the chain evaluates true. Example: Close > EMA(50) AND RSI(14) > 55.",
         )
 
-        self.sma_fast = LabeledEntry(manual, "SMA fast period", 20)
-        self.sma_slow = LabeledEntry(manual, "SMA slow period", 50)
-        self.sl_pips = LabeledEntry(manual, "Stop loss (pips)", 20)
-        self.tp_pips = LabeledEntry(manual, "Take profit (pips)", 40)
+        Label(entry_section, text="LONG ENTRY", bg=PANEL, fg=GREEN, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(4, 2)
+        )
+        long_entry_container = Frame(entry_section, bg=PANEL)
+        long_entry_container.pack(fill="x", padx=18, pady=(0, 4))
+        self.long_entry_conditions = ConditionList(long_entry_container, get_session=self._current_session)
+        self._button(entry_section, "+ Add Condition", self.long_entry_conditions.add_row).pack(
+            anchor="w", padx=18, pady=(0, 14)
+        )
+
+        Label(entry_section, text="SHORT ENTRY", bg=PANEL, fg=RED, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(4, 2)
+        )
+        short_entry_container = Frame(entry_section, bg=PANEL)
+        short_entry_container.pack(fill="x", padx=18, pady=(0, 4))
+        self.short_entry_conditions = ConditionList(short_entry_container, get_session=self._current_session)
+        self._button(entry_section, "+ Add Condition", self.short_entry_conditions.add_row).pack(
+            anchor="w", padx=18, pady=(0, 14)
+        )
+
+        # ------------------------------------------------------------
+        # 24.3  Exit conditions / risk management
+        # ------------------------------------------------------------
+        exit_section = self._section(
+            f,
+            "Exit conditions",
+            "Every field here is optional — leave anything you don't want at its default "
+            "(None / unchecked / blank) and it's simply ignored.",
+        )
+
+        Label(exit_section, text="STOP LOSS", bg=PANEL, fg=METAL, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(4, 2)
+        )
+        self.stop_type = LabeledCombo(exit_section, "Stop loss type", ["None", "Fixed (pips)", "ATR Multiple"], "Fixed (pips)")
+        self.stop_value = LabeledEntry(exit_section, "Stop loss value (pips, or ATR multiple e.g. 1.0)", 20)
+        self.stop_atr_period = LabeledEntry(exit_section, "Stop loss ATR period", 14)
+
+        Label(exit_section, text="TAKE PROFIT", bg=PANEL, fg=METAL, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(10, 2)
+        )
+        self.target_type = LabeledCombo(exit_section, "Take profit type", ["None", "Fixed (pips)", "ATR Multiple"], "Fixed (pips)")
+        self.target_value = LabeledEntry(exit_section, "Take profit value (pips, or ATR multiple e.g. 2.0)", 40)
+        self.target_atr_period = LabeledEntry(exit_section, "Take profit ATR period", 14)
+
+        Label(exit_section, text="TRAILING STOP  (ATR-based)", bg=PANEL, fg=METAL, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(10, 2)
+        )
+        self.trailing_enabled = LabeledCheckbox(exit_section, "Enable trailing stop", False)
+        self.trailing_value = LabeledEntry(exit_section, "Trailing distance (ATR multiple, e.g. 1.5)", 1.5)
+        self.trailing_atr_period = LabeledEntry(exit_section, "Trailing stop ATR period", 14)
+
+        Label(exit_section, text="BREAK EVEN", bg=PANEL, fg=METAL, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(10, 2)
+        )
+        self.breakeven_enabled = LabeledCheckbox(exit_section, "Move stop to break-even once in profit", False)
+        self.breakeven_trigger = LabeledEntry(exit_section, "Trigger, in multiples of initial risk (e.g. 1.0 = +1R)", 1.0)
+
+        Label(exit_section, text="TIME-BASED EXIT", bg=PANEL, fg=METAL, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(10, 2)
+        )
+        self.time_exit_enabled = LabeledCheckbox(exit_section, "Flatten any open trade at a fixed time", False)
+        self.time_exit_time = LabeledEntry(exit_section, "Exit time (HH:MM, 24h)", "15:55")
+
+        Label(exit_section, text="OTHER EXIT RULES", bg=PANEL, fg=METAL, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(10, 2)
+        )
+        self.max_bars = LabeledEntry(exit_section, "Maximum bars in trade (blank = unlimited)", "")
+        self.opposite_signal_exit = LabeledCheckbox(
+            exit_section, "Opposite Signal Exit — an opposite entry signal closes/reverses an open trade", True,
+        )
+
+        Label(exit_section, text="INDICATOR EXIT", bg=PANEL, fg=METAL, font=_safe_font(9, "bold")).pack(
+            anchor="w", padx=18, pady=(10, 2)
+        )
+        Label(
+            exit_section, text="Optional extra exit rule(s), built the same way as entry conditions above.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8),
+        ).pack(anchor="w", padx=18, pady=(0, 4))
+
+        Label(exit_section, text="Long exit", bg=PANEL, fg=GREEN, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=18, pady=(4, 2)
+        )
+        long_exit_container = Frame(exit_section, bg=PANEL)
+        long_exit_container.pack(fill="x", padx=18, pady=(0, 4))
+        self.long_exit_conditions = ConditionList(long_exit_container, get_session=self._current_session)
+        self._button(exit_section, "+ Add Condition", self.long_exit_conditions.add_row).pack(
+            anchor="w", padx=18, pady=(0, 10)
+        )
+
+        Label(exit_section, text="Short exit", bg=PANEL, fg=RED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=18, pady=(4, 2)
+        )
+        short_exit_container = Frame(exit_section, bg=PANEL)
+        short_exit_container.pack(fill="x", padx=18, pady=(0, 4))
+        self.short_exit_conditions = ConditionList(short_exit_container, get_session=self._current_session)
+        self._button(exit_section, "+ Add Condition", self.short_exit_conditions.add_row).pack(
+            anchor="w", padx=18, pady=(0, 16)
+        )
+
+    def _current_session(self) -> tuple[str, str]:
+        start = self.s_session_start.get_str().strip() or "08:30"
+        end = self.s_session_end.get_str().strip() or "15:00"
+        return start, end
 
     def _set_strategy_mode(self, mode: str):
         self.strategy_mode.set(mode)
 
         display = {
-            "manual": "MANUAL — SMA 20/50 CROSS",
+            "manual": "MANUAL STRATEGY BUILDER",
             "python": "PYTHON STRATEGY",
             "pinescript": "PINESCRIPT STRATEGY",
             "mql5": "MQL5 STRATEGY",
@@ -683,27 +890,80 @@ class MainWindow:
                 fg=GREEN,
             )
 
+    def _stop_target_block(self, type_widget, value_widget, atr_period_widget) -> tuple[str, float | None, int]:
+        label = type_widget.get_str()
+        kind = {"None": "none", "Fixed (pips)": "fixed", "ATR Multiple": "atr"}.get(label, "none")
+        value = value_widget.get_float(0) if kind != "none" else None
+        period = atr_period_widget.get_int(14)
+        return kind, value, period
+
     def _build_strategy(self):
         mode = self.strategy_mode.get()
 
         if mode == "manual":
-            cfg = dict(DEFAULT_MANUAL_STRATEGY)
-            cfg["indicators"] = [
-                {
-                    "type": "sma",
-                    "period": self.sma_fast.get_int(20),
-                    "column": "close",
-                    "as": "sma_fast",
+            long_entry, long_entry_conn = self.long_entry_conditions.to_condition_list()
+            short_entry, short_entry_conn = self.short_entry_conditions.to_condition_list()
+            long_exit, long_exit_conn = self.long_exit_conditions.to_condition_list()
+            short_exit, short_exit_conn = self.short_exit_conditions.to_condition_list()
+
+            if not long_entry and not short_entry:
+                raise StrategyError(
+                    "Add at least one Long Entry or Short Entry condition in Step 2 before running."
+                )
+
+            stop_kind, stop_value, stop_period = self._stop_target_block(
+                self.stop_type, self.stop_value, self.stop_atr_period
+            )
+            target_kind, target_value, target_period = self._stop_target_block(
+                self.target_type, self.target_value, self.target_atr_period
+            )
+
+            max_bars_raw = self.max_bars.get_str().strip()
+
+            cfg = {
+                "name": self.s_name.get_str().strip() or "Manual Strategy",
+                "description": self.s_description.get_str(),
+                "author": self.s_author.get_str(),
+                "version": self.s_version.get_str(),
+                "market": {
+                    "instrument": self.s_instrument.get_str(),
+                    "timeframe": self.s_timeframe.get_str(),
+                    "session_start": self.s_session_start.get_str().strip() or "08:30",
+                    "session_end": self.s_session_end.get_str().strip() or "15:00",
+                    "direction": self.s_direction.get_str(),
                 },
-                {
-                    "type": "sma",
-                    "period": self.sma_slow.get_int(50),
-                    "column": "close",
-                    "as": "sma_slow",
+                "entry_conditions": {
+                    "long": long_entry, "long_connectors": long_entry_conn,
+                    "short": short_entry, "short_connectors": short_entry_conn,
                 },
-            ]
-            cfg["stop_loss_pips"] = self.sl_pips.get_float(20)
-            cfg["take_profit_pips"] = self.tp_pips.get_float(40)
+                "exit_conditions": {
+                    "long": long_exit, "long_connectors": long_exit_conn,
+                    "short": short_exit, "short_connectors": short_exit_conn,
+                },
+                "risk_management": {
+                    "stop_type": stop_kind,
+                    "stop_value": stop_value,
+                    "stop_atr_period": stop_period,
+                    "target_type": target_kind,
+                    "target_value": target_value,
+                    "target_atr_period": target_period,
+                    "trailing_stop": {
+                        "enabled": self.trailing_enabled.get(),
+                        "value": self.trailing_value.get_float(1.5),
+                        "atr_period": self.trailing_atr_period.get_int(14),
+                    },
+                    "break_even": {
+                        "enabled": self.breakeven_enabled.get(),
+                        "trigger_r": self.breakeven_trigger.get_float(1.0),
+                    },
+                    "time_based_exit": {
+                        "enabled": self.time_exit_enabled.get(),
+                        "time": self.time_exit_time.get_str().strip(),
+                    },
+                    "max_bars_in_trade": int(max_bars_raw) if max_bars_raw else None,
+                    "opposite_signal_exit": self.opposite_signal_exit.get(),
+                },
+            }
             return ManualStrategy(cfg)
 
         if not self.strategy_py_path:

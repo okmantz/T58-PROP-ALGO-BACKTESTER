@@ -47,10 +47,27 @@ def run_execution(
     risk: RiskConfig,
     stop_loss_pips: float | None,
     take_profit_pips: float | None,
+    stop_loss_distance: pd.Series | None = None,
+    take_profit_distance: pd.Series | None = None,
+    trailing_stop_distance: pd.Series | None = None,
+    breakeven_trigger_r: float | None = None,
 ) -> tuple[list[Trade], pd.DataFrame]:
     """
     Returns (trades, equity_curve_df) where equity_curve_df has columns
     [timestamp, equity] for every bar in df.
+
+    stop_loss_distance / take_profit_distance: optional per-bar distances
+    in raw price units (e.g. an ATR-multiple stop). When provided, these
+    take precedence over the fixed stop_loss_pips/take_profit_pips for
+    that entry bar.
+
+    trailing_stop_distance: optional per-bar distance in raw price units.
+    The distance is captured once at trade entry and then used to ratchet
+    the stop toward price as the trade moves favorably; it never widens.
+
+    breakeven_trigger_r: once open profit reaches this multiple of the
+    trade's initial risk (entry-to-stop distance), the stop is moved to
+    the entry price (only ever tightened, never loosened).
     """
     n = len(df)
     equity = risk.initial_balance
@@ -67,6 +84,10 @@ def run_execution(
     lows = df["low"].values
     closes = df["close"].values
 
+    sl_dist_vals = stop_loss_distance.values if stop_loss_distance is not None else None
+    tp_dist_vals = take_profit_distance.values if take_profit_distance is not None else None
+    trail_dist_vals = trailing_stop_distance.values if trailing_stop_distance is not None else None
+
     spread_price = risk.spread_pips * risk.pip_size
     slip_price = risk.slippage_pips * risk.pip_size
 
@@ -74,10 +95,39 @@ def run_execution(
         bar_date = pd.Timestamp(ts[i]).normalize()
         equity_curve.append((ts[i], equity))
 
-        # --- manage open trade: check stop/take intrabar ---
+        # --- manage open trade: trailing stop / break-even, then stop/take intrabar ---
         if open_trade is not None:
             direction = open_trade["direction"]
+
+            favorable_extreme = highs[i] if direction == 1 else lows[i]
+            if direction == 1:
+                open_trade["best_price"] = max(open_trade["best_price"], favorable_extreme)
+            else:
+                open_trade["best_price"] = min(open_trade["best_price"], favorable_extreme)
+
             stop = open_trade["stop_price"]
+
+            # Break-even: once profit reaches the configured R multiple,
+            # move the stop to entry (only ever tightens the stop).
+            if (
+                breakeven_trigger_r is not None
+                and open_trade["initial_risk"]
+                and not open_trade["breakeven_done"]
+            ):
+                profit_dist = (open_trade["best_price"] - open_trade["entry_price"]) * direction
+                if profit_dist >= breakeven_trigger_r * open_trade["initial_risk"]:
+                    candidate = open_trade["entry_price"]
+                    if stop is None or (direction == 1 and candidate > stop) or (direction == -1 and candidate < stop):
+                        stop = candidate
+                    open_trade["breakeven_done"] = True
+
+            # Trailing stop: ratchet toward price, never away from it.
+            if open_trade.get("trailing_distance"):
+                candidate = open_trade["best_price"] - direction * open_trade["trailing_distance"]
+                if stop is None or (direction == 1 and candidate > stop) or (direction == -1 and candidate < stop):
+                    stop = candidate
+
+            open_trade["stop_price"] = stop
             take = open_trade["take_price"]
             exit_price = None
             reason = None
@@ -123,13 +173,29 @@ def run_execution(
                 direction = int(sig[i])
                 raw_price = closes[i]
                 entry_price = raw_price + (spread_price + slip_price) * direction
-                size = risk.position_size(equity, stop_loss_pips or 0)
+
+                bar_sl_distance = float(sl_dist_vals[i]) if sl_dist_vals is not None and not pd.isna(sl_dist_vals[i]) else None
+                bar_tp_distance = float(tp_dist_vals[i]) if tp_dist_vals is not None and not pd.isna(tp_dist_vals[i]) else None
+                bar_trail_distance = float(trail_dist_vals[i]) if trail_dist_vals is not None and not pd.isna(trail_dist_vals[i]) else None
+
+                if bar_sl_distance:
+                    sizing_pips = bar_sl_distance / risk.pip_size if risk.pip_size else 0
+                else:
+                    sizing_pips = stop_loss_pips or 0
+                size = risk.position_size(equity, sizing_pips)
+
                 stop_price = None
                 take_price = None
-                if stop_loss_pips:
+                if bar_sl_distance:
+                    stop_price = entry_price - direction * bar_sl_distance
+                elif stop_loss_pips:
                     stop_price = entry_price - direction * stop_loss_pips * risk.pip_size
-                if take_profit_pips:
+                if bar_tp_distance:
+                    take_price = entry_price + direction * bar_tp_distance
+                elif take_profit_pips:
                     take_price = entry_price + direction * take_profit_pips * risk.pip_size
+
+                initial_risk = abs(entry_price - stop_price) if stop_price is not None else None
 
                 open_trade = {
                     "entry_time": pd.Timestamp(ts[i]),
@@ -139,6 +205,10 @@ def run_execution(
                     "stop_price": stop_price,
                     "take_price": take_price,
                     "equity_at_entry": equity,
+                    "best_price": entry_price,
+                    "initial_risk": initial_risk,
+                    "breakeven_done": False,
+                    "trailing_distance": bar_trail_distance,
                 }
                 trades_today[bar_date] = n_today + 1
 

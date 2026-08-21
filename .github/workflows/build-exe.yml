@@ -86,6 +86,7 @@ jobs:
             --hidden-import "app" `
             --hidden-import "app.ui" `
             --hidden-import "app.ui.main_window" `
+            --hidden-import "app.ui.condition_builder" `
             --hidden-import "app.strategy" `
             --hidden-import "app.strategy.manual" `
             --hidden-import "app.strategy.expr" `
@@ -109,6 +110,7 @@ jobs:
             --hidden-import "app.prop.simulator" `
             --hidden-import "app.reports" `
             --hidden-import "app.reports.generator" `
+            --hidden-import "app.reports.charts" `
             --add-data "data/examples;data/examples" `
             run_app.py
 

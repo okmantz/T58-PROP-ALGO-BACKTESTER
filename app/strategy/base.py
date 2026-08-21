@@ -31,6 +31,17 @@ class StrategyResult:
     signals: pd.Series  # indexed like the input dataframe, values in {-1, 0, 1}
     stop_loss_pips: float | None = None
     take_profit_pips: float | None = None
+    # Optional per-bar stop/target distances in raw price units (e.g. an
+    # ATR-multiple stop). When set, these take precedence over the fixed
+    # pip-based fields above. Indexed like `signals`.
+    stop_loss_distance: pd.Series | None = None
+    take_profit_distance: pd.Series | None = None
+    # Optional per-bar trailing-stop distance in raw price units (e.g. an
+    # ATR-multiple trailing stop, fixed at trade entry).
+    trailing_stop_distance: pd.Series | None = None
+    # Move the stop to break-even once open profit reaches this multiple
+    # of the trade's initial risk (e.g. 1.0 == "+1R").
+    breakeven_trigger_r: float | None = None
 
 
 class Strategy:
@@ -57,12 +68,21 @@ def signals_from_conditions(
     long_exit: pd.Series,
     short_entry: pd.Series,
     short_exit: pd.Series,
+    allow_opposite_signal_flip: bool = True,
 ) -> pd.Series:
     """
     Shared stateful long/flat/short position loop used by every strategy
     adapter (Manual, PineScript, MQL5) once each has reduced its rules down
     to four boolean condition series. Keeping this in one place guarantees
     all strategy sources behave identically given the same conditions.
+
+    allow_opposite_signal_flip: when True (default, and the only behavior
+    prior versions had), an opposite-direction entry signal while a
+    position is open immediately reverses it. When False ("Opposite Signal
+    Exit" turned off in the Manual Strategy Builder), an opposite entry
+    signal is ignored while a position is open; the position can only be
+    closed by its own exit conditions, stop loss, take profit, a
+    time-based exit, or the max-bars-in-trade limit.
     """
     le, lx = long_entry.values, long_exit.values
     se, sx = short_entry.values, short_exit.values
@@ -78,12 +98,12 @@ def signals_from_conditions(
         elif position == 1:
             if lx[i]:
                 position = 0
-            elif se[i]:
+            elif allow_opposite_signal_flip and se[i]:
                 position = -1
         elif position == -1:
             if sx[i]:
                 position = 0
-            elif le[i]:
+            elif allow_opposite_signal_flip and le[i]:
                 position = 1
         out[i] = position
 

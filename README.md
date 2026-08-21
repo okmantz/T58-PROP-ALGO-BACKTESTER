@@ -199,8 +199,9 @@ T58-Prop-Algo-Backtester/
 │   ├── prop/simulator.py        # prop-firm rules + account simulator
 │   ├── monte_carlo/engine.py
 │   └── reports/generator.py     # JSON / CSV / HTML report export
-├── data/examples/                # sample OHLCV dataset for immediate testing
-├── data/raw/                     # dataset for common forex pairs (1min, 5min, 15min, 1hr, 4hr, and daily timeframes)
+├── data/
+│   ├── examples/                # sample OHLCV dataset for immediate testing
+│   ├── raw/                     # dataset for common forex pairs (1min, 5min, 15min, 1hr, 4hr, and daily timeframes)
 ├── tests/                        # pytest unit tests for every engine
 └── .github/workflows/
     ├── build.yml                 # runs pytest on push/PR

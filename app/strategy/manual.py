@@ -110,8 +110,17 @@ class ManualStrategy(Strategy):
         if kind in {"swing_high", "swing_low"}:
             left = work["high"] if kind == "swing_high" else work["low"]
             if kind == "swing_high":
-                return (left == left.rolling(lookback * 2 + 1, center=True, min_periods=lookback + 1).max()).astype(int)
-            return (left == left.rolling(lookback * 2 + 1, center=True, min_periods=lookback + 1).min()).astype(int)
+                raw = left == left.rolling(lookback * 2 + 1, center=True, min_periods=lookback + 1).max()
+            else:
+                raw = left == left.rolling(lookback * 2 + 1, center=True, min_periods=lookback + 1).min()
+            # A swing point can only be CONFIRMED once `lookback` bars after
+            # it have printed without being broken — a centered window on
+            # its own is lookahead (it needs future bars to know the
+            # present one is a local extreme). Shifting the confirmation
+            # forward by `lookback` bars means the condition only ever
+            # fires on a bar where that confirmation would actually have
+            # been knowable in real time, never earlier.
+            return raw.shift(lookback).fillna(False).astype(int)
 
         if kind in {"liquidity_sweep", "break_of_structure", "bos", "change_of_character", "choch", "fair_value_gap", "fvg", "order_block"}:
             return self._advanced_boolean(work, kind, lookback, direction).astype(int)

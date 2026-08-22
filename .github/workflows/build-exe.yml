@@ -111,7 +111,9 @@ jobs:
             --hidden-import "app.reports" `
             --hidden-import "app.reports.generator" `
             --hidden-import "app.reports.charts" `
+            --hidden-import "app.reports._assets" `
             --add-data "data/examples;data/examples" `
+            --add-data "app/ui/assets;app/ui/assets" `
             run_app.py
 
       - name: Verify executable

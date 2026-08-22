@@ -590,6 +590,37 @@ def import_csv(
                 )
 
     # ---------------------------------------------------------
+    # Split / bad-tick artifact detection
+    #
+    # The single most common way a backtest lies to you: an unadjusted
+    # stock split (or a bad print) creates a single-bar move of hundreds or
+    # thousands of percent that no real trade could have captured, and any
+    # strategy that happens to hold through it "passes" on a fabricated
+    # gain. Flag any single-bar return this extreme so it gets a manual
+    # eyeball before the backtest results are trusted.
+    # ---------------------------------------------------------
+
+    bar_returns = df["close"].pct_change().abs()
+    SUSPICIOUS_BAR_RETURN = 0.20  # 20% in one bar
+    suspicious = bar_returns[bar_returns > SUSPICIOUS_BAR_RETURN]
+
+    if not suspicious.empty:
+        worst_idx = suspicious.idxmax()
+        worst_pct = suspicious.max() * 100
+        worst_ts = df.loc[worst_idx, "timestamp"]
+        issues.append(
+            ValidationIssue(
+                "warning",
+                f"Detected {len(suspicious)} single-bar move(s) over "
+                f"{SUSPICIOUS_BAR_RETURN * 100:.0f}% (largest: {worst_pct:,.1f}% "
+                f"at {worst_ts}). This is the classic signature of an "
+                "unadjusted stock split or a bad tick, not a real tradeable "
+                "move — eyeball this bar before trusting any backtest that "
+                "profits from it.",
+            )
+        )
+
+    # ---------------------------------------------------------
     # Final cleanup
     # ---------------------------------------------------------
 

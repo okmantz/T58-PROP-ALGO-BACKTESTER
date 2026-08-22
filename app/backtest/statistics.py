@@ -190,3 +190,45 @@ def compute_statistics(
         sharpe_ratio=sharpe_ratio, sortino_ratio=sortino_ratio, calmar_ratio=calmar_ratio,
         total_trades=len(trades),
     )
+
+
+def compute_cost_ladder(trades: list, rungs_pct: list[float] | None = None) -> list[dict]:
+    """
+    Re-costs the SAME historical trade sequence at increasing round-turn
+    friction levels and reports net profit / profit factor at each rung.
+
+    This is the single most emphasized practice in serious strategy
+    validation: a "real" edge should survive some added friction, and
+    should die gracefully (not from 3.0 to 0.0 profit factor between two
+    adjacent rungs) as costs rise. An edge that only exists at 0% added
+    cost is not an edge you can trade — it's the cost model doing the
+    lying for you.
+
+    rungs_pct: extra ROUND-TURN cost, as a fraction of notional (entry
+    price x size), applied on top of whatever commission/spread/slippage
+    the backtest already modeled. Defaults to 0%, 0.05%, 0.10%, 0.25% per
+    side (i.e. the exact ladder the falsification-kit methodology uses).
+    """
+    if rungs_pct is None:
+        rungs_pct = [0.0, 0.0005, 0.0010, 0.0025]
+
+    notionals = np.array([abs(t.entry_price * t.size) for t in trades]) if trades else np.array([])
+    base_pnls = np.array([t.pnl for t in trades]) if trades else np.array([])
+    finite_mask = np.isfinite(base_pnls)
+    notionals = notionals[finite_mask]
+    base_pnls = base_pnls[finite_mask]
+
+    ladder = []
+    for rung in rungs_pct:
+        extra_cost = notionals * rung
+        pnls = base_pnls - extra_cost
+        gross_profit = float(pnls[pnls > 0].sum())
+        gross_loss = float(pnls[pnls <= 0].sum())
+        profit_factor = (gross_profit / abs(gross_loss)) if gross_loss != 0 else (float("inf") if gross_profit > 0 else 0.0)
+        ladder.append({
+            "extra_cost_pct_per_trade": rung * 100,
+            "net_profit": float(pnls.sum()) if len(pnls) else 0.0,
+            "profit_factor": profit_factor,
+            "win_rate": float((pnls > 0).sum() / len(pnls) * 100) if len(pnls) else 0.0,
+        })
+    return ladder

@@ -19,6 +19,8 @@ from typing import Any
 import pandas as pd
 
 from app.backtest.engine import BacktestResult
+from app.backtest.statistics import compute_cost_ladder
+from app.reports._assets import T58_LOGO_BASE64
 from app.monte_carlo.engine import MonteCarloResult
 from app.prop.simulator import AccountSimResult, PropRules, summarize_single_run
 from app.reports.charts import svg_histogram, svg_line_chart
@@ -51,6 +53,7 @@ def build_report(
             "initial_balance": backtest_result.initial_balance,
             "final_equity": float(backtest_result.equity_curve["equity"].iloc[-1]) if len(backtest_result.equity_curve) else backtest_result.initial_balance,
         },
+        "cost_ladder": compute_cost_ladder(backtest_result.trades),
         "prop_firm_rules": asdict(prop_rules),
         "prop_firm_single_run": summarize_single_run(prop_single_run),
         "monte_carlo": monte_carlo_result.to_dict(),
@@ -116,26 +119,62 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>T58 Prop Algo Backtester — Report: {strategy_name}</title>
 <style>
-  body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 40px; color: #1a1a1a; background:#fafafa;}}
-  h1 {{ font-size: 22px; border-bottom: 3px solid #111; padding-bottom: 8px; }}
-  h2 {{ font-size: 17px; margin-top: 32px; background:#111; color:#fff; padding:6px 10px; }}
-  table {{ border-collapse: collapse; width: 100%; margin-top: 8px; background:#fff;}}
-  td, th {{ border: 1px solid #ddd; padding: 6px 10px; font-size: 13px; text-align: left; }}
-  th {{ background: #f0f0f0; }}
-  .headline {{ display:flex; gap: 16px; flex-wrap: wrap; margin-top: 10px;}}
-  .card {{ border:1px solid #ddd; background:#fff; padding:14px 18px; min-width:180px; }}
-  .card .label {{ font-size:11px; color:#666; text-transform:uppercase; letter-spacing:.04em;}}
-  .card .value {{ font-size:24px; font-weight:700; margin-top:4px;}}
-  .muted {{ color:#666; font-size:12px; }}
-  .chart {{ border:1px solid #ddd; background:#fff; padding:10px; margin-top:8px; }}
+  :root {{
+    --ink: #14161a; --muted: #6b7280; --line: #e6e8eb; --panel: #ffffff;
+    --bg: #f7f8fa; --accent: #2f6fed; --accent-dark: #111827;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    margin: 0; color: var(--ink); background: var(--bg);
+  }}
+  .masthead {{
+    background: linear-gradient(135deg, #0b0d10 0%, #14171c 100%);
+    color: #e7e9ec; padding: 22px 40px; display:flex; align-items:center; gap:16px;
+  }}
+  .masthead img {{ height: 40px; display:block; }}
+  .masthead .titles h1 {{ margin:0; font-size:18px; font-weight:700; letter-spacing:.01em; border:none; padding:0; color:#f2f3f5;}}
+  .masthead .titles .sub {{ margin-top:3px; font-size:11px; color:#9aa1ac; letter-spacing:.03em; text-transform:uppercase; }}
+  .content {{ max-width: 1040px; margin: 0 auto; padding: 28px 40px 60px; }}
+  .meta {{ color: var(--muted); font-size: 12.5px; margin: 2px 0 0; }}
+  h2 {{
+    font-size: 13px; margin-top: 34px; margin-bottom: 10px; color: var(--accent-dark);
+    text-transform: uppercase; letter-spacing: .06em; font-weight: 700;
+    border-bottom: 2px solid var(--accent-dark); padding-bottom: 6px;
+  }}
+  table {{ border-collapse: collapse; width: 100%; margin-top: 4px; background: var(--panel);
+           box-shadow: 0 1px 2px rgba(16,24,40,0.04); border-radius: 6px; overflow: hidden; }}
+  td, th {{ border-bottom: 1px solid var(--line); padding: 8px 12px; font-size: 13px; text-align: left; }}
+  tr:last-child td {{ border-bottom: none; }}
+  th {{ background: #f1f2f5; font-weight: 600; color: #374151; }}
+  .headline {{ display:flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; }}
+  .card {{
+    border: 1px solid var(--line); background: var(--panel); padding: 16px 20px;
+    min-width: 180px; flex: 1 1 180px; border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(16,24,40,0.05);
+  }}
+  .card .label {{ font-size:10.5px; color: var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:600;}}
+  .card .value {{ font-size:26px; font-weight:700; margin-top:6px; color: var(--accent-dark); }}
+  .muted {{ color: var(--muted); font-size: 12px; }}
+  .chart {{ border: 1px solid var(--line); background: var(--panel); padding: 12px;
+            margin-top: 8px; border-radius: 8px; box-shadow: 0 1px 3px rgba(16,24,40,0.05); }}
   .chart-row {{ display:flex; gap:16px; flex-wrap:wrap; }}
   .chart-row .chart {{ flex: 1 1 340px; }}
   .chart svg {{ width: 100%; height: auto; display:block; }}
+  .footer-note {{ margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line); }}
+  @media print {{ .masthead {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }} }}
 </style>
 </head>
 <body>
-<h1>T58 Trading — Prop Algo Backtester Report</h1>
-<p class="muted">Generated {generated_at} &middot; Strategy: <b>{strategy_name}</b> ({source_type}) &middot;
+<div class="masthead">
+  <img src="data:image/png;base64,{logo_base64}" alt="T58"/>
+  <div class="titles">
+    <h1>Prop Algo Backtester — Strategy Report</h1>
+    <div class="sub">Precision-tested. Falsification-checked. No shortcuts.</div>
+  </div>
+</div>
+<div class="content">
+<p class="meta">Generated {generated_at} &middot; Strategy: <b>{strategy_name}</b> ({source_type}) &middot;
 Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {period_start} → {period_end}</p>
 
 <h2>The Number That Matters Most</h2>
@@ -150,6 +189,10 @@ Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {perio
 
 <h2>Historical Backtest Statistics</h2>
 {backtest_table}
+
+<h2>Cost Ladder</h2>
+<p class="muted">The same trade sequence above, re-costed at increasing added round-turn friction. A real edge should degrade gracefully as costs rise; an edge that only exists at 0% added cost is the cost model doing the lying for you.</p>
+{cost_ladder_table}
 
 <h2>Equity Curve (Historical Backtest)</h2>
 <div class="chart">{equity_chart}</div>
@@ -168,7 +211,8 @@ Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {perio
   <div class="chart">{drawdown_chart}</div>
 </div>
 
-<p class="muted">Report generated by T58 Trading — Prop Algo Backtester (MVP). All figures are simulated estimates based on historical data and resampling; past performance and simulated outcomes do not guarantee future results.</p>
+<p class="footer-note muted">Report generated by T58 Trading — Prop Algo Backtester. All figures are simulated estimates based on historical data and resampling; past performance and simulated outcomes do not guarantee future results.</p>
+</div>
 </body>
 </html>
 """
@@ -181,6 +225,23 @@ def _dict_to_table(d: dict) -> str:
         for k, v in d.items()
     )
     return f"<table><tr><th>Metric</th><th>Value</th></tr>{rows}</table>"
+
+
+def _cost_ladder_table(ladder: list[dict]) -> str:
+    if not ladder:
+        return "<p>No trades to re-cost.</p>"
+    header = "<tr><th>Added round-turn cost</th><th>Net Profit</th><th>Profit Factor</th><th>Win Rate</th></tr>"
+    rows = []
+    for rung in ladder:
+        pf = rung["profit_factor"]
+        pf_str = "∞" if pf == float("inf") else f"{pf:,.2f}"
+        rows.append(
+            f"<tr><td>+{rung['extra_cost_pct_per_trade']:.2f}%</td>"
+            f"<td>${rung['net_profit']:,.2f}</td>"
+            f"<td>{pf_str}</td>"
+            f"<td>{rung['win_rate']:.1f}%</td></tr>"
+        )
+    return f"<table>{header}{''.join(rows)}</table>"
 
 
 def _downsample(values: list[float], max_points: int = 400) -> list[float]:
@@ -228,6 +289,7 @@ def export_html(report: dict, path: str | Path, backtest_result: BacktestResult 
     )
 
     html = _HTML_TEMPLATE.format(
+        logo_base64=T58_LOGO_BASE64,
         strategy_name=report["strategy"]["name"],
         source_type=report["strategy"]["source_type"],
         instrument=report["strategy"]["instrument"],
@@ -242,6 +304,7 @@ def export_html(report: dict, path: str | Path, backtest_result: BacktestResult 
         expected_payout=mc["expected_payout"],
         risk_of_ruin=mc["risk_of_ruin_pct"],
         backtest_table=_dict_to_table(report["historical_backtest"]["statistics"]),
+        cost_ladder_table=_cost_ladder_table(report.get("cost_ladder", [])),
         equity_chart=equity_chart,
         rules_table=_dict_to_table(report["prop_firm_rules"]),
         single_run_table=_dict_to_table(single),

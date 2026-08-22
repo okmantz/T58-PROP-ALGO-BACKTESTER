@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import traceback
 import webbrowser
@@ -19,7 +20,7 @@ from pathlib import Path
 from tkinter import (
     Tk, Frame, Label, Button, Entry, StringVar, Text, END,
     filedialog, messagebox, ttk, Listbox, SINGLE, EXTENDED, BooleanVar, Canvas,
-    Checkbutton,
+    Checkbutton, PhotoImage,
 )
 
 from app.backtest.engine import run_backtest
@@ -78,6 +79,16 @@ MONO = "Consolas"
 # NOTE: the condition-row vocabulary (sources/operators/kind mapping) used
 # to live here, but now lives in app.ui.condition_builder alongside the
 # widget that uses it, so there's a single source of truth.
+
+
+def _asset_path(filename: str) -> Path:
+    """Resolves a bundled UI asset both in dev mode and inside a
+    PyInstaller-frozen .exe (where files added via --add-data land under
+    sys._MEIPASS instead of next to this source file)."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        return Path(bundle_root) / "app" / "ui" / "assets" / filename
+    return Path(__file__).resolve().parent / "assets" / filename
 
 
 def _safe_font(size=10, weight="normal"):
@@ -181,6 +192,13 @@ class MainWindow:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("T58 Trading — Prop Algo Backtester")
+        try:
+            icon_path = _asset_path("t58_mark_medium.png")
+            if icon_path.exists():
+                self._icon_image = PhotoImage(file=str(icon_path))
+                self.root.iconphoto(True, self._icon_image)
+        except Exception:
+            pass
         self.root.geometry("1000x760")
         self.root.minsize(900, 680)
         self.root.configure(bg=BG)
@@ -307,13 +325,24 @@ class MainWindow:
         mark = Frame(header, bg=BG)
         mark.pack(side="left", fill="y")
 
-        Label(
-            mark,
-            text="T58",
-            bg=BG,
-            fg=METAL_BRIGHT,
-            font=_safe_font(32, "bold"),
-        ).pack(anchor="w")
+        logo_shown = False
+        try:
+            logo_path = _asset_path("t58_mark_medium.png")
+            if logo_path.exists():
+                self._logo_image = PhotoImage(file=str(logo_path))
+                Label(mark, image=self._logo_image, bg=BG).pack(anchor="w", pady=(6, 2))
+                logo_shown = True
+        except Exception:
+            logo_shown = False
+
+        if not logo_shown:
+            Label(
+                mark,
+                text="T58",
+                bg=BG,
+                fg=METAL_BRIGHT,
+                font=_safe_font(32, "bold"),
+            ).pack(anchor="w")
 
         Label(
             mark,

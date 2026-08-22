@@ -13,6 +13,7 @@ time (consistent with the standardized long/flat/short signal model).
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, asdict
 
 import pandas as pd
@@ -150,6 +151,15 @@ def run_execution(
             if exit_price is not None:
                 pnl = (exit_price - open_trade["entry_price"]) * open_trade["size"] * direction
                 pnl -= risk.commission_per_trade
+                if not math.isfinite(pnl):
+                    # Guard against a runaway/degenerate trade (e.g. an
+                    # entry sized off a near-zero ATR-based stop distance)
+                    # ever corrupting the equity curve with NaN/inf. This
+                    # should be rare; if you see it often, your stop
+                    # distance or pip size for this instrument is almost
+                    # certainly misconfigured.
+                    pnl = 0.0
+                    reason = f"{reason}_invalid_pnl_skipped"
                 equity += pnl
                 trades.append(Trade(
                     entry_time=open_trade["entry_time"],
@@ -184,33 +194,39 @@ def run_execution(
                     sizing_pips = stop_loss_pips or 0
                 size = risk.position_size(equity, sizing_pips)
 
-                stop_price = None
-                take_price = None
-                if bar_sl_distance:
-                    stop_price = entry_price - direction * bar_sl_distance
-                elif stop_loss_pips:
-                    stop_price = entry_price - direction * stop_loss_pips * risk.pip_size
-                if bar_tp_distance:
-                    take_price = entry_price + direction * bar_tp_distance
-                elif take_profit_pips:
-                    take_price = entry_price + direction * take_profit_pips * risk.pip_size
+                if not math.isfinite(size) or size <= 0:
+                    # Degenerate sizing (e.g. an ATR-based stop distance
+                    # that rounds to ~0 for this bar) — skip this entry
+                    # rather than opening a trade with an invalid size.
+                    trades_today[bar_date] = n_today  # no-op, keeps loop simple
+                else:
+                    stop_price = None
+                    take_price = None
+                    if bar_sl_distance:
+                        stop_price = entry_price - direction * bar_sl_distance
+                    elif stop_loss_pips:
+                        stop_price = entry_price - direction * stop_loss_pips * risk.pip_size
+                    if bar_tp_distance:
+                        take_price = entry_price + direction * bar_tp_distance
+                    elif take_profit_pips:
+                        take_price = entry_price + direction * take_profit_pips * risk.pip_size
 
-                initial_risk = abs(entry_price - stop_price) if stop_price is not None else None
+                    initial_risk = abs(entry_price - stop_price) if stop_price is not None else None
 
-                open_trade = {
-                    "entry_time": pd.Timestamp(ts[i]),
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "size": size,
-                    "stop_price": stop_price,
-                    "take_price": take_price,
-                    "equity_at_entry": equity,
-                    "best_price": entry_price,
-                    "initial_risk": initial_risk,
-                    "breakeven_done": False,
-                    "trailing_distance": bar_trail_distance,
-                }
-                trades_today[bar_date] = n_today + 1
+                    open_trade = {
+                        "entry_time": pd.Timestamp(ts[i]),
+                        "direction": direction,
+                        "entry_price": entry_price,
+                        "size": size,
+                        "stop_price": stop_price,
+                        "take_price": take_price,
+                        "equity_at_entry": equity,
+                        "best_price": entry_price,
+                        "initial_risk": initial_risk,
+                        "breakeven_done": False,
+                        "trailing_distance": bar_trail_distance,
+                    }
+                    trades_today[bar_date] = n_today + 1
 
     # close any still-open trade at final bar close
     if open_trade is not None:

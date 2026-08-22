@@ -1,482 +1,298 @@
 """
-T58 Manual Strategy Engine.
+Bar-by-bar trade execution simulator.
 
-The manual strategy format is deliberately data-driven so the visual builder
-can create complex strategies without generating Python source code.
+Consumes OHLCV data + a standardized signal series (-1/0/1) + risk config
+and produces a discrete trade list. Entries occur on the bar the signal
+changes (filled at that bar's close, adjusted for spread/slippage); each
+open trade is then walked forward bar-by-bar checking for stop-loss /
+take-profit intrabar hits (using high/low) or a signal-driven exit.
 
-Backward compatibility:
-- The original expression-based config still works.
-- The original ``indicators`` + ``long_entry``/``short_entry`` fields still work.
-- New visual-builder configs use ``entry_conditions`` / ``exit_conditions``
-  and ``risk_management``.
+This is intentionally a straightforward, transparent simulation appropriate
+for an MVP -- no partial fills, no multi-leg positions, one open trade at a
+time (consistent with the standardized long/flat/short signal model).
 """
 from __future__ import annotations
 
-from typing import Any
+import math
+from dataclasses import dataclass, asdict
 
-import numpy as np
 import pandas as pd
 
-from app.strategy.base import Strategy, StrategyError, StrategyResult, signals_from_conditions
-from app.strategy.expr import safe_eval_bool
-from app.strategy.indicators import build_indicator_series, INDICATOR_FUNCS
+from app.backtest.risk import RiskConfig
 
 
-class ManualStrategy(Strategy):
-    source_type = "manual"
+@dataclass
+class Trade:
+    entry_time: pd.Timestamp
+    exit_time: pd.Timestamp
+    direction: int          # 1 = long, -1 = short
+    entry_price: float
+    exit_price: float
+    size: float
+    pnl: float
+    pnl_pct: float
+    exit_reason: str        # "stop_loss" | "take_profit" | "signal" | "end_of_data"
+    commission: float
+    equity_after: float
 
-    def __init__(self, config: dict[str, Any]):
-        if not isinstance(config, dict):
-            raise StrategyError("Manual strategy configuration must be a dictionary.")
-        self.config = config
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["entry_time"] = str(self.entry_time)
+        d["exit_time"] = str(self.exit_time)
+        return d
 
-    # ------------------------------------------------------------------
-    # Legacy indicator support
-    # ------------------------------------------------------------------
-    def _build_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        work = df.copy()
-        for ind in self.config.get("indicators", []):
-            itype = str(ind.get("type", "")).lower()
-            if itype not in INDICATOR_FUNCS:
-                raise StrategyError(
-                    f"Unsupported indicator type '{itype}'. Supported: {list(INDICATOR_FUNCS)}"
-                )
-            col = ind.get("column", "close")
-            if col not in work.columns:
-                raise StrategyError(f"Indicator references unknown column '{col}'.")
-            period = max(int(ind.get("period", 14)), 1)
-            alias = ind.get("as") or f"{itype}_{period}_{col}"
-            work[alias] = INDICATOR_FUNCS[itype](work[col], period)
-        return work
 
-    # ------------------------------------------------------------------
-    # Visual-builder condition evaluation
-    # ------------------------------------------------------------------
-    def _series_from_operand(self, work: pd.DataFrame, operand: Any, side: str = "left") -> pd.Series:
-        """Resolve a visual-builder operand into a numeric/boolean Series."""
-        if isinstance(operand, (int, float, np.number)):
-            return pd.Series(float(operand), index=work.index)
-        if operand is None:
-            return pd.Series(np.nan, index=work.index)
+DEFAULT_STOP_PCT_OF_PRICE = 0.01  # 1% of entry price, used only when a strategy defines no stop at all
 
-        if isinstance(operand, str):
-            name = operand.lower().strip()
-            if name in work.columns:
-                return work[name]
-            if name in {"open", "high", "low", "close", "volume"}:
-                if name not in work.columns:
-                    raise StrategyError(f"Market data does not contain '{name}'.")
-                return work[name]
-            try:
-                return pd.Series(float(operand), index=work.index)
-            except ValueError as exc:
-                raise StrategyError(f"Unknown operand '{operand}'.") from exc
 
-        if not isinstance(operand, dict):
-            raise StrategyError(f"Invalid {side} operand: {operand!r}")
+def run_execution(
+    df: pd.DataFrame,
+    signals: pd.Series,
+    risk: RiskConfig,
+    stop_loss_pips: float | None,
+    take_profit_pips: float | None,
+    stop_loss_distance: pd.Series | None = None,
+    take_profit_distance: pd.Series | None = None,
+    trailing_stop_distance: pd.Series | None = None,
+    breakeven_trigger_r: float | None = None,
+) -> tuple[list[Trade], pd.DataFrame]:
+    """
+    Returns (trades, equity_curve_df) where equity_curve_df has columns
+    [timestamp, equity] for every bar in df.
 
-        kind = str(operand.get("type", operand.get("source", "close"))).lower().strip()
-        field = str(operand.get("field", "close")).lower().strip()
-        period = max(int(operand.get("period", 14) or 14), 1)
-        lookback = max(int(operand.get("lookback", period) or period), 1)
-        direction = str(operand.get("direction", "both")).lower().strip()
+    stop_loss_distance / take_profit_distance: optional per-bar distances
+    in raw price units (e.g. an ATR-multiple stop). When provided, these
+    take precedence over the fixed stop_loss_pips/take_profit_pips for
+    that entry bar.
 
-        if kind in {"value", "constant", "number"}:
-            try:
-                return pd.Series(float(operand.get("value", 0)), index=work.index)
-            except (TypeError, ValueError) as exc:
-                raise StrategyError("A numeric condition value is required.") from exc
+    trailing_stop_distance: optional per-bar distance in raw price units.
+    The distance is captured once at trade entry and then used to ratchet
+    the stop toward price as the trade moves favorably; it never widens.
 
-        if kind in {"price", "open", "high", "low", "close", "volume"}:
-            col = field if kind == "price" else kind
-            if col not in work.columns:
-                raise StrategyError(f"Market data does not contain '{col}'.")
-            return work[col]
+    breakeven_trigger_r: once open profit reaches this multiple of the
+    trade's initial risk (entry-to-stop distance), the stop is moved to
+    the entry price (only ever tightened, never loosened).
+    """
+    n = len(df)
+    equity = risk.initial_balance
+    equity_curve = []
+    trades: list[Trade] = []
 
-        if kind in {"ema", "sma", "wma", "rsi", "vwap", "macd", "macd_signal", "macd_histogram", "atr",
-                    "bollinger_mid", "bollinger_upper", "bollinger_lower", "highest_high", "lowest_low",
-                    "average_volume", "candle_range", "percentage_change"}:
-            return build_indicator_series(work, kind, period=period, column=field, lookback=lookback)
+    open_trade: dict | None = None
+    trades_today: dict[pd.Timestamp, int] = {}
+    fallback_stop_count = 0
 
-        if kind == "candle_direction":
-            bullish = work["close"] > work["open"]
-            bearish = work["close"] < work["open"]
-            if direction == "bearish":
-                return bearish.astype(int)
-            if direction == "bullish":
-                return bullish.astype(int)
-            return (bullish.astype(int) - bearish.astype(int))
+    sig = signals.values
+    ts = df["timestamp"].values
+    opens = df["open"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
 
-        if kind in {"swing_high", "swing_low"}:
-            left = work["high"] if kind == "swing_high" else work["low"]
-            if kind == "swing_high":
-                raw = left == left.rolling(lookback * 2 + 1, center=True, min_periods=lookback + 1).max()
+    sl_dist_vals = stop_loss_distance.values if stop_loss_distance is not None else None
+    tp_dist_vals = take_profit_distance.values if take_profit_distance is not None else None
+    trail_dist_vals = trailing_stop_distance.values if trailing_stop_distance is not None else None
+
+    spread_price = risk.spread_pips * risk.pip_size
+    slip_price = risk.slippage_pips * risk.pip_size
+
+    for i in range(n):
+        bar_date = pd.Timestamp(ts[i]).normalize()
+        equity_curve.append((ts[i], equity))
+
+        # --- manage open trade: trailing stop / break-even, then stop/take intrabar ---
+        if open_trade is not None:
+            direction = open_trade["direction"]
+
+            favorable_extreme = highs[i] if direction == 1 else lows[i]
+            if direction == 1:
+                open_trade["best_price"] = max(open_trade["best_price"], favorable_extreme)
             else:
-                raw = left == left.rolling(lookback * 2 + 1, center=True, min_periods=lookback + 1).min()
-            # A swing point can only be CONFIRMED once `lookback` bars after
-            # it have printed without being broken — a centered window on
-            # its own is lookahead (it needs future bars to know the
-            # present one is a local extreme). Shifting the confirmation
-            # forward by `lookback` bars means the condition only ever
-            # fires on a bar where that confirmation would actually have
-            # been knowable in real time, never earlier.
-            return raw.shift(lookback).fillna(False).astype(int)
+                open_trade["best_price"] = min(open_trade["best_price"], favorable_extreme)
 
-        if kind in {"liquidity_sweep", "break_of_structure", "bos", "change_of_character", "choch", "fair_value_gap", "fvg", "order_block"}:
-            return self._advanced_boolean(work, kind, lookback, direction).astype(int)
+            stop = open_trade["stop_price"]
 
-        if kind in {"session_high", "session_low", "previous_day_high", "previous_day_low", "previous_day_close",
-                    "opening_range_high", "opening_range_low"}:
-            return self._session_series(work, kind, operand)
+            # Break-even: once profit reaches the configured R multiple,
+            # move the stop to entry (only ever tightens the stop).
+            if (
+                breakeven_trigger_r is not None
+                and open_trade["initial_risk"]
+                and not open_trade["breakeven_done"]
+            ):
+                profit_dist = (open_trade["best_price"] - open_trade["entry_price"]) * direction
+                if profit_dist >= breakeven_trigger_r * open_trade["initial_risk"]:
+                    candidate = open_trade["entry_price"]
+                    if stop is None or (direction == 1 and candidate > stop) or (direction == -1 and candidate < stop):
+                        stop = candidate
+                    open_trade["breakeven_done"] = True
 
-        if kind in {"atr_regime", "volatility_regime"}:
-            return self._regime_series(work, kind, period, operand)
+            # Trailing stop: ratchet toward price, never away from it.
+            if open_trade.get("trailing_distance"):
+                candidate = open_trade["best_price"] - direction * open_trade["trailing_distance"]
+                if stop is None or (direction == 1 and candidate > stop) or (direction == -1 and candidate < stop):
+                    stop = candidate
 
-        raise StrategyError(f"Unsupported visual-builder condition source '{kind}'.")
+            open_trade["stop_price"] = stop
+            take = open_trade["take_price"]
+            exit_price = None
+            reason = None
 
-    def _advanced_boolean(self, work: pd.DataFrame, kind: str, lookback: int, direction: str) -> pd.Series:
-        high, low, close = work["high"], work["low"], work["close"]
-        prior_high = high.shift(1).rolling(lookback, min_periods=lookback).max()
-        prior_low = low.shift(1).rolling(lookback, min_periods=lookback).min()
+            if direction == 1:
+                if stop is not None and lows[i] <= stop:
+                    # Honest fill: a resting stop that the bar gapped
+                    # straight through does NOT fill at the stop price —
+                    # it fills at the open, which is worse. Filling every
+                    # stop at its exact level is one of the most common
+                    # sources of a fake backtest edge.
+                    exit_price, reason = min(stop, opens[i]), "stop_loss"
+                elif take is not None and highs[i] >= take:
+                    exit_price, reason = take, "take_profit"
+            else:
+                if stop is not None and highs[i] >= stop:
+                    exit_price, reason = max(stop, opens[i]), "stop_loss"
+                elif take is not None and lows[i] <= take:
+                    exit_price, reason = take, "take_profit"
 
-        if kind == "liquidity_sweep":
-            sweep_high = (high > prior_high) & (close < prior_high)
-            sweep_low = (low < prior_low) & (close > prior_low)
-            if direction == "bullish":
-                return sweep_low.fillna(False)
-            if direction == "bearish":
-                return sweep_high.fillna(False)
-            return (sweep_high | sweep_low).fillna(False)
+            # signal-driven exit (flat or reversal) takes effect at close if no SL/TP hit
+            if exit_price is None and sig[i] != direction:
+                exit_price, reason = closes[i], "signal"
 
-        if kind in {"break_of_structure", "bos"}:
-            up = close > prior_high
-            down = close < prior_low
-            if direction == "bullish":
-                return up.fillna(False)
-            if direction == "bearish":
-                return down.fillna(False)
-            return (up | down).fillna(False)
+            if exit_price is not None:
+                # Every exit is a real transaction and pays the same
+                # round-turn cost the entry did — crediting a stop/take/
+                # signal exit at its exact quoted level (with no spread or
+                # slippage) flatters every single trade by that amount.
+                filled_exit_price = exit_price - (spread_price + slip_price) * direction
+                pnl = (filled_exit_price - open_trade["entry_price"]) * open_trade["size"] * direction
+                pnl -= risk.commission_per_trade
+                if not math.isfinite(pnl):
+                    # Guard against a runaway/degenerate trade (e.g. an
+                    # entry sized off a near-zero ATR-based stop distance)
+                    # ever corrupting the equity curve with NaN/inf. This
+                    # should be rare; if you see it often, your stop
+                    # distance or pip size for this instrument is almost
+                    # certainly misconfigured.
+                    pnl = 0.0
+                    reason = f"{reason}_invalid_pnl_skipped"
+                equity += pnl
+                trades.append(Trade(
+                    entry_time=open_trade["entry_time"],
+                    exit_time=pd.Timestamp(ts[i]),
+                    direction=direction,
+                    entry_price=open_trade["entry_price"],
+                    exit_price=filled_exit_price,
+                    size=open_trade["size"],
+                    pnl=pnl,
+                    pnl_pct=(pnl / open_trade["equity_at_entry"]) * 100 if open_trade["equity_at_entry"] else 0.0,
+                    exit_reason=reason,
+                    commission=risk.commission_per_trade,
+                    equity_after=equity,
+                ))
+                open_trade = None
 
-        if kind in {"change_of_character", "choch"}:
-            hh = high.diff(lookback) > 0
-            ll = low.diff(lookback) < 0
-            bull_shift = (close > high.shift(lookback)) & ll.shift(1).fillna(False)
-            bear_shift = (close < low.shift(lookback)) & hh.shift(1).fillna(False)
-            if direction == "bullish":
-                return bull_shift.fillna(False)
-            if direction == "bearish":
-                return bear_shift.fillna(False)
-            return (bull_shift | bear_shift).fillna(False)
+        # --- consider new entry ---
+        if open_trade is None and sig[i] != 0:
+            n_today = trades_today.get(bar_date, 0)
+            if n_today < risk.max_trades_per_day:
+                direction = int(sig[i])
+                raw_price = closes[i]
+                entry_price = raw_price + (spread_price + slip_price) * direction
 
-        if kind in {"fair_value_gap", "fvg"}:
-            bull = low > high.shift(2)
-            bear = high < low.shift(2)
-            if direction == "bullish":
-                return bull.fillna(False)
-            if direction == "bearish":
-                return bear.fillna(False)
-            return (bull | bear).fillna(False)
+                bar_sl_distance = float(sl_dist_vals[i]) if sl_dist_vals is not None and not pd.isna(sl_dist_vals[i]) else None
+                bar_tp_distance = float(tp_dist_vals[i]) if tp_dist_vals is not None and not pd.isna(tp_dist_vals[i]) else None
+                bar_trail_distance = float(trail_dist_vals[i]) if trail_dist_vals is not None and not pd.isna(trail_dist_vals[i]) else None
 
-        # Simple, deterministic order-block proxy: the last opposite candle
-        # immediately preceding a displacement candle.
-        bull_displacement = close > high.shift(1) + (high - low).rolling(lookback, min_periods=1).mean()
-        bear_displacement = close < low.shift(1) - (high - low).rolling(lookback, min_periods=1).mean()
-        bull_ob = (close.shift(1) < work["open"].shift(1)) & bull_displacement
-        bear_ob = (close.shift(1) > work["open"].shift(1)) & bear_displacement
-        if direction == "bullish":
-            return bull_ob.fillna(False)
-        if direction == "bearish":
-            return bear_ob.fillna(False)
-        return (bull_ob | bear_ob).fillna(False)
+                used_fallback_stop = False
+                if not bar_sl_distance and not stop_loss_pips:
+                    # The strategy defined no stop loss at all (no ATR-based
+                    # distance and no fixed pips). Sizing off a hardcoded
+                    # small pip count here would be wrong for any
+                    # non-FX-scaled instrument (e.g. gold, indices, crypto)
+                    # and would also leave the position completely
+                    # unprotected. Fall back to a stop sized as a percentage
+                    # of the entry price instead — this scales correctly
+                    # regardless of instrument or pip size.
+                    bar_sl_distance = abs(raw_price) * DEFAULT_STOP_PCT_OF_PRICE
+                    used_fallback_stop = True
 
-    def _session_mask(self, index: pd.Series, start: str, end: str) -> pd.Series:
-        t = pd.to_datetime(index)
-        start_t = pd.to_datetime(start).time()
-        end_t = pd.to_datetime(end).time()
-        times = t.dt.time
-        if start_t <= end_t:
-            return (times >= start_t) & (times <= end_t)
-        return (times >= start_t) | (times <= end_t)
+                if bar_sl_distance:
+                    sizing_pips = bar_sl_distance / risk.pip_size if risk.pip_size else 0
+                else:
+                    sizing_pips = stop_loss_pips or 0
+                size = risk.position_size(equity, sizing_pips)
 
-    def _session_series(self, work: pd.DataFrame, kind: str, operand: dict[str, Any]) -> pd.Series:
-        ts = pd.to_datetime(work["timestamp"])
-        day = ts.dt.normalize()
-        session_start = operand.get("session_start", "08:30")
-        session_end = operand.get("session_end", "15:00")
-        mask = self._session_mask(ts, session_start, session_end)
+                if not math.isfinite(size) or size <= 0:
+                    # Degenerate sizing (e.g. an ATR-based stop distance
+                    # that rounds to ~0 for this bar) — skip this entry
+                    # rather than opening a trade with an invalid size.
+                    trades_today[bar_date] = n_today  # no-op, keeps loop simple
+                else:
+                    if used_fallback_stop:
+                        fallback_stop_count += 1
+                    stop_price = None
+                    take_price = None
+                    if bar_sl_distance:
+                        stop_price = entry_price - direction * bar_sl_distance
+                    elif stop_loss_pips:
+                        stop_price = entry_price - direction * stop_loss_pips * risk.pip_size
+                    if bar_tp_distance:
+                        take_price = entry_price + direction * bar_tp_distance
+                    elif take_profit_pips:
+                        take_price = entry_price + direction * take_profit_pips * risk.pip_size
 
-        if kind in {"session_high", "session_low"}:
-            source = work["high"] if kind == "session_high" else work["low"]
-            # Expanding within the active session avoids future-bar leakage.
-            grouped = source.where(mask).groupby(day)
-            result = grouped.cummax() if kind == "session_high" else grouped.cummin()
-            return result.ffill()
+                    initial_risk = abs(entry_price - stop_price) if stop_price is not None else None
 
-        daily = work.groupby(day)
-        if kind == "previous_day_high":
-            daily_val = daily["high"].max().shift(1)
-            return day.map(daily_val)
-        if kind == "previous_day_low":
-            daily_val = daily["low"].min().shift(1)
-            return day.map(daily_val)
-        if kind == "previous_day_close":
-            daily_val = daily["close"].last().shift(1)
-            return day.map(daily_val)
+                    open_trade = {
+                        "entry_time": pd.Timestamp(ts[i]),
+                        "direction": direction,
+                        "entry_price": entry_price,
+                        "size": size,
+                        "stop_price": stop_price,
+                        "take_price": take_price,
+                        "equity_at_entry": equity,
+                        "best_price": entry_price,
+                        "initial_risk": initial_risk,
+                        "breakeven_done": False,
+                        "trailing_distance": bar_trail_distance,
+                    }
+                    trades_today[bar_date] = n_today + 1
 
-        # Opening-range levels become available only after the opening window
-        # has completed, preventing look-ahead bias inside the opening range.
-        start_t = pd.to_datetime(session_start).time()
-        end_t = pd.to_datetime(session_end).time()
-        if start_t <= end_t:
-            opening_mask = (ts.dt.time >= start_t) & (ts.dt.time <= end_t)
-            after_open = ts.dt.time > end_t
-        else:
-            opening_mask = (ts.dt.time >= start_t) | (ts.dt.time <= end_t)
-            after_open = ts.dt.time > end_t
-        opening_high = work["high"].where(opening_mask).groupby(day).transform("max")
-        opening_low = work["low"].where(opening_mask).groupby(day).transform("min")
-        result = opening_high if kind == "opening_range_high" else opening_low
-        return result.where(after_open).ffill()
+    # close any still-open trade at final bar close
+    if open_trade is not None:
+        i = n - 1
+        direction = open_trade["direction"]
+        exit_price = closes[i] - (spread_price + slip_price) * direction
+        pnl = (exit_price - open_trade["entry_price"]) * open_trade["size"] * direction
+        pnl -= risk.commission_per_trade
+        if not math.isfinite(pnl):
+            pnl = 0.0
+        equity += pnl
+        trades.append(Trade(
+            entry_time=open_trade["entry_time"],
+            exit_time=pd.Timestamp(ts[i]),
+            direction=direction,
+            entry_price=open_trade["entry_price"],
+            exit_price=exit_price,
+            size=open_trade["size"],
+            pnl=pnl,
+            pnl_pct=(pnl / open_trade["equity_at_entry"]) * 100 if open_trade["equity_at_entry"] else 0.0,
+            exit_reason="end_of_data",
+            commission=risk.commission_per_trade,
+            equity_after=equity,
+        ))
 
-    def _regime_series(self, work: pd.DataFrame, kind: str, period: int, operand: dict[str, Any]) -> pd.Series:
-        atr = build_indicator_series(work, "atr", period, "close")
-        if kind == "atr_regime":
-            baseline = atr.rolling(max(period * 3, period + 1), min_periods=period).mean()
-            out = pd.Series(0, index=work.index, dtype=int)
-            out[atr > baseline * 1.25] = 1
-            out[atr < baseline * 0.75] = -1
-            return out
-        returns = work["close"].pct_change()
-        vol = returns.rolling(period, min_periods=period).std()
-        baseline = vol.rolling(max(period * 3, period + 1), min_periods=period).mean()
-        out = pd.Series(0, index=work.index, dtype=int)
-        out[vol > baseline * 1.25] = 1
-        out[vol < baseline * 0.75] = -1
-        return out
+    equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
 
-    @staticmethod
-    def _compare(left: pd.Series, operator: str, right: pd.Series) -> pd.Series:
-        op = operator.strip().lower()
-        if op in {">", "greater than", "gt"}:
-            return left > right
-        if op in {">=", "greater than or equal", "gte"}:
-            return left >= right
-        if op in {"<", "less than", "lt"}:
-            return left < right
-        if op in {"<=", "less than or equal", "lte"}:
-            return left <= right
-        if op in {"==", "equal to", "equals", "eq"}:
-            return left == right
-        if op in {"!=", "not equal", "neq"}:
-            return left != right
-        if op in {"cross above", "crosses above"}:
-            return (left > right) & (left.shift(1) <= right.shift(1))
-        if op in {"cross below", "crosses below"}:
-            return (left < right) & (left.shift(1) >= right.shift(1))
-        if op in {"is true", "true"}:
-            return left.astype(bool)
-        if op in {"is false", "false"}:
-            return ~left.astype(bool)
-        raise StrategyError(f"Unsupported condition operator '{operator}'.")
-
-    def _evaluate_condition(self, work: pd.DataFrame, condition: dict[str, Any]) -> pd.Series:
-        if not isinstance(condition, dict):
-            raise StrategyError(f"Invalid condition: {condition!r}")
-        left = self._series_from_operand(work, condition.get("left", condition.get("source", "close")), "left")
-        right_operand = condition.get("right", condition.get("value", 0))
-        right = self._series_from_operand(work, right_operand, "right")
-        result = self._compare(left, str(condition.get("operator", ">")), right)
-        return result.fillna(False).astype(bool)
-
-    def _combine_conditions(self, work: pd.DataFrame, conditions: list[dict[str, Any]], connectors: list[str] | None = None) -> pd.Series:
-        if not conditions:
-            return pd.Series(False, index=work.index)
-        result = self._evaluate_condition(work, conditions[0])
-        connectors = connectors or []
-        for i, condition in enumerate(conditions[1:], start=1):
-            current = self._evaluate_condition(work, condition)
-            connector = str(connectors[i - 1] if i - 1 < len(connectors) else "AND").upper()
-            result = result & current if connector == "AND" else result | current
-        return result.fillna(False).astype(bool)
-
-    def _build_visual_signals(self, work: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-        entries = self.config.get("entry_conditions", {})
-        exits = self.config.get("exit_conditions", {})
-
-        long_entry = self._combine_conditions(work, entries.get("long", []), entries.get("long_connectors"))
-        short_entry = self._combine_conditions(work, entries.get("short", []), entries.get("short_connectors"))
-        long_exit = self._combine_conditions(work, exits.get("long", []), exits.get("long_connectors"))
-        short_exit = self._combine_conditions(work, exits.get("short", []), exits.get("short_connectors"))
-
-        allowed = str(self.config.get("market", {}).get("direction", self.config.get("direction", "Both"))).lower()
-        if allowed == "long":
-            short_entry[:] = False
-            short_exit[:] = False
-        elif allowed == "short":
-            long_entry[:] = False
-            long_exit[:] = False
-
-        return long_entry, long_exit, short_entry, short_exit
-
-    def _apply_signal_exits(self, signals: pd.Series, work: pd.DataFrame) -> pd.Series:
-        """Apply exits that can be represented by the engine's signal model."""
-        rm = self.config.get("risk_management", {})
-        out = signals.copy().astype(int)
-
-        max_bars = rm.get("max_bars_in_trade")
-        if max_bars:
-            try:
-                max_bars = max(int(max_bars), 1)
-            except (TypeError, ValueError):
-                max_bars = None
-        if max_bars:
-            vals = out.to_numpy(copy=True)
-            position = 0
-            bars = 0
-            for i in range(len(vals)):
-                if position == 0 and vals[i] != 0:
-                    position = vals[i]
-                    bars = 0
-                elif position != 0:
-                    if vals[i] != position:
-                        position = vals[i]
-                        bars = 0 if position != 0 else 0
-                    else:
-                        bars += 1
-                        if bars >= max_bars:
-                            vals[i] = 0
-                            position = 0
-                            bars = 0
-            out = pd.Series(vals, index=signals.index)
-
-        # Clock-time exit. Once the configured time is reached, flatten the
-        # current signal for that bar and prevent re-entry for the remainder
-        # of that trading day.
-        time_cfg = rm.get("time_based_exit", {})
-        if time_cfg.get("enabled") and time_cfg.get("time"):
-            try:
-                exit_time = pd.to_datetime(str(time_cfg["time"])).time()
-                ts = pd.to_datetime(work["timestamp"])
-                day = ts.dt.normalize()
-                flattened = out.copy()
-                for d in day.drop_duplicates():
-                    mask = (day == d) & (ts.dt.time >= exit_time)
-                    flattened.loc[mask] = 0
-                out = flattened
-            except (TypeError, ValueError):
-                raise StrategyError("Time-Based Exit must use HH:MM format.")
-
-        return out
-
-    # ------------------------------------------------------------------
-    # Risk management: ATR-aware stop loss / take profit / trailing stop
-    # ------------------------------------------------------------------
-    def _atr_series(self, work: pd.DataFrame, cache: dict[int, pd.Series], period: int) -> pd.Series:
-        period = max(int(period or 14), 1)
-        if period not in cache:
-            cache[period] = build_indicator_series(work, "atr", period=period, column="close")
-        return cache[period]
-
-    def _build_risk_management(self, work: pd.DataFrame) -> dict[str, Any]:
-        """
-        Resolve the `risk_management` block (plus legacy top-level
-        stop_loss_pips/take_profit_pips) into the values StrategyResult /
-        the execution engine need. Every field is optional: anything not
-        configured is simply left out, so a user who only wants a fixed
-        stop loss and nothing else never has to touch ATR, trailing stop,
-        or break-even settings.
-        """
-        cfg = self.config
-        rm = cfg.get("risk_management", {}) or {}
-        atr_cache: dict[int, pd.Series] = {}
-
-        stop_loss_pips = None
-        stop_loss_distance = None
-        stop_type = str(rm.get("stop_type", "")).lower()
-        if stop_type == "fixed" and rm.get("stop_value") not in (None, ""):
-            stop_loss_pips = float(rm["stop_value"])
-        elif stop_type == "atr" and rm.get("stop_value") not in (None, ""):
-            mult = float(rm["stop_value"])
-            stop_loss_distance = self._atr_series(work, atr_cache, rm.get("stop_atr_period", 14)) * mult
-        elif cfg.get("stop_loss_pips") not in (None, ""):
-            stop_loss_pips = float(cfg["stop_loss_pips"])
-
-        take_profit_pips = None
-        take_profit_distance = None
-        target_type = str(rm.get("target_type", "")).lower()
-        if target_type == "fixed" and rm.get("target_value") not in (None, ""):
-            take_profit_pips = float(rm["target_value"])
-        elif target_type == "atr" and rm.get("target_value") not in (None, ""):
-            mult = float(rm["target_value"])
-            take_profit_distance = self._atr_series(work, atr_cache, rm.get("target_atr_period", 14)) * mult
-        elif cfg.get("take_profit_pips") not in (None, ""):
-            take_profit_pips = float(cfg["take_profit_pips"])
-
-        trailing_stop_distance = None
-        ts = rm.get("trailing_stop", {}) or {}
-        if ts.get("enabled") and ts.get("value") not in (None, ""):
-            mult = float(ts["value"])
-            trailing_stop_distance = self._atr_series(work, atr_cache, ts.get("atr_period", 14)) * mult
-
-        breakeven_trigger_r = None
-        be = rm.get("break_even", {}) or {}
-        if be.get("enabled") and be.get("trigger_r") not in (None, ""):
-            try:
-                breakeven_trigger_r = max(float(be["trigger_r"]), 0.0)
-            except (TypeError, ValueError):
-                breakeven_trigger_r = None
-
-        return {
-            "stop_loss_pips": stop_loss_pips,
-            "take_profit_pips": take_profit_pips,
-            "stop_loss_distance": stop_loss_distance,
-            "take_profit_distance": take_profit_distance,
-            "trailing_stop_distance": trailing_stop_distance,
-            "breakeven_trigger_r": breakeven_trigger_r,
-        }
-
-    # ------------------------------------------------------------------
-    # Public strategy API
-    # ------------------------------------------------------------------
-    def generate(self, df: pd.DataFrame) -> StrategyResult:
-        cfg = self.config
-        work = self._build_indicators(df)
-
-        has_visual = bool(cfg.get("entry_conditions"))
-        if has_visual:
-            long_entry_sig, long_exit_sig, short_entry_sig, short_exit_sig = self._build_visual_signals(work)
-        else:
-            long_entry = cfg.get("long_entry")
-            long_exit = cfg.get("long_exit")
-            short_entry = cfg.get("short_entry")
-            short_exit = cfg.get("short_exit")
-            if not long_entry and not short_entry:
-                raise StrategyError("At least one of 'long_entry' or 'short_entry' must be defined.")
-            long_entry_sig = safe_eval_bool(work, long_entry, "long_entry") if long_entry else pd.Series(False, index=work.index)
-            long_exit_sig = safe_eval_bool(work, long_exit, "long_exit") if long_exit else pd.Series(False, index=work.index)
-            short_entry_sig = safe_eval_bool(work, short_entry, "short_entry") if short_entry else pd.Series(False, index=work.index)
-            short_exit_sig = safe_eval_bool(work, short_exit, "short_exit") if short_exit else pd.Series(False, index=work.index)
-
-        rm_cfg = cfg.get("risk_management", {}) or {}
-        opposite_signal_exit = bool(rm_cfg.get("opposite_signal_exit", True))
-
-        raw_signals = signals_from_conditions(
-            work.index, long_entry_sig, long_exit_sig, short_entry_sig, short_exit_sig,
-            allow_opposite_signal_flip=opposite_signal_exit,
+    if fallback_stop_count:
+        import warnings
+        warnings.warn(
+            f"{fallback_stop_count} trade(s) had no stop loss defined by the "
+            f"strategy at all (no fixed pips, no ATR-based distance) — a "
+            f"{DEFAULT_STOP_PCT_OF_PRICE * 100:.0f}%-of-price protective stop "
+            "was used instead purely for sane position sizing and account "
+            "protection. Add a real stop loss / STOP_LOSS_PIPS to the "
+            "strategy for accurate results.",
+            RuntimeWarning,
         )
-        signals = self._apply_signal_exits(raw_signals, work)
-        signals = self._validate_signals(signals, df)
 
-        risk = self._build_risk_management(work)
-
-        return StrategyResult(
-            name=cfg.get("name", "Manual Strategy"),
-            source_type=self.source_type,
-            signals=signals,
-            stop_loss_pips=risk["stop_loss_pips"],
-            take_profit_pips=risk["take_profit_pips"],
-            stop_loss_distance=risk["stop_loss_distance"],
-            take_profit_distance=risk["take_profit_distance"],
-            trailing_stop_distance=risk["trailing_stop_distance"],
-            breakeven_trigger_r=risk["breakeven_trigger_r"],
-        )
+    return trades, equity_df

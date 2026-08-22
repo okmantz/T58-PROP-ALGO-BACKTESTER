@@ -98,7 +98,35 @@ def compute_statistics(
             sharpe_ratio=0, sortino_ratio=0, calmar_ratio=0, total_trades=0,
         )
 
-    pnls = np.array([t.pnl for t in trades])
+    pnls_raw = np.array([t.pnl for t in trades])
+    finite_mask = np.isfinite(pnls_raw)
+    n_bad = int((~finite_mask).sum())
+    pnls = pnls_raw[finite_mask]
+    if n_bad:
+        # A non-finite trade pnl indicates a data or configuration anomaly
+        # (e.g. an indicator warm-up period, a near-zero ATR stop distance,
+        # or similar edge case). Excluding it keeps the rest of the report
+        # trustworthy instead of letting one bad value poison every
+        # aggregate statistic (which otherwise silently turns into NaN).
+        import warnings
+        warnings.warn(
+            f"Excluded {n_bad} trade(s) with a non-finite P&L from the backtest "
+            "statistics. Check your risk settings (in particular pip size vs. "
+            "the instrument's actual price scale, and any ATR-multiple stop) "
+            "if this number is large.",
+            RuntimeWarning,
+        )
+    if not len(pnls):
+        return BacktestStatistics(
+            net_profit=0, gross_profit=0, gross_loss=0, return_pct=0, average_trade=0,
+            win_rate=0, loss_rate=0, average_winner=0, average_loser=0,
+            largest_winner=0, largest_loser=0,
+            max_drawdown=0, max_drawdown_pct=0, average_drawdown_pct=0,
+            max_daily_drawdown_pct=0, max_weekly_drawdown_pct=0,
+            max_losing_streak=0, max_winning_streak=0,
+            profit_factor=0, expectancy=0, average_r=0, risk_reward=0,
+            sharpe_ratio=0, sortino_ratio=0, calmar_ratio=0, total_trades=len(trades),
+        )
     wins = pnls[pnls > 0]
     losses = pnls[pnls <= 0]
 

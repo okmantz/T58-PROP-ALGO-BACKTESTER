@@ -32,6 +32,11 @@ def svg_line_chart(
     if not values:
         return f'<svg width="{width}" height="{height}"><text x="20" y="20">No data.</text></svg>'
 
+    clean = [v for v in values if math.isfinite(v)]
+    if not clean:
+        return f'<svg width="{width}" height="{height}"><text x="20" y="20">No finite values to plot.</text></svg>'
+    values = clean
+
     lo, hi = min(values), max(values)
     if lo == hi:
         lo -= 1
@@ -109,6 +114,15 @@ def svg_histogram(
     if not values:
         return f'<svg width="{width}" height="{height}"><text x="20" y="20">No data.</text></svg>'
 
+    clean = [v for v in values if math.isfinite(v)]
+    dropped = len(values) - len(clean)
+    if not clean:
+        return (
+            f'<svg width="{width}" height="{height}"><text x="20" y="20">'
+            f'No finite values to plot ({dropped} non-finite value(s) excluded).</text></svg>'
+        )
+    values = clean
+
     lo, hi = min(values), max(values)
     if lo == hi:
         lo -= 1
@@ -130,6 +144,12 @@ def svg_histogram(
         bh = (c / max_count) * plot_h
         by = pad_top + plot_h - bh
         bars.append(f'<rect x="{bx:.1f}" y="{by:.1f}" width="{max(bar_w - 1, 0):.1f}" height="{bh:.1f}" fill="{color}" opacity="0.85"/>')
+
+    note_el = (
+        f'<text x="{pad_left}" y="{height - 4}" font-size="8" fill="#b33">'
+        f'{dropped} non-finite simulation(s) excluded from this chart.</text>'
+        if dropped else ""
+    )
 
     def px_of_value(v: float) -> float:
         return pad_left + ((v - lo) / span) * plot_w
@@ -171,5 +191,6 @@ def svg_histogram(
   {''.join(marker_els)}
   {''.join(axis_labels)}
   {xlabel_el}
+  {note_el}
 </svg>
 """.strip()

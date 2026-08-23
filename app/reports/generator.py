@@ -19,7 +19,7 @@ from typing import Any
 import pandas as pd
 
 from app.backtest.engine import BacktestResult
-from app.backtest.statistics import compute_cost_ladder
+from app.backtest.statistics import compute_concentration_stats, compute_cost_ladder
 from app.reports._assets import T58_LOGO_BASE64
 from app.monte_carlo.engine import MonteCarloResult
 from app.prop.simulator import AccountSimResult, PropRules, summarize_single_run
@@ -36,6 +36,7 @@ def build_report(
     prop_rules: PropRules,
     prop_single_run: AccountSimResult,
     monte_carlo_result: MonteCarloResult,
+    holdout_comparison: dict | None = None,
 ) -> dict[str, Any]:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -48,12 +49,21 @@ def build_report(
             "backtest_period_end": backtest_period[1],
         },
         "historical_backtest": {
+            # NOTE: computed over the FULL, uninterrupted trade sequence --
+            # prop-firm rules (daily loss limit, max drawdown, etc.) are NOT
+            # enforced here, so a strategy can show a healthy net_profit in
+            # this section while still failing outright in the
+            # "prop_firm_single_run" section below, which walks the exact
+            # same trades forward and stops the account the moment a rule
+            # is breached. Always read the two together.
             "statistics": backtest_result.statistics.to_dict(),
             "total_trades": len(backtest_result.trades),
             "initial_balance": backtest_result.initial_balance,
             "final_equity": float(backtest_result.equity_curve["equity"].iloc[-1]) if len(backtest_result.equity_curve) else backtest_result.initial_balance,
         },
+        "concentration_check": compute_concentration_stats(backtest_result.trades),
         "cost_ladder": compute_cost_ladder(backtest_result.trades),
+        "holdout_comparison": holdout_comparison,
         "prop_firm_rules": asdict(prop_rules),
         "prop_firm_single_run": summarize_single_run(prop_single_run),
         "monte_carlo": monte_carlo_result.to_dict(),
@@ -95,6 +105,16 @@ def export_summary_csv(report: dict, path: str | Path) -> Path:
 
     for k, v in report["historical_backtest"]["statistics"].items():
         flat[f"backtest_{k}"] = v
+
+    for k, v in report.get("concentration_check", {}).items():
+        flat[f"concentration_{k}"] = v
+
+    holdout = report.get("holdout_comparison")
+    if holdout:
+        for k, v in (holdout.get("in_sample_statistics") or {}).items():
+            flat[f"holdout_in_sample_{k}"] = v
+        for k, v in (holdout.get("holdout_statistics") or {}).items():
+            flat[f"holdout_out_of_sample_{k}"] = v
 
     for k, v in report["prop_firm_single_run"].items():
         flat[f"prop_single_run_{k}"] = v
@@ -186,9 +206,15 @@ Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {perio
   <div class="card"><div class="label">Expected Payout</div><div class="value">${expected_payout:,.0f}</div></div>
   <div class="card"><div class="label">Risk of Ruin</div><div class="value">{risk_of_ruin:.1f}%</div></div>
 </div>
+<p class="muted">"Risk of Ruin" is the probability that max drawdown is breached at <b>some point</b> across the full simulated path -- including after passing the evaluation and collecting payouts -- not just during the evaluation phase. It will not generally match Evaluation Pass Probability, and a strategy can be likely to pass yet still likely to eventually blow the account well downstream. "Failure Before Payout" (above) is the more relevant number for "will this specific attempt work."</p>
 
 <h2>Historical Backtest Statistics</h2>
+<p class="muted">Computed over the full, uninterrupted trade sequence with prop-firm rules (daily loss limit, max drawdown, etc.) <b>not</b> enforced. Compare against "Prop-Firm Single-Run Result" below, which walks these same trades forward and stops the account the moment a rule is actually breached -- a strategy can look profitable here and still fail outright there.</p>
 {backtest_table}
+
+<h2>Concentration Check</h2>
+<p class="muted">Is one lucky trade or one lucky day carrying the whole result? A repeatable edge shouldn't evaporate when its single best outcome is removed.</p>
+{concentration_table}
 
 <h2>Cost Ladder</h2>
 <p class="muted">The same trade sequence above, re-costed at increasing added round-turn friction. A real edge should degrade gracefully as costs rise; an edge that only exists at 0% added cost is the cost model doing the lying for you.</p>
@@ -197,10 +223,13 @@ Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {perio
 <h2>Equity Curve (Historical Backtest)</h2>
 <div class="chart">{equity_chart}</div>
 
+{holdout_section}
+
 <h2>Prop-Firm Rules Used</h2>
 {rules_table}
 
 <h2>Prop-Firm Single-Run Result (Historical Sequence)</h2>
+<p class="muted">Same trades as above, but the account stops the instant a prop-firm rule is breached (this run may therefore reflect fewer effective trading days than the historical stats above).</p>
 {single_run_table}
 
 <h2>Monte Carlo Simulation ({n_sims:,} simulated accounts)</h2>
@@ -242,6 +271,54 @@ def _cost_ladder_table(ladder: list[dict]) -> str:
             f"<td>{rung['win_rate']:.1f}%</td></tr>"
         )
     return f"<table>{header}{''.join(rows)}</table>"
+
+
+def _concentration_table(c: dict) -> str:
+    if not c:
+        return "<p>No trades to check.</p>"
+    rows = (
+        f"<tr><td>Best single trade</td><td>${c['best_trade_pnl']:,.2f}</td>"
+        f"<td>{c['best_trade_pct_of_gross_profit']:.1f}% of gross profit</td>"
+        f"<td>Net profit excl. it: ${c['net_profit_excluding_best_trade']:,.2f}</td></tr>"
+        f"<tr><td>Best single day</td><td>${c['best_day_pnl']:,.2f}</td>"
+        f"<td>{c['best_day_pct_of_gross_profit']:.1f}% of gross profit</td>"
+        f"<td>Net profit excl. it: ${c['net_profit_excluding_best_day']:,.2f}</td></tr>"
+    )
+    return (
+        "<table><tr><th></th><th>P&amp;L</th><th>Share of gross profit</th>"
+        f"<th>Result if removed</th></tr>{rows}</table>"
+    )
+
+
+def _holdout_section(holdout: dict | None) -> str:
+    if not holdout:
+        return ""
+    in_s = holdout.get("in_sample_statistics") or {}
+    out_s = holdout.get("holdout_statistics") or {}
+    frac = holdout.get("holdout_frac", 0.0) * 100
+    in_period = holdout.get("in_sample_period", (None, None))
+    out_period = holdout.get("holdout_period", (None, None))
+
+    def row(label, key, fmt="{:,.2f}"):
+        a = in_s.get(key)
+        b = out_s.get(key)
+        a_str = fmt.format(a) if isinstance(a, (int, float)) else "n/a"
+        b_str = fmt.format(b) if isinstance(b, (int, float)) else "n/a"
+        return f"<tr><td>{label}</td><td>{a_str}</td><td>{b_str}</td></tr>"
+
+    table = (
+        "<table><tr><th>Metric</th><th>In-Sample</th><th>Holdout (never re-tuned on)</th></tr>"
+        + row("Trades", "total_trades", "{:,.0f}")
+        + row("Net profit", "net_profit", "${:,.2f}")
+        + row("Profit factor", "profit_factor", "{:,.2f}")
+        + row("Win rate (%)", "win_rate", "{:.1f}")
+        + row("Max drawdown (%)", "max_drawdown_pct", "{:.2f}")
+        + row("Sharpe ratio", "sharpe_ratio", "{:.2f}")
+        + "</table>"
+    )
+    return f"""<h2>Out-of-Sample Holdout Check</h2>
+<p class="muted">The final {frac:.0f}% of bars chronologically ({out_period[0]} &rarr; {out_period[1]}) were withheld and run through the exact same strategy and risk settings as the earlier {100-frac:.0f}% ({in_period[0]} &rarr; {in_period[1]}), with no re-tuning between the two. A real edge should degrade gracefully here, not invert or vanish -- if the holdout column looks nothing like the in-sample column, the in-sample result was likely overfit to that specific period.</p>
+{table}"""
 
 
 def _downsample(values: list[float], max_points: int = 400) -> list[float]:
@@ -304,8 +381,10 @@ def export_html(report: dict, path: str | Path, backtest_result: BacktestResult 
         expected_payout=mc["expected_payout"],
         risk_of_ruin=mc["risk_of_ruin_pct"],
         backtest_table=_dict_to_table(report["historical_backtest"]["statistics"]),
+        concentration_table=_concentration_table(report.get("concentration_check", {})),
         cost_ladder_table=_cost_ladder_table(report.get("cost_ladder", [])),
         equity_chart=equity_chart,
+        holdout_section=_holdout_section(report.get("holdout_comparison")),
         rules_table=_dict_to_table(report["prop_firm_rules"]),
         single_run_table=_dict_to_table(single),
         monte_carlo_table=_dict_to_table({k: v for k, v in mc.items() if not isinstance(v, (dict, list))}),
@@ -331,11 +410,13 @@ def generate_full_report(
     prop_single_run: AccountSimResult,
     monte_carlo_result: MonteCarloResult,
     basename: str = "report",
+    holdout_comparison: dict | None = None,
 ) -> dict[str, Path]:
     """Builds the report dict and writes JSON + summary CSV + trades CSV + HTML to output_dir."""
     report = build_report(
         strategy_name, strategy_source_type, instrument, timeframe, backtest_period,
         backtest_result, prop_rules, prop_single_run, monte_carlo_result,
+        holdout_comparison=holdout_comparison,
     )
     output_dir = Path(output_dir)
     paths = {

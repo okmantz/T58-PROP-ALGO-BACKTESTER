@@ -29,7 +29,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
-from app.backtest.engine import run_backtest
+from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_raw_data_dir, list_stored_datasets, store_csv_bytes
@@ -167,6 +167,11 @@ def run_pipeline():
         mc_cfg = MonteCarloConfig(n_simulations=min(n_sims, 50_000), method=form.get("mc_method", "bootstrap"))
         mc_result = run_monte_carlo(bt_result.trades, rules, mc_cfg)
 
+        try:
+            holdout_comparison = run_holdout_comparison(df, strategy, risk, holdout_frac=0.2)
+        except Exception:
+            holdout_comparison = None
+
         run_id = uuid.uuid4().hex[:10]
         period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
         paths = generate_full_report(
@@ -181,6 +186,7 @@ def run_pipeline():
             prop_single_run=single_run,
             monte_carlo_result=mc_result,
             basename=f"report_{run_id}",
+            holdout_comparison=holdout_comparison,
         )
 
         import_note = None

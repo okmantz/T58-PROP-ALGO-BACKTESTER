@@ -15,7 +15,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from app.backtest.engine import run_backtest
+from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data.importer import import_csv
 from app.data.storage import list_stored_datasets, store_csv_path
@@ -87,6 +87,13 @@ def run_cli(csv_path: str | None, n_sims: int, output_dir: str) -> None:
     print(f"  First payout probability: {mc_result.first_payout_probability:.1f}%")
     print(f"  Expected payout: ${mc_result.expected_payout:,.2f}")
 
+    print("Running out-of-sample holdout check...")
+    try:
+        holdout_comparison = run_holdout_comparison(df, strategy, risk, holdout_frac=0.2)
+    except Exception as exc:
+        print(f"  Holdout check skipped: {exc}")
+        holdout_comparison = None
+
     period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
     paths = generate_full_report(
         output_dir=output_dir,
@@ -99,6 +106,7 @@ def run_cli(csv_path: str | None, n_sims: int, output_dir: str) -> None:
         prop_rules=rules,
         prop_single_run=single_run,
         monte_carlo_result=mc_result,
+        holdout_comparison=holdout_comparison,
     )
     print("\nReport written to:")
     for k, p in paths.items():

@@ -34,6 +34,7 @@ class Trade:
     exit_reason: str        # "stop_loss" | "take_profit" | "signal" | "end_of_data"
     commission: float
     equity_after: float
+    initial_risk: float | None = None  # |entry - stop| in raw price units, at entry time
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -187,6 +188,7 @@ def run_execution(
                     exit_reason=reason,
                     commission=risk.commission_per_trade,
                     equity_after=equity,
+                    initial_risk=open_trade["initial_risk"],
                 ))
                 open_trade = None
 
@@ -279,6 +281,7 @@ def run_execution(
             exit_reason="end_of_data",
             commission=risk.commission_per_trade,
             equity_after=equity,
+            initial_risk=open_trade["initial_risk"],
         ))
 
     equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])

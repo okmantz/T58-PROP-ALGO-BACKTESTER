@@ -23,7 +23,7 @@ from tkinter import (
     Checkbutton, PhotoImage,
 )
 
-from app.backtest.engine import run_backtest
+from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data.importer import import_csv
 from app.data.multi_timeframe import merge_multi_timeframe
@@ -1353,6 +1353,13 @@ class MainWindow:
                 f"{mc_result.risk_of_ruin_pct:.1f}%"
             )
 
+            self._log("Running out-of-sample holdout check...")
+            try:
+                holdout_comparison = run_holdout_comparison(df, strategy, risk, holdout_frac=0.2)
+            except Exception:
+                self._log("  Holdout check skipped (not enough data to split).")
+                holdout_comparison = None
+
             self._log("Generating report...")
 
             period = (
@@ -1375,6 +1382,7 @@ class MainWindow:
                 prop_rules=rules,
                 prop_single_run=single_run,
                 monte_carlo_result=mc_result,
+                holdout_comparison=holdout_comparison,
             )
 
             self._last_html_path = paths["html"]

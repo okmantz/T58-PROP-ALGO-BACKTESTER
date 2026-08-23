@@ -158,10 +158,24 @@ def compute_statistics(
 
     profit_factor = float(gross_profit / abs(gross_loss)) if gross_loss != 0 else float("inf") if gross_profit > 0 else 0.0
     expectancy = float(average_trade)
-    # Average R approximated as average pnl / average risked amount per trade (risk-normalized return)
-    risk_per_trade = [abs(t.pnl) for t in trades if t.pnl <= 0]
-    avg_risk = float(np.mean(risk_per_trade)) if risk_per_trade else (abs(average_loser) or 1.0)
-    average_r = float(average_trade / avg_risk) if avg_risk else 0.0
+
+    # Average R: pnl / the trade's own PLANNED risk (|entry - stop| * size)
+    # at entry time, when the strategy/engine actually attached one. This is
+    # the real definition of "R" (risk-normalized return per trade) used in
+    # prop-firm evaluation. Falls back to the old realized-loss approximation
+    # only for trades with no initial_risk on record (e.g. a strategy that
+    # never defines a stop at all and predates this field).
+    r_multiples = [
+        t.pnl / (t.initial_risk * t.size)
+        for t in trades
+        if getattr(t, "initial_risk", None) and t.initial_risk > 0 and t.size
+    ]
+    if r_multiples:
+        average_r = float(np.mean(r_multiples))
+    else:
+        risk_per_trade = [abs(t.pnl) for t in trades if t.pnl <= 0]
+        avg_risk = float(np.mean(risk_per_trade)) if risk_per_trade else (abs(average_loser) or 1.0)
+        average_r = float(average_trade / avg_risk) if avg_risk else 0.0
     risk_reward = float(abs(average_winner / average_loser)) if average_loser != 0 else float("inf") if average_winner > 0 else 0.0
 
     # Risk-adjusted ratios computed on per-trade returns (simple, MVP-appropriate approach)
@@ -190,6 +204,57 @@ def compute_statistics(
         sharpe_ratio=sharpe_ratio, sortino_ratio=sortino_ratio, calmar_ratio=calmar_ratio,
         total_trades=len(trades),
     )
+
+
+def compute_concentration_stats(trades: list) -> dict:
+    """
+    "Is one lucky trade or one lucky day carrying the whole result?"
+
+    A real, repeatable edge shouldn't evaporate the moment you remove its
+    single best outcome. Reports the net profit and profit factor with the
+    single best trade removed, and again with the single best calendar day
+    removed, plus what share of total gross profit each represents. If
+    removing one trade or one day flips net_profit negative (or profit
+    factor below ~1.2), the headline numbers are being carried by an
+    outlier, not a repeatable process.
+    """
+    if not trades:
+        return {
+            "best_trade_pnl": 0.0,
+            "best_trade_pct_of_gross_profit": 0.0,
+            "net_profit_excluding_best_trade": 0.0,
+            "best_day_pnl": 0.0,
+            "best_day_pct_of_gross_profit": 0.0,
+            "net_profit_excluding_best_day": 0.0,
+        }
+
+    pnls = np.array([t.pnl for t in trades])
+    pnls = pnls[np.isfinite(pnls)]
+    net_profit = float(pnls.sum())
+    gross_profit = float(pnls[pnls > 0].sum()) if len(pnls) else 0.0
+
+    best_trade_pnl = float(pnls.max()) if len(pnls) else 0.0
+    net_excl_trade = float(net_profit - best_trade_pnl)
+    best_trade_pct = (best_trade_pnl / gross_profit * 100.0) if gross_profit > 0 and best_trade_pnl > 0 else 0.0
+
+    daily_pnl: dict = {}
+    for t in trades:
+        if not np.isfinite(t.pnl):
+            continue
+        day = pd.Timestamp(t.exit_time).normalize()
+        daily_pnl[day] = daily_pnl.get(day, 0.0) + t.pnl
+    best_day_pnl = max(daily_pnl.values()) if daily_pnl else 0.0
+    net_excl_day = float(net_profit - best_day_pnl)
+    best_day_pct = (best_day_pnl / gross_profit * 100.0) if gross_profit > 0 and best_day_pnl > 0 else 0.0
+
+    return {
+        "best_trade_pnl": best_trade_pnl,
+        "best_trade_pct_of_gross_profit": float(best_trade_pct),
+        "net_profit_excluding_best_trade": net_excl_trade,
+        "best_day_pnl": float(best_day_pnl),
+        "best_day_pct_of_gross_profit": float(best_day_pct),
+        "net_profit_excluding_best_day": net_excl_day,
+    }
 
 
 def compute_cost_ladder(trades: list, rungs_pct: list[float] | None = None) -> list[dict]:

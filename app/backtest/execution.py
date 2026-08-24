@@ -81,7 +81,13 @@ def run_execution(
 
     open_trade: dict | None = None
     trades_today: dict[pd.Timestamp, int] = {}
+    pnl_today: dict[pd.Timestamp, float] = {}
     fallback_stop_count = 0
+    daily_limit_amount = (
+        risk.initial_balance * (risk.daily_loss_limit_pct / 100.0)
+        if risk.daily_loss_limit_pct is not None
+        else None
+    )
 
     sig = signals.values
     ts = df["timestamp"].values
@@ -190,10 +196,15 @@ def run_execution(
                     equity_after=equity,
                     initial_risk=open_trade["initial_risk"],
                 ))
+                pnl_today[bar_date] = pnl_today.get(bar_date, 0.0) + pnl
                 open_trade = None
 
         # --- consider new entry ---
-        if open_trade is None and sig[i] != 0:
+        day_realized_pnl = pnl_today.get(bar_date, 0.0)
+        daily_limit_breached = (
+            daily_limit_amount is not None and day_realized_pnl <= -daily_limit_amount
+        )
+        if open_trade is None and sig[i] != 0 and not daily_limit_breached:
             n_today = trades_today.get(bar_date, 0)
             if n_today < risk.max_trades_per_day:
                 direction = int(sig[i])

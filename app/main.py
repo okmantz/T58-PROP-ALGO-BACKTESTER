@@ -107,6 +107,7 @@ def run_cli(csv_path: str | None, n_sims: int, output_dir: str) -> None:
         prop_single_run=single_run,
         monte_carlo_result=mc_result,
         holdout_comparison=holdout_comparison,
+        risk_config=risk,
     )
     print("\nReport written to:")
     for k, p in paths.items():

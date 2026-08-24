@@ -187,6 +187,7 @@ def run_pipeline():
             monte_carlo_result=mc_result,
             basename=f"report_{run_id}",
             holdout_comparison=holdout_comparison,
+            risk_config=risk,
         )
 
         import_note = None

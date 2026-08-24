@@ -1383,6 +1383,7 @@ class MainWindow:
                 prop_single_run=single_run,
                 monte_carlo_result=mc_result,
                 holdout_comparison=holdout_comparison,
+                risk_config=risk,
             )
 
             self._last_html_path = paths["html"]

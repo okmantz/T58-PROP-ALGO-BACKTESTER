@@ -22,6 +22,12 @@ class RiskConfig:
     spread_pips: float = 0.0
     pip_size: float = 0.0001            # price move that equals "1 pip" (e.g. 0.0001 for EURUSD)
     max_position_size: float | None = None  # cap on units, None = unlimited
+    daily_loss_limit_pct: float | None = None  # % of initial_balance; once a day's REALIZED
+    # pnl breaches -this, no new entries are taken for the rest of that calendar day.
+    # None = disabled (no circuit breaker; this was the only behavior before this field
+    # existed). This is the correct, supported way to give a strategy a daily-loss cutoff --
+    # a strategy's own generate_signals() cannot implement this itself (see app/strategy/
+    # python.py) because it never sees realized trade outcomes, only price data.
 
     def risk_amount(self, current_equity: float) -> float:
         if self.risk_mode == "fixed":

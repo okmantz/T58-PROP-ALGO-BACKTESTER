@@ -33,6 +33,33 @@ strategy computes a stop or target and never attaches it here, the engine
 has no way to know about it and will size/protect the trade using its own
 generic fallback instead, silently discarding your intended risk management.
 
+MULTI-TIMEFRAME BIAS FILTERS — A COMMON LOOKAHEAD TRAP
+-------------------------------------------------------
+If your strategy resamples the input data to a higher timeframe (e.g. a 1H
+trend filter for a 15m entry strategy) and then filters it with something
+like `htf[htf.index < timestamp]` to get "the last closed HTF bar", THIS IS
+LIKELY A LOOKAHEAD BUG. A resampled bar is labeled by its START time, so
+`htf.index < timestamp` includes the still-forming CURRENT bar for any
+`timestamp` that isn't exactly on the HTF boundary — which was computed
+using the full bar's data, including bars later than `timestamp` that
+haven't happened yet. Use `app.strategy.mtf.completed_bars()` /
+`last_completed_bar()` instead, which correctly requires the bar to have
+fully closed (bar_start + timeframe <= timestamp) before using it. This
+exact mistake was found in a real uploaded strategy and was, on its own,
+responsible for the strategy's entire apparent edge (see app/strategy/mtf.py
+docstring for the before/after numbers).
+
+STRATEGIES CANNOT IMPLEMENT THEIR OWN "MAX DAILY LOSSES" GATE
+----------------------------------------------------------------
+generate_signals(df) is called ONCE, statelessly, over the entire dataset
+before any execution or P&L exists. A strategy has no way to know whether
+its own earlier trades that day won or lost, so any internal
+"stop trading after N daily losses" counter a strategy tries to maintain is
+silently a no-op — it can count trades taken, but never trades lost. If you
+need a real daily-loss circuit breaker, use the engine's own
+RiskConfig-level enforcement (see app/backtest/risk.py) rather than trying
+to build one inside generate_signals().
+
 The module is imported in isolation via importlib so a bad/malicious upload
 cannot silently corrupt the running app's own modules; execution errors are
 caught and surfaced as a clear StrategyError per the spec's requirement that

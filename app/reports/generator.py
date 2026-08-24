@@ -19,6 +19,7 @@ from typing import Any
 import pandas as pd
 
 from app.backtest.engine import BacktestResult
+from app.backtest.risk import RiskConfig
 from app.backtest.statistics import compute_concentration_stats, compute_cost_ladder
 from app.reports._assets import T58_LOGO_BASE64
 from app.monte_carlo.engine import MonteCarloResult
@@ -37,6 +38,7 @@ def build_report(
     prop_single_run: AccountSimResult,
     monte_carlo_result: MonteCarloResult,
     holdout_comparison: dict | None = None,
+    risk_config: RiskConfig | None = None,
 ) -> dict[str, Any]:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -48,6 +50,13 @@ def build_report(
             "backtest_period_start": backtest_period[0],
             "backtest_period_end": backtest_period[1],
         },
+        # Every dollar figure in this report is a direct function of this
+        # config (risk % per trade, spread/slippage/commission assumptions,
+        # initial balance, max trades/day). Without it recorded here, a
+        # report cannot be reproduced or audited later -- this was a real
+        # gap found during an external verification pass (the report had
+        # no way to say what config produced its own numbers).
+        "risk_config": asdict(risk_config) if risk_config is not None else None,
         "historical_backtest": {
             # NOTE: computed over the FULL, uninterrupted trade sequence --
             # prop-firm rules (daily loss limit, max drawdown, etc.) are NOT
@@ -197,6 +206,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <p class="meta">Generated {generated_at} &middot; Strategy: <b>{strategy_name}</b> ({source_type}) &middot;
 Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {period_start} → {period_end}</p>
 
+<h2>Backtest Configuration</h2>
+<p class="muted">The exact execution/risk assumptions used to produce every dollar figure below. Recorded here so this report can be reproduced or audited later.</p>
+{risk_config_table}
+
 <h2>The Number That Matters Most</h2>
 <div class="headline">
   <div class="card"><div class="label">Evaluation Pass Probability</div><div class="value">{eval_pass:.1f}%</div></div>
@@ -328,6 +341,12 @@ def _downsample(values: list[float], max_points: int = 400) -> list[float]:
     return [values[int(i * step)] for i in range(max_points)]
 
 
+def _risk_config_table(risk_config: dict | None) -> str:
+    if not risk_config:
+        return "<p>No risk configuration was recorded for this run.</p>"
+    return _dict_to_table(risk_config)
+
+
 def export_html(report: dict, path: str | Path, backtest_result: BacktestResult | None = None) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +393,7 @@ def export_html(report: dict, path: str | Path, backtest_result: BacktestResult 
         period_start=report["strategy"]["backtest_period_start"],
         period_end=report["strategy"]["backtest_period_end"],
         generated_at=report["generated_at"],
+        risk_config_table=_risk_config_table(report.get("risk_config")),
         eval_pass=mc["evaluation_pass_probability"],
         first_payout=mc["first_payout_probability"],
         failure_before_payout=mc["failure_before_payout_probability"],
@@ -411,12 +431,13 @@ def generate_full_report(
     monte_carlo_result: MonteCarloResult,
     basename: str = "report",
     holdout_comparison: dict | None = None,
+    risk_config: RiskConfig | None = None,
 ) -> dict[str, Path]:
     """Builds the report dict and writes JSON + summary CSV + trades CSV + HTML to output_dir."""
     report = build_report(
         strategy_name, strategy_source_type, instrument, timeframe, backtest_period,
         backtest_result, prop_rules, prop_single_run, monte_carlo_result,
-        holdout_comparison=holdout_comparison,
+        holdout_comparison=holdout_comparison, risk_config=risk_config,
     )
     output_dir = Path(output_dir)
     paths = {

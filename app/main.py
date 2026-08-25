@@ -117,6 +117,7 @@ def run_cli(csv_path: str | None, n_sims: int, output_dir: str) -> None:
         monte_carlo_result=mc_result,
         holdout_comparison=holdout_comparison,
         risk_config=risk,
+        price_df=df,
     )
     print("\nReport written to:")
     for k, p in paths.items():

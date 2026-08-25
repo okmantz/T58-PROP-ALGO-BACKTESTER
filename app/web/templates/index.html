@@ -69,6 +69,9 @@
   {% if result.import_note %}
   <p style="font-size:13px;color:#9ecbff;margin-bottom:10px;">{{ result.import_note }}</p>
   {% endif %}
+  {% if result.lookahead_warning %}
+  <p style="font-size:13px;color:#ffcf7a;margin-bottom:10px;border:1px solid #6b5423;background:#2a2314;padding:10px;border-radius:8px;">⚠ {{ result.lookahead_warning }}</p>
+  {% endif %}
   <p style="font-size:12px;color:#888;margin-bottom:10px;">Ran against: <b>{{ result.active_dataset }}</b></p>
   <div class="headline">
     <div class="stat"><div class="label">Eval Pass Probability</div><div class="value">{{ "%.1f"|format(result.eval_pass_prob) }}%</div></div>

@@ -129,3 +129,67 @@ def test_run_against_existing_stored_dataset_without_new_upload():
         shutil.rmtree(raw_dir, ignore_errors=True)
         for f in REPORTS_DIR.glob("report_*"):
             f.unlink()
+
+
+_LEAKY_PYTHON_STRATEGY = '''
+import pandas as pd
+
+def generate_signals(df, config=None):
+    x = df.copy()
+    x["timestamp"] = pd.to_datetime(x["timestamp"])
+    h1 = x.set_index("timestamp").resample("1h").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}
+    ).dropna()
+
+    out = pd.Series(0, index=x.index, dtype="int8")
+    for i in range(60, len(x)):
+        ts = x["timestamp"].iloc[i]
+        h1c = h1[h1.index < ts]  # BUG: includes the still-forming current-hour bar
+        if len(h1c) < 2:
+            continue
+        if h1c["close"].iloc[-1] > h1c["close"].iloc[-2]:
+            out.iloc[i] = 1
+        elif h1c["close"].iloc[-1] < h1c["close"].iloc[-2]:
+            out.iloc[i] = -1
+    return out
+'''
+
+
+def _make_leaky_strategy_csv() -> bytes:
+    import numpy as np
+    import pandas as pd
+    rng = np.random.default_rng(11)
+    n = 1500
+    ts = pd.date_range("2024-01-01", periods=n, freq="15min")
+    price = 1900 + np.cumsum(rng.normal(0, 0.5, n))
+    df = pd.DataFrame({
+        "timestamp": ts, "open": price, "high": price + 0.5, "low": price - 0.5,
+        "close": price, "volume": 100.0,
+    })
+    return df.to_csv(index=False).encode()
+
+
+def test_python_strategy_with_lookahead_bug_shows_warning_banner():
+    import io
+    client = app.test_client()
+    data = {
+        "csv_file": (io.BytesIO(_make_leaky_strategy_csv()), "leaky.csv"),
+        "strategy_mode": "python",
+        "strategy_code": _LEAKY_PYTHON_STRATEGY,
+        "account_size": "100000", "profit_target": "8", "daily_loss": "5", "max_dd": "10",
+        "dd_type": "trailing", "consistency": "30", "min_days": "5", "payout_freq": "14",
+        "payout_threshold": "0", "buffer": "0", "payout_cap": "",
+        "initial_balance": "100000", "risk_mode": "percent", "risk_value": "1.0",
+        "max_trades_day": "10", "commission": "0", "slippage_pips": "0.5",
+        "spread_pips": "1.0", "pip_size": "0.0001",
+        "n_sims": "50", "mc_method": "bootstrap",
+    }
+    try:
+        r = client.post("/run", data=data, content_type="multipart/form-data")
+        body = r.get_data(as_text=True)
+        assert r.status_code in (200, 400)
+        if r.status_code == 200:
+            assert "LOOKAHEAD BIAS DETECTED" in body
+    finally:
+        for f in REPORTS_DIR.glob("report_*"):
+            f.unlink()

@@ -210,6 +210,7 @@ def run_pipeline():
             basename=f"report_{run_id}",
             holdout_comparison=holdout_comparison,
             risk_config=risk,
+            price_df=df,
         )
 
         import_note = None

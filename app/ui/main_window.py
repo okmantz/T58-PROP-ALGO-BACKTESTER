@@ -1416,6 +1416,7 @@ class MainWindow:
                 monte_carlo_result=mc_result,
                 holdout_comparison=holdout_comparison,
                 risk_config=risk,
+                price_df=df,
             )
 
             self._last_html_path = paths["html"]

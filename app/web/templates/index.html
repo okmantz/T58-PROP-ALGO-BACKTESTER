@@ -156,6 +156,14 @@
         <div><label>Drawdown type</label>
           <select name="dd_type"><option value="trailing">Trailing</option><option value="static">Static</option></select>
         </div>
+        <div><label>Drawdown check mode</label>
+          <select name="dd_check_mode" title="intrabar: floors monitored in real time, can force-close mid-trade. eod: only checked once per day using that day's final balance -- match to what your firm documents.">
+            <option value="intrabar">Intrabar (real-time)</option>
+            <option value="eod">EOD (end-of-day only)</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
         <div><label>Consistency rule (%)</label><input type="number" name="consistency" value="30"></div>
       </div>
       <div class="row">

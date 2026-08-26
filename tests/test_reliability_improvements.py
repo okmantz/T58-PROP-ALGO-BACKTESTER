@@ -90,3 +90,75 @@ def test_holdout_comparison_handles_too_little_data_gracefully():
     # Should not raise even on a pathologically short dataframe.
     holdout = run_holdout_comparison(df, _sma_strategy(), risk, holdout_frac=0.2)
     assert holdout["in_sample_bars"] + holdout["holdout_bars"] == len(df)
+
+
+def test_daily_loss_limit_force_closes_on_intrabar_floating_loss():
+    """
+    A long trade whose bar dips deep underwater intrabar (breaching the
+    daily loss floor) but recovers by the bar's close must still be
+    force-closed -- a real funded account would have been auto-liquidated
+    the moment floating equity crossed the daily floor, regardless of
+    where the bar eventually closes. Checking only realized end-of-bar
+    P&L would incorrectly let this trade ride.
+    """
+    from app.backtest.execution import run_execution
+
+    ts = pd.date_range("2024-01-01 09:00", periods=4, freq="15min")
+    # Bar 0: enter long at close via signal.
+    # Bar 1: gaps down hard intrabar (low far below entry) then recovers
+    #        to close near flat -- floating loss at the low must breach
+    #        the daily limit even though the close looks fine.
+    rows = [
+        (ts[0], 100.0, 100.2, 99.9, 100.0, 100.0),
+        (ts[1], 100.0, 100.1, 90.0, 99.9, 100.0),   # deep intrabar wick down
+        (ts[2], 99.9, 100.5, 99.8, 100.4, 100.0),
+        (ts[3], 100.4, 100.6, 100.3, 100.5, 100.0),
+    ]
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    signals = pd.Series([1, 1, 1, 1])
+
+    risk = RiskConfig(
+        initial_balance=10_000.0, risk_mode="percent", risk_value=1.0,
+        pip_size=1.0, daily_loss_limit_pct=5.0,  # 5% of 10,000 = $500 floor
+    )
+    trades, equity_df = run_execution(
+        df, signals, risk, stop_loss_pips=None, take_profit_pips=None,
+    )
+
+    # Sizing at 1% risk with the engine's 1%-of-price fallback stop
+    # (no stop defined) means the position is large enough that the
+    # bar-1 wick (10 points against a ~1-point fallback stop) is a
+    # catastrophic move well past the $500 daily floor.
+    reasons = [t.exit_reason for t in trades]
+    assert "daily_loss_limit_forced_close" in reasons
+    forced = next(t for t in trades if t.exit_reason == "daily_loss_limit_forced_close")
+    # Forced close must happen on bar 1 (the wick bar), not later.
+    assert forced.exit_time == ts[1]
+
+
+def test_equity_curve_reflects_mark_to_market_not_only_realized():
+    """
+    The equity curve must move while a trade is open and price is moving
+    against/for it, not just jump at trade close -- otherwise drawdown
+    statistics silently ignore intrabar/multi-bar floating losses.
+    """
+    from app.backtest.execution import run_execution
+
+    ts = pd.date_range("2024-01-01 09:00", periods=3, freq="15min")
+    rows = [
+        (ts[0], 100.0, 100.1, 99.9, 100.0, 100.0),
+        (ts[1], 100.0, 100.1, 99.9, 95.0, 100.0),   # large adverse close, trade stays open
+        (ts[2], 95.0, 95.1, 94.9, 95.0, 100.0),
+    ]
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    signals = pd.Series([1, 1, 1])
+
+    risk = RiskConfig(initial_balance=10_000.0, risk_mode="percent", risk_value=1.0, pip_size=1.0)
+    trades, equity_df = run_execution(
+        df, signals, risk, stop_loss_pips=None, take_profit_pips=None,
+    )
+    # Equity at bar 1 (still open, deep in floating loss) must already be
+    # below initial balance -- not flat at initial balance because
+    # nothing has "realized" yet.
+    equity_bar1 = equity_df.iloc[1]["equity"]
+    assert equity_bar1 < risk.initial_balance

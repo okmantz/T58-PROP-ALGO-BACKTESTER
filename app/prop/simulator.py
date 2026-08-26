@@ -28,6 +28,7 @@ class PropRules:
     daily_loss_limit_pct: float = 5.0              # max loss in a single day (% of account_size)
     max_drawdown_pct: float = 10.0                 # overall max drawdown allowed
     drawdown_type: str = "trailing"                 # "trailing" | "static"
+    drawdown_check_mode: str = "intrabar"           # "intrabar" | "eod" -- see note below
     consistency_rule_pct: float | None = 30.0       # best single day's profit <= this % of total profit
     min_trading_days: int = 5
     payout_threshold_pct: float = 0.0               # extra profit % (above account size) required before 1st payout eligibility, funded stage
@@ -35,6 +36,21 @@ class PropRules:
     payout_frequency_days: int = 14                 # min days between payouts
     required_buffer_pct: float = 0.0                # profit buffer that must be maintained above account_size before payout
     max_position_size: float | None = None          # informational cap on units (enforced in RiskConfig)
+
+    # drawdown_check_mode controls WHEN the daily-loss-limit and max-drawdown
+    # failure checks are evaluated:
+    #   "intrabar" (default, conservative): checked after every single trade
+    #   as it closes, matching a firm that monitors floating equity in real
+    #   time and can auto-liquidate mid-day the instant a floor is crossed.
+    #   "eod": checked only once per calendar day, using that day's final
+    #   cumulative balance after all of that day's trades -- matching firms
+    #   (many real futures prop firms, including both evaluated in this
+    #   codebase's research notes) that explicitly state an "EOD" drawdown
+    #   type: you can be deep underwater intraday and still be fine as long
+    #   as you close the day above the floor. Using "intrabar" against a
+    #   firm that is actually "eod" understates your true pass probability;
+    #   using "eod" against a firm that is actually real-time overstates it.
+    #   Match this to what the specific firm's rules document actually say.
 
 
 @dataclass
@@ -112,6 +128,14 @@ def simulate_account(
     best_day_profit = 0.0
 
     dates_norm = [pd.Timestamp(d).normalize() for d in trade_dates]
+    # Precompute, for each trade, whether it's the LAST trade of its
+    # calendar day -- needed for "eod" drawdown_check_mode, where the
+    # failure checks below only fire once per day (using that day's final
+    # cumulative balance) rather than after every single trade.
+    is_last_of_day = [
+        (i == len(dates_norm) - 1) or (dates_norm[i] != dates_norm[i + 1])
+        for i in range(len(dates_norm))
+    ]
 
     for i, (pnl, d) in enumerate(zip(trade_pnls, dates_norm)):
         if d not in day_index_map:
@@ -126,6 +150,14 @@ def simulate_account(
         total_profit_since_start += pnl
         best_day_profit = max(best_day_profit, day_profit_history[d])
 
+        cur_day_idx = day_index_map[d]
+        check_now = (rules.drawdown_check_mode == "intrabar") or is_last_of_day[i]
+
+        if not check_now:
+            # "eod" mode: this trade isn't the day's last -- defer the
+            # peak/drawdown/failure evaluation until the day is complete.
+            continue
+
         trailing_peak = max(trailing_peak, balance)
         if rules.drawdown_type == "trailing":
             dd_floor = trailing_peak * (1 - rules.max_drawdown_pct / 100.0)
@@ -133,8 +165,6 @@ def simulate_account(
             dd_floor = static_floor
         current_dd_pct = max(0.0, (trailing_peak - balance) / trailing_peak * 100.0) if trailing_peak else 0.0
         max_dd_pct_reached = max(max_dd_pct_reached, current_dd_pct)
-
-        cur_day_idx = day_index_map[d]
 
         # --- Failure checks (apply in both evaluation and funded stages) ---
         if daily_pnl[d] <= -rules.account_size * (rules.daily_loss_limit_pct / 100.0):

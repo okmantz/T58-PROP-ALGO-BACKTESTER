@@ -20,8 +20,11 @@ from app.backtest.risk import RiskConfig
 from app.data.importer import import_csv
 from app.data.storage import list_stored_datasets, store_csv_path
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
+from app.optimize.parameter_space import RefinementError
+from app.optimize.refinement import RefinementConfig, run_iterative_refinement
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
+from app.reports.refinement_report import generate_refinement_report
 from app.strategy.manual import ManualStrategy
 from app.ui.main_window import launch
 
@@ -48,7 +51,16 @@ def _resolve_default_csv() -> str:
     return "data/examples/EURUSD_5M_sample.csv"
 
 
-def run_cli(csv_path: str | None, n_sims: int, output_dir: str) -> None:
+def run_cli(
+    csv_path: str | None,
+    n_sims: int,
+    output_dir: str,
+    refine: bool = False,
+    refine_population: int = 10,
+    refine_generations: int = 5,
+    refine_metric: str = "composite_prop_score",
+    refine_seed: int | None = 42,
+) -> None:
     if csv_path is None:
         csv_path = _resolve_default_csv()
     else:
@@ -91,7 +103,8 @@ def run_cli(csv_path: str | None, n_sims: int, output_dir: str) -> None:
         return
 
     print(f"Running Monte Carlo simulation ({n_sims:,} runs)...")
-    mc_result = run_monte_carlo(bt_result.trades, rules, MonteCarloConfig(n_simulations=n_sims))
+    mc_cfg = MonteCarloConfig(n_simulations=n_sims)
+    mc_result = run_monte_carlo(bt_result.trades, rules, mc_cfg)
     print(f"  Evaluation pass probability: {mc_result.evaluation_pass_probability:.1f}%")
     print(f"  First payout probability: {mc_result.first_payout_probability:.1f}%")
     print(f"  Expected payout: ${mc_result.expected_payout:,.2f}")
@@ -123,6 +136,49 @@ def run_cli(csv_path: str | None, n_sims: int, output_dir: str) -> None:
     for k, p in paths.items():
         print(f"  {k}: {p}")
 
+    # ------------------------------------------------------------------
+    # Optional: Iterative Refinement. Off unless --refine is passed --
+    # everything above this point behaves exactly as it always has.
+    # ------------------------------------------------------------------
+    if not refine:
+        return
+
+    print("\n--- Iterative Refinement (--refine) ---")
+    if strategy.source_type != "manual":
+        print(
+            "  Skipped: Iterative Refinement currently supports Manual Strategy "
+            "Builder configurations only (Python/PineScript/MQL5 strategies have "
+            "no declared parameter schema to search over)."
+        )
+        return
+
+    refine_cfg = RefinementConfig(
+        fitness_metric=refine_metric,
+        population_size=refine_population,
+        generations=refine_generations,
+        random_seed=refine_seed,
+    )
+    try:
+        result = run_iterative_refinement(
+            df, strategy.config, risk, rules, mc_cfg, refine_cfg, progress_cb=print,
+        )
+    except RefinementError as exc:
+        print(f"  Skipped: {exc}")
+        return
+
+    refine_paths = generate_refinement_report(
+        output_dir=output_dir,
+        result=result,
+        strategy_name=bt_result.strategy_name,
+        instrument=Path(csv_path).name,
+        timeframe="unknown",
+        backtest_period=period,
+        price_df=df,
+    )
+    print("\nIterative Refinement report written to:")
+    for k, p in refine_paths.items():
+        print(f"  {k}: {p}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="T58 Trading — Prop Algo Backtester")
@@ -131,10 +187,34 @@ def main():
                                                        "most recently stored dataset in data/raw/, or the bundled sample")
     parser.add_argument("--sims", type=int, default=10000, help="number of Monte Carlo simulations (--cli mode)")
     parser.add_argument("--output", default="reports", help="output directory for the report (--cli mode)")
+    parser.add_argument(
+        "--refine", action="store_true",
+        help="optional: also run Iterative Refinement (genetic-algorithm-style parameter "
+             "search) after the normal report, and write a second, separate report. "
+             "Off by default -- the normal pipeline is completely unaffected without this "
+             "flag. Only applies to the default Manual Strategy Builder DEFAULT_MANUAL_STRATEGY "
+             "used by --cli; there is currently no --cli flag to load a custom Manual config.",
+    )
+    parser.add_argument("--refine-population", type=int, default=10, help="Iterative Refinement: configs per generation")
+    parser.add_argument("--refine-generations", type=int, default=5, help="Iterative Refinement: number of generations")
+    parser.add_argument(
+        "--refine-metric", default="composite_prop_score",
+        choices=["composite_prop_score", "eval_pass_probability", "first_payout_probability",
+                 "expected_payout", "net_profit", "profit_factor", "sharpe_ratio"],
+        help="Iterative Refinement: fitness metric to optimize for",
+    )
+    parser.add_argument("--refine-seed", type=int, default=42, help="Iterative Refinement: random seed")
     args = parser.parse_args()
 
     if args.cli:
-        run_cli(args.csv, args.sims, args.output)
+        run_cli(
+            args.csv, args.sims, args.output,
+            refine=args.refine,
+            refine_population=args.refine_population,
+            refine_generations=args.refine_generations,
+            refine_metric=args.refine_metric,
+            refine_seed=args.refine_seed,
+        )
     else:
         launch()
 

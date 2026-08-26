@@ -44,6 +44,18 @@ from app.ui.condition_builder import ConditionList
 
 OUTPUT_DIR = Path.cwd() / "reports"
 
+
+def _strategy_display_name(strategy) -> str:
+    if strategy.source_type == "manual":
+        return strategy.config.get("name", "Manual Strategy")
+    if strategy.source_type == "python":
+        return Path(strategy.file_path).stem
+    if strategy.source_type == "pinescript":
+        return "PineScript Strategy"
+    if strategy.source_type == "mql5":
+        return "MQL5 Strategy"
+    return "Strategy"
+
 DEFAULT_MANUAL_STRATEGY = {
     "name": "SMA 20/50 Cross",
     "description": "Trend-following moving-average crossover strategy.",
@@ -1178,20 +1190,13 @@ class MainWindow:
         """
         Runs Iterative Refinement against an already-built strategy/df/risk/
         rules/mc_cfg (the exact same objects the normal pipeline would use)
-        and writes a second, separate report. Raises RefinementError if the
-        strategy isn't eligible (non-manual, or no tunable parameters).
+        and writes a second, separate report. Works for Manual, Python,
+        PineScript, and MQL5 strategies alike. Raises RefinementError if the
+        strategy has no tunable parameters for its source type.
         """
-        if strategy.source_type != "manual":
-            raise RefinementError(
-                "Iterative Refinement currently supports Manual Strategy Builder "
-                "strategies only -- Python / PineScript / MQL5 strategies have no "
-                "declared parameter schema for the search to mutate. Build this "
-                "strategy in the Manual Strategy Builder (Step 2) to use this feature."
-            )
-
         refine_cfg = self._build_refine_config()
         result = run_iterative_refinement(
-            df, strategy.config, risk, rules, mc_cfg, refine_cfg, progress_cb=log_fn,
+            df, strategy, risk, rules, mc_cfg, refine_cfg, progress_cb=log_fn,
         )
 
         period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
@@ -1202,7 +1207,7 @@ class MainWindow:
         paths = generate_refinement_report(
             output_dir=OUTPUT_DIR,
             result=result,
-            strategy_name=strategy.config.get("name", "Manual Strategy"),
+            strategy_name=_strategy_display_name(strategy),
             instrument=instrument,
             timeframe="unknown",
             backtest_period=period,
@@ -1211,6 +1216,7 @@ class MainWindow:
 
         self._last_refinement_result = result
         self._last_refinement_html_path = paths["html"]
+        self._last_refinement_best_strategy_path = paths.get("best_strategy_file")
         self.open_refine_report_btn.config(state="normal")
         self.apply_best_config_btn.config(state="normal")
         return paths
@@ -1247,8 +1253,12 @@ class MainWindow:
         )
         Label(
             section,
-            text="Manual Strategy Builder strategies only -- Python / PineScript / MQL5 "
-                 "strategies have no declared parameter schema for the search to mutate.",
+            text="Works with Manual Strategy Builder, Python, PineScript, and MQL5 strategies. "
+                 "For Python it searches every top-level SCREAMING_SNAKE_CASE numeric constant "
+                 "(e.g. EMA_FAST, STOP_LOSS_PIPS); for PineScript, every input.int()/input.float() "
+                 "value; for MQL5, every iMA()/iRSI() period -- plus the T58_SL_PIPS/T58_TP_PIPS "
+                 "directives for all three. A strategy with no such parameters will say so clearly "
+                 "rather than run a meaningless search.",
             bg=PANEL, fg=AMBER, font=_safe_font(8), wraplength=820, justify="left",
         ).pack(anchor="w", padx=18, pady=(0, 10))
 
@@ -1307,6 +1317,7 @@ class MainWindow:
 
         self._last_refinement_result = None
         self._last_refinement_html_path = None
+        self._last_refinement_best_strategy_path = None
 
     def _log_refine(self, msg: str):
         self.refine_output.insert(END, msg + "\n")
@@ -1380,15 +1391,24 @@ class MainWindow:
                 "Run Iterative Refinement first, then apply its best configuration.",
             )
             return
+
+        result = self._last_refinement_result
+        source_type = result.source_type
+
+        if source_type != "manual":
+            self._apply_best_code_strategy(result, source_type)
+            return
+
         if self.strategy_mode.get() != "manual":
             messagebox.showwarning(
-                "Manual strategies only",
-                "Applying an optimized configuration back into the builder is only "
-                "supported for Manual Strategy Builder strategies.",
+                "Mode mismatch",
+                "This refinement result was optimized for a Manual Strategy Builder "
+                "strategy. Switch the Strategy tab to Manual mode to apply it, or "
+                "re-run Iterative Refinement against whatever strategy is currently selected.",
             )
             return
 
-        cfg = self._last_refinement_result.best.config
+        cfg = result.best.config
         entries = cfg.get("entry_conditions", {}) or {}
         exits = cfg.get("exit_conditions", {}) or {}
 
@@ -1430,6 +1450,37 @@ class MainWindow:
             "The optimized parameters have been loaded into the Strategy tab (Step 2). "
             "Switch tabs to review them, then re-run the normal pipeline (Step 5) to "
             "confirm the result with a fresh, non-search report.",
+        )
+
+    def _apply_best_code_strategy(self, result, source_type: str):
+        """
+        For Python/PineScript/MQL5 strategies, "applying" the winner means
+        pointing the Strategy tab's file selector at the already-written
+        patched source file (its logic is identical to the original -- only
+        the numeric parameter values changed), so the next run uses it.
+        """
+        path = getattr(self, "_last_refinement_best_strategy_path", None)
+        if not path:
+            messagebox.showinfo(
+                "File not available",
+                "The optimized strategy file wasn't written for this run -- try "
+                "running Iterative Refinement again.",
+            )
+            return
+
+        expected_mode = source_type  # "python" | "pinescript" | "mql5"
+        if self.strategy_mode.get() != expected_mode:
+            self._set_strategy_mode(expected_mode)
+
+        self.strategy_py_path = str(path)
+        self.strategy_file_status.config(text=f"Selected: {os.path.basename(str(path))}", fg=GREEN)
+
+        messagebox.showinfo(
+            "Applied",
+            f"The optimized {FITNESS_METRICS.get(result.fitness_metric, result.fitness_metric)}-tuned "
+            f"strategy file has been selected on the Strategy tab (Step 2):\n\n{path}\n\n"
+            "Re-run the normal pipeline (Step 5) to confirm the result with a fresh, "
+            "non-search report.",
         )
 
     # -----------------------------------------------------------------------

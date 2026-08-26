@@ -65,6 +65,7 @@ def build_refinement_report(
             "backtest_period_start": backtest_period[0],
             "backtest_period_end": backtest_period[1],
         },
+        "source_type": result.source_type,
         "search_settings": asdict(result.refinement_config),
         "fitness_metric": result.fitness_metric,
         "fitness_metric_label": FITNESS_METRIC_LABELS.get(result.fitness_metric, result.fitness_metric),
@@ -77,7 +78,10 @@ def build_refinement_report(
         ],
         "baseline": _candidate_summary(result.baseline),
         "best": _candidate_summary(result.best),
+        "best_genome": list(result.best.genome),
         "best_config": result.best.config,
+        "best_code_text": result.best.code_text,
+        "best_code_extension": result.best.code_extension,
         "generation_history": [asdict(g) for g in result.generation_history],
         "leaderboard": [_candidate_summary(c) for c in result.leaderboard[:25]],
         "holdout_comparison": result.holdout_comparison,
@@ -102,6 +106,19 @@ def export_best_config_json(best_config: dict, path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(best_config, f, indent=2, default=str)
+    return path
+
+
+def export_best_code_file(code_text: str, path: str | Path) -> Path:
+    """
+    Writes just the winning Python/PineScript/MQL5 source, standalone -- the
+    file to load directly as a strategy file, independent of the rest of
+    the refinement report.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(code_text)
     return path
 
 
@@ -255,7 +272,7 @@ search converges on a region of the parameter space.</p>
 
 <div class="tabs">
   <button class="tab-btn active" data-tab="leaderboard" type="button">Final Generation Leaderboard</button>
-  <button class="tab-btn" data-tab="config" type="button">Winning Configuration (JSON)</button>
+  <button class="tab-btn" data-tab="config" type="button">{config_tab_label}</button>
   <button class="tab-btn" data-tab="tradechart" type="button">Trade Visualization</button>
 </div>
 
@@ -266,9 +283,7 @@ search converges on a region of the parameter space.</p>
 </div>
 
 <div class="tab-panel" id="tab-config">
-<h2>Winning Configuration</h2>
-<p class="muted">The full Manual Strategy configuration dict for the best candidate found. Copy this to reuse it directly with <code>ManualStrategy(...)</code>, or as a reference while updating the Strategy tab by hand. A standalone copy is also written to <code>{basename}_best_config.json</code> next to this report.</p>
-<pre class="config">{best_config_json}</pre>
+{config_tab_body}
 </div>
 
 <div class="tab-panel" id="tab-tradechart">
@@ -391,10 +406,11 @@ def _comparison_table(report: dict) -> str:
     return f"<table><tr><th>Metric</th><th>Baseline (Current)</th><th>Optimized (Best Found)</th></tr>{rows}</table>"
 
 
-def _parameter_drift_table(report: dict, best_config: dict) -> str:
+def _parameter_drift_table(report: dict) -> str:
     params = report["parameters"]
+    genome = report["best_genome"]
     rows = []
-    for p, genome_val in zip(params, _genome_for(report)):
+    for p, genome_val in zip(params, genome):
         base = p["base_value"]
         change = "n/a" if base == 0 else f"{(genome_val - base) / abs(base) * 100:+.1f}%"
         kind = "integer" if p["is_int"] else "continuous"
@@ -406,17 +422,45 @@ def _parameter_drift_table(report: dict, best_config: dict) -> str:
     return f"<table>{header}{''.join(rows)}</table>"
 
 
-def _genome_for(report: dict) -> list[float]:
-    # The winning genome isn't serialized separately in the report dict (only
-    # the applied config is), so we recover each gene's optimized value
-    # straight from the winning config using its recorded path label. Simpler
-    # and safer: re-walk best_config with the same paths used to build
-    # `parameters`, via app.optimize.parameter_space.extract_genome on that
-    # config and matching by label (labels are unique per config shape).
-    from app.optimize.parameter_space import extract_genome
+_CODE_LANGUAGE_LABELS = {"python": "Python", "pinescript": "PineScript", "mql5": "MQL5"}
 
-    best_genes = {g.label: g.base_value for g in extract_genome(report["best_config"])}
-    return [best_genes.get(p["label"], p["base_value"]) for p in report["parameters"]]
+
+def _config_tab(report: dict, basename: str) -> tuple[str, str]:
+    """Returns (tab_label, tab_body_html) for the "winning configuration"
+    tab -- a Manual config as JSON, or patched source code for Python/
+    PineScript/MQL5 strategies."""
+    source_type = report.get("source_type", "manual")
+    if source_type == "manual":
+        label = "Winning Configuration (JSON)"
+        body = (
+            "<h2>Winning Configuration</h2>"
+            "<p class=\"muted\">The full Manual Strategy configuration dict for the best candidate found. "
+            "Copy this to reuse it directly with <code>ManualStrategy(...)</code>, or as a reference while "
+            f"updating the Strategy tab by hand. A standalone copy is also written to "
+            f"<code>{basename}_best_config.json</code> next to this report.</p>"
+            f"<pre class=\"config\">{json.dumps(report['best_config'], indent=2, default=str)}</pre>"
+        )
+        return label, body
+
+    ext = report.get("best_code_extension") or ".txt"
+    lang = _CODE_LANGUAGE_LABELS.get(source_type, source_type)
+    label = f"Winning Strategy ({lang})"
+    code_text = report.get("best_code_text") or "# No source available."
+    body = (
+        f"<h2>Winning {lang} Strategy</h2>"
+        f"<p class=\"muted\">The original strategy's source code with the best-found parameter values patched "
+        f"in directly (same file, same logic -- only the numeric parameter values changed). Load this file "
+        f"the same way you loaded the original to reuse it. A standalone copy is also written to "
+        f"<code>{basename}_best_strategy{ext}</code> next to this report.</p>"
+        f"<pre class=\"config\">{_html_escape(code_text)}</pre>"
+    )
+    return label, body
+
+
+def _html_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
 
 
 def _leaderboard_table(report: dict) -> str:
@@ -545,6 +589,7 @@ def export_refinement_html(
     baseline_fitness = report["baseline"]["fitness"]
     best_fitness = report["best"]["fitness"]
     best_generation = report["best"]["generation"]
+    config_tab_label, config_tab_body = _config_tab(report, basename)
 
     html = _HTML_TEMPLATE.format(
         logo_base64=T58_LOGO_BASE64,
@@ -566,7 +611,7 @@ def export_refinement_html(
         comparison_table=_comparison_table(report),
         convergence_chart=convergence_chart,
         diversity_chart=diversity_chart,
-        parameter_drift_table=_parameter_drift_table(report, report["best_config"]),
+        parameter_drift_table=_parameter_drift_table(report),
         best_stats_table=_dict_to_table(best_stats) if best_stats else "<p>No trades generated.</p>",
         best_prop_table=_dict_to_table(best_prop) if best_prop else "<p>No trades generated.</p>",
         best_mc_table=_dict_to_table(best_mc) if best_mc else "<p>No trades generated.</p>",
@@ -576,7 +621,8 @@ def export_refinement_html(
         equity_chart=equity_chart,
         holdout_section=_holdout_section(report.get("holdout_comparison")),
         leaderboard_table=_leaderboard_table(report),
-        best_config_json=json.dumps(report["best_config"], indent=2, default=str),
+        config_tab_label=config_tab_label,
+        config_tab_body=config_tab_body,
         basename=basename,
         trade_chart_html=trade_chart_html,
     )
@@ -598,8 +644,9 @@ def generate_refinement_report(
 ) -> dict[str, Path]:
     """
     Builds the refinement report dict and writes JSON + a standalone
-    best-config JSON + HTML to output_dir. Mirrors
-    app.reports.generator.generate_full_report's return shape.
+    best-config file (JSON for Manual, source code for Python/PineScript/
+    MQL5) + HTML to output_dir. Mirrors app.reports.generator.generate_full_report's
+    return shape.
     """
     report = build_refinement_report(result, strategy_name, instrument, timeframe, backtest_period)
 
@@ -615,10 +662,18 @@ def generate_refinement_report(
     output_dir = Path(output_dir)
     paths = {
         "json": export_refinement_json(report, output_dir / f"{basename}.json"),
-        "best_config_json": export_best_config_json(report["best_config"], output_dir / f"{basename}_best_config.json"),
-        "html": export_refinement_html(
-            report, output_dir / f"{basename}.html",
-            best_bt_result=result.best.bt_result, price_df=price_df, basename=basename,
-        ),
     }
+    if result.source_type == "manual":
+        paths["best_config_json"] = export_best_config_json(
+            report["best_config"], output_dir / f"{basename}_best_config.json",
+        )
+    else:
+        ext = report.get("best_code_extension") or ".txt"
+        paths["best_strategy_file"] = export_best_code_file(
+            report["best_code_text"] or "", output_dir / f"{basename}_best_strategy{ext}",
+        )
+    paths["html"] = export_refinement_html(
+        report, output_dir / f"{basename}.html",
+        best_bt_result=result.best.bt_result, price_df=price_df, basename=basename,
+    )
     return paths

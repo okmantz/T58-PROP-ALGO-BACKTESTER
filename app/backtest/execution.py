@@ -103,9 +103,10 @@ def run_execution(
     spread_price = risk.spread_pips * risk.pip_size
     slip_price = risk.slippage_pips * risk.pip_size
 
+    force_closed_count = 0
+
     for i in range(n):
         bar_date = pd.Timestamp(ts[i]).normalize()
-        equity_curve.append((ts[i], equity))
 
         # --- manage open trade: trailing stop / break-even, then stop/take intrabar ---
         if open_trade is not None:
@@ -116,6 +117,53 @@ def run_execution(
                 open_trade["best_price"] = max(open_trade["best_price"], favorable_extreme)
             else:
                 open_trade["best_price"] = min(open_trade["best_price"], favorable_extreme)
+
+            # Mark-to-market daily-loss check, using the ADVERSE intrabar
+            # extreme (low for a long, high for a short) rather than the
+            # close. A prop firm's daily-loss floor is monitored on
+            # floating equity in real time, not just on realized P&L at
+            # the moment a trade happens to close — a trade that dips
+            # deep underwater and recovers by the close of the bar can
+            # still have breached (and been auto-liquidated at) the daily
+            # floor intrabar. Checking only realized same-day P&L (the
+            # old behavior) silently let strategies "survive" daily-loss
+            # breaches that a real funded account would have been
+            # stopped out of.
+            adverse_extreme = lows[i] if direction == 1 else highs[i]
+            floating_adverse_pnl = (adverse_extreme - open_trade["entry_price"]) * open_trade["size"] * direction
+            day_realized_so_far = pnl_today.get(bar_date, 0.0)
+            if (
+                daily_limit_amount is not None
+                and (day_realized_so_far + floating_adverse_pnl) <= -daily_limit_amount
+            ):
+                # Force-close at the adverse extreme (the point the real
+                # account would have been liquidated at), paying the same
+                # round-turn cost as any other exit.
+                filled_exit_price = adverse_extreme - (spread_price + slip_price) * direction
+                pnl = (filled_exit_price - open_trade["entry_price"]) * open_trade["size"] * direction
+                pnl -= risk.commission_per_trade
+                if not math.isfinite(pnl):
+                    pnl = 0.0
+                equity += pnl
+                trades.append(Trade(
+                    entry_time=open_trade["entry_time"],
+                    exit_time=pd.Timestamp(ts[i]),
+                    direction=direction,
+                    entry_price=open_trade["entry_price"],
+                    exit_price=filled_exit_price,
+                    size=open_trade["size"],
+                    pnl=pnl,
+                    pnl_pct=(pnl / open_trade["equity_at_entry"]) * 100 if open_trade["equity_at_entry"] else 0.0,
+                    exit_reason="daily_loss_limit_forced_close",
+                    commission=risk.commission_per_trade,
+                    equity_after=equity,
+                    initial_risk=open_trade["initial_risk"],
+                ))
+                pnl_today[bar_date] = pnl_today.get(bar_date, 0.0) + pnl
+                open_trade = None
+                force_closed_count += 1
+                equity_curve.append((ts[i], equity))
+                continue
 
             stop = open_trade["stop_price"]
 
@@ -198,6 +246,21 @@ def run_execution(
                 ))
                 pnl_today[bar_date] = pnl_today.get(bar_date, 0.0) + pnl
                 open_trade = None
+
+        # --- mark-to-market equity curve point for this bar ---
+        # Realized equity plus the floating P&L of any still-open
+        # position, valued at this bar's close. This is what feeds the
+        # drawdown statistics (app.backtest.statistics) -- using realized
+        # equity alone understated true intrabar/multi-day drawdown
+        # whenever a trade was open across the peak.
+        if open_trade is not None:
+            floating_close_pnl = (
+                (closes[i] - open_trade["entry_price"]) * open_trade["size"] * open_trade["direction"]
+            )
+            mtm_equity = equity + floating_close_pnl
+        else:
+            mtm_equity = equity
+        equity_curve.append((ts[i], mtm_equity))
 
         # --- consider new entry ---
         day_realized_pnl = pnl_today.get(bar_date, 0.0)
@@ -296,6 +359,18 @@ def run_execution(
         ))
 
     equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
+
+    if force_closed_count:
+        import warnings
+        warnings.warn(
+            f"{force_closed_count} trade(s) were force-closed intrabar because "
+            "floating losses breached the configured daily_loss_limit_pct before "
+            "the trade's own stop/target/signal exit would have fired. This "
+            "mirrors a real prop firm auto-liquidating a funded account the "
+            "moment equity crosses the daily floor, which realized-P&L-only "
+            "accounting previously missed.",
+            RuntimeWarning,
+        )
 
     if fallback_stop_count:
         import warnings

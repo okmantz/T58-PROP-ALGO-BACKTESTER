@@ -1159,7 +1159,13 @@ class MainWindow:
         section = self._section(
             f,
             "Account & evaluation",
-            "Core evaluation parameters.",
+            "Core evaluation parameters. Drawdown check mode: 'intrabar' "
+            "monitors floating equity in real time (a floor breach can "
+            "force-close a position mid-trade); 'eod' only checks once per "
+            "day using that day's final balance, so an intraday dip that "
+            "recovers by the close doesn't count. Match this to what your "
+            "specific firm documents -- getting it backwards makes your "
+            "pass-probability estimate too pessimistic or too optimistic.",
             emphasize=True,
         )
 
@@ -1175,6 +1181,11 @@ class MainWindow:
         )
         self.p_dd_type = LabeledEntry(
             section, "Drawdown type (trailing/static)", "trailing"
+        )
+        self.p_dd_check_mode = LabeledEntry(
+            section,
+            "Drawdown check mode (intrabar/eod)",
+            "intrabar",
         )
         self.p_consistency = LabeledEntry(
             section, "Consistency rule (% best day of total profit)", 30
@@ -1215,6 +1226,7 @@ class MainWindow:
             daily_loss_limit_pct=self.p_daily_loss.get_float(5),
             max_drawdown_pct=self.p_max_dd.get_float(10),
             drawdown_type=self.p_dd_type.get_str().strip() or "trailing",
+            drawdown_check_mode=self.p_dd_check_mode.get_str().strip() or "intrabar",
             consistency_rule_pct=self.p_consistency.get_float(30),
             min_trading_days=self.p_min_days.get_int(5),
             payout_threshold_pct=self.p_payout_threshold.get_float(0),

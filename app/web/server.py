@@ -32,7 +32,7 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data.importer import import_csv, import_csv_bytes
-from app.data.storage import get_raw_data_dir, list_stored_datasets, store_csv_bytes
+from app.data.storage import get_app_base_dir, get_raw_data_dir, list_stored_datasets, store_csv_bytes
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
@@ -43,8 +43,16 @@ from app.strategy.mql5 import MQL5Strategy
 from app.strategy.pinescript import PineScriptStrategy
 from app.strategy.python import PythonStrategy
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+# get_app_base_dir() already knows how to find a persistent, writable
+# folder next to the running .exe when frozen (see app/data/storage.py),
+# vs. the repo root during normal development. Reusing it here (instead
+# of the old `Path(__file__).resolve().parent.parent.parent`) matters
+# specifically for the packaged web-app exe: PyInstaller --onefile runs
+# code from a temporary extraction folder that's deleted on exit, so the
+# old path would silently drop every report the moment the app closed.
+BASE_DIR = get_app_base_dir()
 REPORTS_DIR = BASE_DIR / "reports"
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 

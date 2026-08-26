@@ -74,6 +74,15 @@ OPERATOR_CODE = {
     "Greater Than": ">", "Greater Than or Equal": ">=", "Less Than": "<", "Less Than or Equal": "<=",
     "Equal To": "==", "Not Equal": "!=", "Cross Above": "cross above", "Cross Below": "cross below",
 }
+CODE_TO_OPERATOR = {v: k for k, v in OPERATOR_CODE.items()}
+
+# Reverse of SOURCE_KIND ("ema" -> "EMA", etc.) used to repopulate a row's
+# dropdowns from a saved/optimized condition dict (see ConditionRow.load_from
+# and ConditionList.set_from_conditions) -- e.g. what Iterative Refinement's
+# "Apply Best Configuration" button uses to push optimized parameters back
+# into this builder.
+KIND_TO_SOURCE = {v: k for k, v in SOURCE_KIND.items()}
+KIND_TO_SOURCE["price"] = "Price"
 
 PERIOD_KINDS = {
     "ema", "sma", "wma", "rsi", "atr", "macd", "macd_signal", "macd_histogram",
@@ -277,6 +286,49 @@ class ConditionRow(Frame):
             operand["session_end"] = session_end
         return operand
 
+    # -- reverse of the above: repopulate this row's widgets from a saved --
+    # -- or optimized condition dict (see ConditionList.set_from_conditions) --
+    def _load_operand_into(self, operand, kind_var: StringVar, period_var: StringVar,
+                            field_var: StringVar, direction_var: StringVar) -> None:
+        if not isinstance(operand, dict):
+            return
+        kind = str(operand.get("type", "price")).lower().strip()
+        kind_var.set(KIND_TO_SOURCE.get(kind, "Price"))
+        if "period" in operand and operand["period"] is not None:
+            period_var.set(str(operand["period"]))
+        if "field" in operand and operand["field"]:
+            field_var.set(str(operand["field"]).capitalize())
+        if "direction" in operand and operand["direction"]:
+            direction_var.set(str(operand["direction"]).capitalize())
+
+    def load_from(self, condition: dict, connector: str | None = None) -> None:
+        """Repopulate this row's widgets from a condition dict of the same
+        shape to_condition() produces. Used to push an Iterative Refinement
+        result (or any saved config) back into the visual builder."""
+        if connector is not None:
+            self.connector_var.set(connector)
+
+        left = condition.get("left", {}) if isinstance(condition, dict) else {}
+        self._load_operand_into(left, self.left_kind_var, self.left_period_var,
+                                 self.left_field_var, self.left_direction_var)
+
+        right = condition.get("right", {}) if isinstance(condition, dict) else {}
+        is_boolean_shorthand = (
+            condition.get("operator") == "==" and isinstance(right, dict)
+            and right.get("type") == "value" and right.get("value") == 1
+        )
+        if not is_boolean_shorthand:
+            op_code = str(condition.get("operator", ">"))
+            self.operator_var.set(CODE_TO_OPERATOR.get(op_code, "Greater Than"))
+            if isinstance(right, dict) and right.get("type") in ("value", "constant", "number"):
+                self.right_kind_var.set("Value")
+                self.right_value_var.set(str(right.get("value", 0)))
+            else:
+                self._load_operand_into(right, self.right_kind_var, self.right_period_var,
+                                         self.right_field_var, self.right_direction_var)
+
+        self._refresh()
+
 
 class ConditionList:
     """Manages a vertical stack of ConditionRow widgets inside `container`."""
@@ -314,3 +366,19 @@ class ConditionList:
         conditions = [r.to_condition(session_start, session_end) for r in self.rows]
         connectors = [r.connector_var.get() for r in self.rows[1:]]
         return conditions, connectors
+
+    def set_from_conditions(self, conditions: list[dict], connectors: list[str] | None = None) -> None:
+        """
+        Clears this list and rebuilds it from a list of condition dicts (the
+        same shape to_condition_list() produces) plus their AND/OR
+        connectors. Used by the "Apply Best Configuration" action after an
+        Iterative Refinement run, and generally to load any saved config.
+        """
+        connectors = connectors or []
+        while self.rows:
+            self._remove_row(self.rows[0])
+        for i, condition in enumerate(conditions or []):
+            self.add_row()
+            row = self.rows[-1]
+            connector = connectors[i - 1] if i > 0 and (i - 1) < len(connectors) else "AND"
+            row.load_from(condition, connector if i > 0 else None)

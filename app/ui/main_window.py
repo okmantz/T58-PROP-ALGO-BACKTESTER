@@ -74,21 +74,30 @@ DEFAULT_MANUAL_STRATEGY = {
     "take_profit_pips": 40,
 }
 
-BG = "#080A0D"
-PANEL = "#101318"
-PANEL_2 = "#15191F"
-PANEL_3 = "#1B2027"
-BORDER = "#292E36"
-BORDER_LIGHT = "#3A414B"
-TEXT = "#E5E7EB"
-TEXT_MUTED = "#8B929D"
-TEXT_DIM = "#626A75"
+BG = "#08090C"
+PANEL = "#131720"          # lifted slightly off BG so cards read as elevated surfaces
+PANEL_2 = "#171B25"
+PANEL_3 = "#1E232E"
+PANEL_HOVER = "#242A37"    # hover state for interactive surfaces (buttons, rows)
+BORDER = "#272C38"
+BORDER_LIGHT = "#3D4453"
+TEXT = "#E9EBEF"
+TEXT_MUTED = "#8D94A3"
+TEXT_DIM = "#5C6472"
 METAL = "#B8BDC5"
-METAL_BRIGHT = "#E1E4E8"
-GREEN = "#43D17A"
-RED = "#F05B63"
+METAL_BRIGHT = "#E7E9ED"
+GREEN = "#3ED685"
+RED = "#F0596A"
 BLUE = "#6FA8FF"
 AMBER = "#D9A441"
+# Signature brand accent — used deliberately for primary actions, the active
+# tab indicator, focus states and a handful of high-intent highlights. Kept
+# out of the status vocabulary (green/red/blue/amber already mean
+# success/error/info/warning) so it always reads as "act here."
+ACCENT = "#7C6FFF"
+ACCENT_HOVER = "#9089FF"
+ACCENT_DIM = "#332E5C"     # low-opacity-style accent for subtle fills/left-bars
+ACCENT_INK = "#0C0A16"     # near-black used as text on top of the bright accent
 FONT = "Segoe UI"
 MONO = "Consolas"
 
@@ -242,12 +251,20 @@ class MainWindow:
         self.tab_run = Frame(self.nb, bg=BG)
         self.tab_refine = Frame(self.nb, bg=BG)
 
-        self.nb.add(self.tab_data, text="  01  DATA  ")
-        self.nb.add(self.tab_strategy, text="  02  STRATEGY  ")
-        self.nb.add(self.tab_prop, text="  03  PROP RULES  ")
-        self.nb.add(self.tab_risk, text="  04  RISK  ")
-        self.nb.add(self.tab_run, text="  05  RUN & REPORT  ")
-        self.nb.add(self.tab_refine, text="  06  ITERATIVE REFINEMENT  ")
+        self.nb.add(self.tab_data, text="  01 ▤  DATA  ")
+        self.nb.add(self.tab_strategy, text="  02 ⚙  STRATEGY  ")
+        self.nb.add(self.tab_prop, text="  03 ⚖  PROP RULES  ")
+        self.nb.add(self.tab_risk, text="  04 ◈  RISK  ")
+        self.nb.add(self.tab_run, text="  05 ▶  RUN & REPORT  ")
+        self.nb.add(self.tab_refine, text="  06 ↻  REFINEMENT  ")
+
+        # Thin accent underline that tracks whichever tab is active, giving
+        # the tab strip a focal point beyond the stock ttk selected-color
+        # swap. Positioned with place() against the notebook's own
+        # coordinate space so it lines up exactly with the live tab bbox.
+        self.tab_indicator = Frame(self.nb, bg=ACCENT, height=3, bd=0, highlightthickness=0)
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._update_tab_indicator())
+        self.root.bind("<Configure>", lambda _e: self._update_tab_indicator())
 
         self._build_data_tab()
         self._build_strategy_tab()
@@ -255,6 +272,27 @@ class MainWindow:
         self._build_risk_tab()
         self._build_run_tab()
         self._build_refine_tab()
+
+        for delay in (50, 150, 400):
+            self.root.after(delay, self._update_tab_indicator)
+
+    def _update_tab_indicator(self):
+        # bbox() can legitimately return an empty/zero box for one frame
+        # right after the window is first realized (before the tab strip
+        # has been laid out) — hide the bar rather than leave it stuck at a
+        # stale position, and let the next <Configure>/tab-change re-place it.
+        try:
+            bbox = self.nb.bbox(self.nb.select())
+        except Exception:
+            bbox = None
+
+        if not bbox or bbox[2] == 0:
+            self.tab_indicator.place_forget()
+            return
+
+        bx, by, bw, bh = bbox
+        self.tab_indicator.place(in_=self.nb, x=bx, y=by + bh - 3, width=bw, height=3)
+        self.tab_indicator.lift()
 
     # -----------------------------------------------------------------------
     # Styling / shell
@@ -278,7 +316,7 @@ class MainWindow:
             "T58.TNotebook.Tab",
             background=PANEL,
             foreground=TEXT_MUTED,
-            padding=[18, 10],
+            padding=[20, 12],
             borderwidth=0,
             font=_safe_font(9, "bold"),
         )
@@ -289,17 +327,24 @@ class MainWindow:
                 ("active", PANEL_3),
             ],
             foreground=[
-                ("selected", METAL_BRIGHT),
+                ("selected", ACCENT_HOVER),
                 ("active", TEXT),
             ],
         )
 
         style.configure(
             "T58.Vertical.TScrollbar",
-            background=PANEL_2,
-            troughcolor=BG,
-            bordercolor=BG,
+            background=BORDER_LIGHT,
+            troughcolor=PANEL,
+            bordercolor=PANEL,
             arrowcolor=TEXT_DIM,
+            gripcount=0,
+            width=14,
+            relief="flat",
+        )
+        style.map(
+            "T58.Vertical.TScrollbar",
+            background=[("active", ACCENT), ("pressed", ACCENT_HOVER)],
         )
 
         style.configure(
@@ -327,11 +372,11 @@ class MainWindow:
 
         style.configure(
             "T58.Horizontal.TProgressbar",
-            background=METAL,
+            background=ACCENT,
             troughcolor=PANEL_3,
             bordercolor=PANEL_3,
-            lightcolor=METAL,
-            darkcolor=METAL,
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
         )
 
     def _build_header(self, parent):
@@ -363,13 +408,16 @@ class MainWindow:
                 font=_safe_font(32, "bold"),
             ).pack(anchor="w")
 
+        sub_row = Frame(mark, bg=BG)
+        sub_row.pack(anchor="w", pady=(0, 2))
+        Frame(sub_row, bg=ACCENT, width=10, height=2).pack(side="left", pady=(3, 0))
         Label(
-            mark,
+            sub_row,
             text="PROP ALGO BACKTESTER",
             bg=BG,
             fg=TEXT_MUTED,
             font=_safe_font(8, "bold"),
-        ).pack(anchor="w", pady=(0, 2))
+        ).pack(side="left", padx=(6, 0))
 
         right = Frame(header, bg=BG)
         right.pack(side="right", fill="y")
@@ -378,10 +426,12 @@ class MainWindow:
             right,
             text="MVP",
             bg=PANEL_2,
-            fg=METAL,
+            fg=ACCENT_HOVER,
             font=_safe_font(8, "bold"),
             padx=12,
             pady=5,
+            highlightthickness=1,
+            highlightbackground=BORDER_LIGHT,
         ).pack(anchor="e", pady=(17, 0))
 
         Label(
@@ -398,21 +448,25 @@ class MainWindow:
         box = Frame(parent, bg=BG)
         box.pack(fill="x", padx=24, pady=(20, 16))
 
+        eyebrow_row = Frame(box, bg=BG)
+        eyebrow_row.pack(anchor="w")
+
+        Frame(eyebrow_row, bg=ACCENT, width=14, height=2).pack(side="left", pady=(4, 0))
         Label(
-            box,
+            eyebrow_row,
             text=eyebrow.upper(),
             bg=BG,
-            fg=METAL,
+            fg=ACCENT_HOVER,
             font=_safe_font(8, "bold"),
-        ).pack(anchor="w")
+        ).pack(side="left", padx=(7, 0))
 
         Label(
             box,
             text=title,
             bg=BG,
             fg=METAL_BRIGHT,
-            font=_safe_font(20, "bold"),
-        ).pack(anchor="w", pady=(3, 3))
+            font=_safe_font(21, "bold"),
+        ).pack(anchor="w", pady=(5, 3))
 
         if description:
             Label(
@@ -425,7 +479,7 @@ class MainWindow:
                 justify="left",
             ).pack(anchor="w")
 
-        Frame(box, bg=BORDER, height=1).pack(fill="x", pady=(13, 0))
+        Frame(box, bg=BORDER, height=1).pack(fill="x", pady=(14, 0))
 
     def _button(self, parent, text, command, primary=False, width=None):
         kwargs = {
@@ -435,34 +489,67 @@ class MainWindow:
             "relief": "flat",
             "bd": 0,
             "cursor": "hand2",
-            "padx": 14,
-            "pady": 7,
+            "padx": 16,
+            "pady": 8,
         }
 
         if primary:
             kwargs.update(
-                bg=METAL_BRIGHT,
-                fg=BG,
-                activebackground=METAL,
-                activeforeground=BG,
+                bg=ACCENT,
+                fg="#FFFFFF",
+                activebackground=ACCENT_HOVER,
+                activeforeground="#FFFFFF",
+                highlightthickness=0,
             )
+            hover_bg, idle_bg = ACCENT_HOVER, ACCENT
         else:
             kwargs.update(
                 bg=PANEL_3,
                 fg=TEXT,
-                activebackground=BORDER_LIGHT,
+                activebackground=PANEL_HOVER,
                 activeforeground=METAL_BRIGHT,
+                highlightthickness=1,
+                highlightbackground=BORDER,
+                highlightcolor=BORDER_LIGHT,
             )
+            hover_bg, idle_bg = PANEL_HOVER, PANEL_3
 
         if width:
             kwargs["width"] = width
 
-        return Button(parent, **kwargs)
+        btn = Button(parent, **kwargs)
+
+        # Tk's native Button only recolors on click (activebackground), not on
+        # hover, so real cursor-follows-affordance feedback is added by hand.
+        def _on_enter(_e, b=btn, c=hover_bg):
+            if str(b["state"]) != "disabled":
+                b.configure(bg=c)
+
+        def _on_leave(_e, b=btn, c=idle_bg):
+            if str(b["state"]) != "disabled":
+                b.configure(bg=c)
+
+        btn.bind("<Enter>", _on_enter)
+        btn.bind("<Leave>", _on_leave)
+
+        return btn
 
     def _scrollable(self, parent) -> Frame:
         """Wraps `parent` in a mouse-wheel-scrollable canvas and returns an
         inner Frame to build content into. Used for tabs long enough to
-        overflow the window (the Manual Strategy Builder, in particular)."""
+        overflow the window (the Manual Strategy Builder, the Iterative
+        Refinement builder).
+
+        The wheel binding is done at the root level and dispatched by
+        cursor screen-position rather than the old Enter/Leave-on-canvas
+        approach: Tkinter fires Leave the instant the pointer moves onto a
+        child widget sitting inside the canvas (an Entry, Combobox, or
+        Button), which silently killed scrolling over almost all of the
+        actual form content and only worked in the bare margins. Binding
+        once at the root and checking which registered canvas's bounding
+        box contains the pointer fixes that regardless of which widget is
+        directly under the cursor.
+        """
         outer = Frame(parent, bg=BG)
         outer.pack(fill="both", expand=True)
 
@@ -478,34 +565,59 @@ class MainWindow:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        def _wheel(event):
-            delta = -1 * (event.delta // 120) if event.delta else (-1 if event.num == 4 else 1)
-            canvas.yview_scroll(int(delta), "units")
+        if not hasattr(self, "_scroll_canvases"):
+            self._scroll_canvases = []
+        self._scroll_canvases.append(canvas)
 
-        canvas.bind("<Enter>", lambda _e: (
-            canvas.bind_all("<MouseWheel>", _wheel),
-            canvas.bind_all("<Button-4>", _wheel),
-            canvas.bind_all("<Button-5>", _wheel),
-        ))
-        canvas.bind("<Leave>", lambda _e: (
-            canvas.unbind_all("<MouseWheel>"),
-            canvas.unbind_all("<Button-4>"),
-            canvas.unbind_all("<Button-5>"),
-        ))
+        def _dispatch_wheel(event, delta):
+            x, y = event.x_root, event.y_root
+            for c in self._scroll_canvases:
+                try:
+                    if not c.winfo_ismapped():
+                        continue
+                    x1, y1 = c.winfo_rootx(), c.winfo_rooty()
+                    x2, y2 = x1 + c.winfo_width(), y1 + c.winfo_height()
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        c.yview_scroll(int(delta), "units")
+                        return
+                except Exception:
+                    continue
+
+        if not getattr(self, "_wheel_bound", False):
+            self._wheel_bound = True
+            self.root.bind_all(
+                "<MouseWheel>",
+                lambda e: _dispatch_wheel(e, -1 * (e.delta // 120)),
+            )
+            self.root.bind_all("<Button-4>", lambda e: _dispatch_wheel(e, -1))
+            self.root.bind_all("<Button-5>", lambda e: _dispatch_wheel(e, 1))
 
         return inner
 
-    def _section(self, parent, title, subtitle=""):
-        box = Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
-        box.pack(fill="x", padx=24, pady=7)
+    def _section(self, parent, title, subtitle="", emphasize=False):
+        """A card-style container. `emphasize=True` marks the one primary
+        action card on a tab (e.g. the run/import card) with a left accent
+        bar, so each screen has a single clear focal point instead of every
+        panel competing at the same visual weight."""
+        wrap = Frame(parent, bg=BG)
+        wrap.pack(fill="x", padx=24, pady=7)
+
+        if emphasize:
+            Frame(wrap, bg=ACCENT, width=3).pack(side="left", fill="y")
+
+        box = Frame(wrap, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        box.pack(side="left", fill="both", expand=True)
+
+        title_row = Frame(box, bg=PANEL)
+        title_row.pack(fill="x", padx=18, pady=(14, 2))
 
         Label(
-            box,
+            title_row,
             text=title.upper(),
             bg=PANEL,
-            fg=METAL,
+            fg=ACCENT_HOVER if emphasize else METAL,
             font=_safe_font(9, "bold"),
-        ).pack(anchor="w", padx=18, pady=(13, 2))
+        ).pack(side="left")
 
         if subtitle:
             Label(
@@ -540,6 +652,7 @@ class MainWindow:
             "for multi-timeframe analysis (e.g. 60m for bias, 15m for zone, 5m for entry). "
             "The finest timeframe selected becomes the base/entry timeframe; the others are "
             "merged in as 'tfNN_open/high/low/close/volume' context columns.",
+            emphasize=True,
         )
 
         list_frame = Frame(section, bg=PANEL)
@@ -800,6 +913,7 @@ class MainWindow:
             "Entry conditions",
             "Build one or more rules using AND / OR. A trade only enters once every "
             "condition in the chain evaluates true. Example: Close > EMA(50) AND RSI(14) > 55.",
+            emphasize=True,
         )
 
         Label(entry_section, text="LONG ENTRY", bg=PANEL, fg=GREEN, font=_safe_font(9, "bold")).pack(
@@ -1046,6 +1160,7 @@ class MainWindow:
             f,
             "Account & evaluation",
             "Core evaluation parameters.",
+            emphasize=True,
         )
 
         self.p_account_size = LabeledEntry(section, "Account size ($)", 100000)
@@ -1127,6 +1242,7 @@ class MainWindow:
             f,
             "Risk configuration",
             "These parameters are passed directly into the backtest engine.",
+            emphasize=True,
         )
 
         self.r_initial_balance = LabeledEntry(
@@ -1501,6 +1617,7 @@ class MainWindow:
             f,
             "Simulation",
             "Configure the Monte Carlo run before starting.",
+            emphasize=True,
         )
 
         self.mc_sims = LabeledEntry(

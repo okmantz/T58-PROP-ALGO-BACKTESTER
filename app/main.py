@@ -144,13 +144,6 @@ def run_cli(
         return
 
     print("\n--- Iterative Refinement (--refine) ---")
-    if strategy.source_type != "manual":
-        print(
-            "  Skipped: Iterative Refinement currently supports Manual Strategy "
-            "Builder configurations only (Python/PineScript/MQL5 strategies have "
-            "no declared parameter schema to search over)."
-        )
-        return
 
     refine_cfg = RefinementConfig(
         fitness_metric=refine_metric,
@@ -160,7 +153,7 @@ def run_cli(
     )
     try:
         result = run_iterative_refinement(
-            df, strategy.config, risk, rules, mc_cfg, refine_cfg, progress_cb=print,
+            df, strategy, risk, rules, mc_cfg, refine_cfg, progress_cb=print,
         )
     except RefinementError as exc:
         print(f"  Skipped: {exc}")

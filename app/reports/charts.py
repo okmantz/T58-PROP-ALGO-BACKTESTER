@@ -194,3 +194,96 @@ def svg_histogram(
   {note_el}
 </svg>
 """.strip()
+
+
+def svg_multi_line_chart(
+    series: list[tuple[str, list[float], str]],
+    width: int = 760,
+    height: int = 260,
+    title: str = "",
+    x_label: str = "",
+    y_label: str = "",
+) -> str:
+    """
+    Multiple labeled line series on shared axes (e.g. best-fitness vs
+    mean-fitness per generation, for the Iterative Refinement convergence
+    chart). `series` is a list of (label, values, color) tuples; all value
+    lists must be the same length (one point per x-position, e.g. one per
+    generation).
+    """
+    pad_left, pad_right, pad_top, pad_bottom = 56, 16, 16, 40
+    plot_w = max(width - pad_left - pad_right, 10)
+    plot_h = max(height - pad_top - pad_bottom, 10)
+
+    clean_series = []
+    for label, values, color in series:
+        clean = [v for v in values if math.isfinite(v)]
+        if clean:
+            clean_series.append((label, values, color, clean))
+
+    if not clean_series:
+        return f'<svg width="{width}" height="{height}"><text x="20" y="20">No data.</text></svg>'
+
+    n = max(len(values) for _, values, _, _ in clean_series)
+    all_clean = [v for _, _, _, clean in clean_series for v in clean]
+    lo, hi = min(all_clean), max(all_clean)
+    if lo == hi:
+        lo -= 1
+        hi += 1
+    span = hi - lo
+    step = plot_w / max(n - 1, 1)
+
+    def px(i: int) -> float:
+        return pad_left + i * step
+
+    def py(v: float) -> float:
+        return pad_top + plot_h - ((v - lo) / span) * plot_h
+
+    gridlines = []
+    for i in range(5):
+        gy = pad_top + plot_h * i / 4
+        gv = hi - span * i / 4
+        gridlines.append(
+            f'<line x1="{pad_left}" y1="{gy:.1f}" x2="{width - pad_right}" y2="{gy:.1f}" '
+            f'stroke="#e3e6ea" stroke-width="1"/>'
+            f'<text x="{pad_left - 8}" y="{gy + 4:.1f}" font-size="10" fill="#666" text-anchor="end">{gv:,.1f}</text>'
+        )
+
+    paths = []
+    legend = []
+    for i, (label, values, color, _clean) in enumerate(clean_series):
+        pts = [(px(j), py(v)) for j, v in enumerate(values) if math.isfinite(v)]
+        if len(pts) >= 2:
+            path = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+            paths.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2"/>')
+        for x, y in pts:
+            paths.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5" fill="{color}"/>')
+        lx = pad_left + i * 150
+        legend.append(
+            f'<rect x="{lx}" y="{height - 12}" width="10" height="10" fill="{color}"/>'
+            f'<text x="{lx + 14}" y="{height - 3}" font-size="10" fill="#333">{label}</text>'
+        )
+
+    title_el = f'<text x="{pad_left}" y="14" font-size="12" font-weight="700" fill="#111">{title}</text>' if title else ""
+    ylabel_el = (
+        f'<text x="14" y="{pad_top + plot_h / 2:.1f}" font-size="10" fill="#666" '
+        f'transform="rotate(-90 14 {pad_top + plot_h / 2:.1f})" text-anchor="middle">{y_label}</text>'
+        if y_label else ""
+    )
+    xlabel_el = (
+        f'<text x="{pad_left + plot_w / 2:.1f}" y="{pad_top + plot_h + 22}" font-size="9" '
+        f'fill="#666" text-anchor="middle">{x_label}</text>'
+        if x_label else ""
+    )
+
+    return f"""
+<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>
+  {title_el}
+  {ylabel_el}
+  {''.join(gridlines)}
+  {''.join(paths)}
+  {xlabel_el}
+  {''.join(legend)}
+</svg>
+""".strip()

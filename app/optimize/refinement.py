@@ -1,0 +1,413 @@
+"""
+Iterative Refinement engine.
+
+A small, dependency-free genetic algorithm that searches a Manual
+Strategy's numeric parameter space (see app.optimize.parameter_space) for
+the configuration that scores best on a chosen fitness metric, evaluated
+on the SAME historical dataset used for the normal backtest.
+
+Each "generation":
+  1. keeps the top `elite_count` configs from the current population unchanged
+  2. breeds the rest via tournament-selected crossover + mutation
+  3. injects a small fraction of fresh, fully-random configs ("random
+     immigrants") to keep the search from collapsing onto one local optimum
+  4. re-evaluates the new population (backtest -> prop simulation ->
+     a *cheap* Monte Carlo pass) and scores it
+
+Across generations the population's parameters converge toward whatever
+scores highest on the fitness metric -- the "genetic algorithm-like
+optimization" Owen asked for. After the last generation, the single
+best-ever candidate found across the whole search is re-evaluated once
+more with the SAME Monte Carlo fidelity (n_simulations) as the main
+pipeline, plus an out-of-sample holdout check, so the final report's
+headline numbers are as trustworthy as the first report's.
+
+IMPORTANT -- this is an in-sample search. It will always find *something*
+that looks better on the exact historical window it was run against, even
+if that improvement is pure noise. The holdout check and the prominent
+overfitting-risk note in the generated report exist specifically to catch
+that. Iterative Refinement should never be treated as proof a strategy
+is better -- only as a faster way to generate candidates worth falsifying.
+"""
+from __future__ import annotations
+
+import math
+import random
+import time
+from dataclasses import dataclass, field, replace
+from typing import Callable
+
+import pandas as pd
+
+from app.backtest.engine import BacktestResult, run_backtest, run_holdout_comparison
+from app.backtest.risk import RiskConfig
+from app.monte_carlo.engine import MonteCarloConfig, MonteCarloResult, run_monte_carlo
+from app.optimize.parameter_space import GeneMeta, RefinementError, apply_genome, extract_genome
+from app.prop.simulator import AccountSimResult, PropRules, simulate_account, summarize_single_run
+from app.strategy.manual import ManualStrategy
+
+ProgressCallback = Callable[[str], None]
+
+# Human-readable labels for the fitness-metric dropdown in the UI. Keys
+# here are the exact strings accepted by RefinementConfig.fitness_metric.
+FITNESS_METRICS: dict[str, str] = {
+    "composite_prop_score": "Composite Prop Score (recommended)",
+    "eval_pass_probability": "Evaluation Pass Probability",
+    "first_payout_probability": "First Payout Probability",
+    "expected_payout": "Expected Payout ($)",
+    "net_profit": "Net Profit ($)",
+    "profit_factor": "Profit Factor",
+    "sharpe_ratio": "Sharpe Ratio",
+}
+
+
+@dataclass
+class RefinementConfig:
+    enabled: bool = False
+    fitness_metric: str = "composite_prop_score"
+    population_size: int = 10
+    generations: int = 5
+    elite_count: int = 2
+    mutation_rate: float = 0.35        # probability each gene mutates in a bred child
+    mutation_strength: float = 0.25    # mutation step size, as a fraction of that gene's search range
+    random_immigrants_frac: float = 0.15  # fraction of each new generation that is freshly randomized
+    search_monte_carlo_sims: int = 500    # cheap MC used while searching, for speed
+    random_seed: int | None = 42
+
+    def __post_init__(self):
+        self.population_size = max(int(self.population_size), 4)
+        self.generations = max(int(self.generations), 1)
+        self.elite_count = max(1, min(int(self.elite_count), self.population_size - 1))
+        self.mutation_rate = min(max(float(self.mutation_rate), 0.0), 1.0)
+        self.mutation_strength = min(max(float(self.mutation_strength), 0.01), 1.0)
+        self.random_immigrants_frac = min(max(float(self.random_immigrants_frac), 0.0), 0.9)
+        self.search_monte_carlo_sims = max(int(self.search_monte_carlo_sims), 50)
+        if self.fitness_metric not in FITNESS_METRICS:
+            raise RefinementError(f"Unknown fitness metric '{self.fitness_metric}'.")
+
+
+@dataclass
+class Candidate:
+    generation: int
+    genome: list
+    config: dict
+    fitness: float
+    statistics: dict | None = None          # BacktestStatistics.to_dict()
+    prop_summary: dict | None = None        # summarize_single_run(...)
+    mc_summary: dict | None = None          # a few key Monte Carlo fields (cheap to keep for every candidate)
+    # Full objects are only kept for the baseline and the final best
+    # candidate (see _evaluate keep_full=) -- keeping them for every
+    # candidate in every generation would mean holding population_size *
+    # generations full equity curves in memory at once.
+    bt_result: BacktestResult | None = None
+    mc_result: MonteCarloResult | None = None
+    single_run: AccountSimResult | None = None
+
+
+@dataclass
+class GenerationSummary:
+    generation: int
+    best_fitness: float
+    mean_fitness: float
+    worst_fitness: float
+    diversity: float   # average normalized population std-dev across genes; falls as the GA converges
+
+
+@dataclass
+class RefinementResult:
+    refinement_config: RefinementConfig
+    fitness_metric: str
+    genes: list  # list[GeneMeta]
+    baseline: Candidate
+    best: Candidate
+    generation_history: list  # list[GenerationSummary]
+    leaderboard: list  # list[Candidate], final generation, sorted best-first
+    holdout_comparison: dict | None
+    elapsed_seconds: float
+    warnings: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Fitness
+# ---------------------------------------------------------------------------
+
+def compute_fitness(stats: dict, prop_summary: dict | None, mc: MonteCarloResult, metric: str) -> float:
+    if metric == "net_profit":
+        return float(stats.get("net_profit", 0.0))
+    if metric == "profit_factor":
+        pf = stats.get("profit_factor", 0.0)
+        return 10.0 if pf == float("inf") else float(pf)
+    if metric == "sharpe_ratio":
+        return float(stats.get("sharpe_ratio", 0.0))
+    if metric == "eval_pass_probability":
+        return float(mc.evaluation_pass_probability)
+    if metric == "first_payout_probability":
+        return float(mc.first_payout_probability)
+    if metric == "expected_payout":
+        return float(mc.expected_payout)
+    if metric == "composite_prop_score":
+        return float(
+            mc.evaluation_pass_probability * 0.5
+            + mc.first_payout_probability * 0.3
+            - mc.risk_of_ruin_pct * 0.2
+        )
+    raise RefinementError(f"Unknown fitness metric '{metric}'.")
+
+
+def _mc_summary(mc: MonteCarloResult) -> dict:
+    return {
+        "evaluation_pass_probability": mc.evaluation_pass_probability,
+        "first_payout_probability": mc.first_payout_probability,
+        "failure_before_payout_probability": mc.failure_before_payout_probability,
+        "expected_payout": mc.expected_payout,
+        "risk_of_ruin_pct": mc.risk_of_ruin_pct,
+        "median_drawdown_pct": mc.median_drawdown_pct,
+        "n_simulations": mc.n_simulations,
+    }
+
+
+def _evaluate(
+    df: pd.DataFrame,
+    config: dict,
+    risk: RiskConfig,
+    prop_rules: PropRules,
+    mc_cfg: MonteCarloConfig,
+    metric: str,
+    keep_full: bool = False,
+):
+    """Runs one full backtest -> prop sim -> Monte Carlo pass for one config."""
+    strategy = ManualStrategy(config)
+    bt_result = run_backtest(df, strategy, risk)
+
+    if not bt_result.trades:
+        return (
+            float("-inf"),
+            bt_result.statistics.to_dict(),
+            None,
+            None,
+            bt_result if keep_full else None,
+            None,
+            None,
+        )
+
+    trade_pnls = [t.pnl for t in bt_result.trades]
+    trade_dates = [t.entry_time for t in bt_result.trades]
+    single_run = simulate_account(trade_pnls, trade_dates, prop_rules)
+    mc_result = run_monte_carlo(bt_result.trades, prop_rules, mc_cfg)
+    prop_summary = summarize_single_run(single_run)
+
+    fitness = compute_fitness(bt_result.statistics.to_dict(), prop_summary, mc_result, metric)
+    if not math.isfinite(fitness):
+        fitness = float("-inf")
+
+    return (
+        fitness,
+        bt_result.statistics.to_dict(),
+        prop_summary,
+        _mc_summary(mc_result),
+        bt_result if keep_full else None,
+        mc_result if keep_full else None,
+        single_run if keep_full else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Genetic operators
+# ---------------------------------------------------------------------------
+
+def _random_gene_value(gene: GeneMeta, rng: random.Random) -> float:
+    v = rng.uniform(gene.lo, gene.hi)
+    return float(round(v)) if gene.is_int else float(v)
+
+
+def _crossover(genome_a: list, genome_b: list, rng: random.Random) -> list:
+    return [genome_a[i] if rng.random() < 0.5 else genome_b[i] for i in range(len(genome_a))]
+
+
+def _mutate(genome: list, genes: list[GeneMeta], rate: float, strength: float, rng: random.Random) -> list:
+    out = list(genome)
+    for i, gene in enumerate(genes):
+        if rng.random() < rate:
+            span = gene.hi - gene.lo
+            delta = rng.uniform(-strength, strength) * span
+            v = min(max(out[i] + delta, gene.lo), gene.hi)
+            out[i] = float(round(v)) if gene.is_int else float(v)
+    return out
+
+
+def _tournament_select(population: list[Candidate], rng: random.Random, k: int = 3) -> Candidate:
+    k = min(k, len(population))
+    contenders = rng.sample(population, k)
+    return max(contenders, key=lambda c: c.fitness)
+
+
+def _diversity(population: list[Candidate], genes: list[GeneMeta]) -> float:
+    if not genes or len(population) < 2:
+        return 0.0
+    total = 0.0
+    for i, gene in enumerate(genes):
+        span = (gene.hi - gene.lo) or 1.0
+        vals = [c.genome[i] for c in population]
+        mean_v = sum(vals) / len(vals)
+        var = sum((v - mean_v) ** 2 for v in vals) / len(vals)
+        total += (var ** 0.5) / span
+    return total / len(genes)
+
+
+def _summarize_generation(gen: int, population: list[Candidate], genes: list[GeneMeta]) -> GenerationSummary:
+    finite = [c.fitness for c in population if math.isfinite(c.fitness)]
+    best = max((c.fitness for c in population), default=float("-inf"))
+    mean = (sum(finite) / len(finite)) if finite else float("-inf")
+    worst = min(finite) if finite else float("-inf")
+    return GenerationSummary(
+        generation=gen, best_fitness=best, mean_fitness=mean, worst_fitness=worst,
+        diversity=_diversity(population, genes),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run_iterative_refinement(
+    df: pd.DataFrame,
+    base_config: dict,
+    risk: RiskConfig,
+    prop_rules: PropRules,
+    mc_config: MonteCarloConfig,
+    refinement_config: RefinementConfig,
+    progress_cb: ProgressCallback | None = None,
+) -> RefinementResult:
+    """
+    base_config: a ManualStrategy config dict (e.g. `strategy.config` for a
+    ManualStrategy instance already built by the UI/CLI for the normal run).
+    mc_config: the SAME MonteCarloConfig used for the main pipeline run --
+    its n_simulations is used for the baseline and the final best-candidate
+    evaluation; the search phase uses refinement_config.search_monte_carlo_sims
+    instead, for speed.
+    """
+    def log(msg: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+
+    t0 = time.time()
+    cfg = refinement_config
+    warnings: list[str] = []
+
+    genes = extract_genome(base_config)
+    if not genes:
+        raise RefinementError(
+            "No tunable numeric parameters were found in this strategy configuration. "
+            "Iterative Refinement optimizes Manual Strategy Builder parameters "
+            "(indicator periods, comparison thresholds, stop loss / take profit / "
+            "trailing stop / break-even values). Add at least one indicator-based "
+            "condition, or a Fixed or ATR-based stop/target, and try again."
+        )
+
+    rng = random.Random(cfg.random_seed)
+    search_mc_cfg = replace(mc_config, n_simulations=cfg.search_monte_carlo_sims)
+
+    def evaluate(genome: list, generation: int, keep_full: bool = False) -> Candidate:
+        config = apply_genome(base_config, genes, genome)
+        fitness, stats, prop_summary, mc_summary, bt_full, mc_full, single_full = _evaluate(
+            df, config, risk, prop_rules, search_mc_cfg, cfg.fitness_metric, keep_full=keep_full,
+        )
+        return Candidate(
+            generation=generation, genome=list(genome), config=config, fitness=fitness,
+            statistics=stats, prop_summary=prop_summary, mc_summary=mc_summary,
+            bt_result=bt_full, mc_result=mc_full, single_run=single_full,
+        )
+
+    log(f"Analyzing strategy parameters... found {len(genes)} tunable parameter(s).")
+
+    baseline_genome = [g.base_value for g in genes]
+    baseline = evaluate(baseline_genome, 0, keep_full=True)
+    if not math.isfinite(baseline.fitness):
+        warnings.append(
+            "The current (baseline) configuration produced no trades on this data "
+            "-- there is no known-good baseline to compare the search against."
+        )
+    log(f"Baseline fitness ({FITNESS_METRICS[cfg.fitness_metric]}): {baseline.fitness:.3f}")
+
+    population: list[Candidate] = [baseline]
+    while len(population) < cfg.population_size:
+        population.append(evaluate([_random_gene_value(g, rng) for g in genes], 0))
+
+    best_ever = max(population, key=lambda c: c.fitness)
+    generation_history: list[GenerationSummary] = [_summarize_generation(0, population, genes)]
+    log(
+        f"Generation 0 (initial population of {cfg.population_size}): "
+        f"best={generation_history[0].best_fitness:.3f}  mean={generation_history[0].mean_fitness:.3f}"
+    )
+
+    for gen in range(1, cfg.generations + 1):
+        population.sort(key=lambda c: c.fitness, reverse=True)
+        elites = population[: cfg.elite_count]
+        next_pop: list[Candidate] = list(elites)
+
+        n_immigrants = max(1, round(cfg.population_size * cfg.random_immigrants_frac))
+        n_bred = max(cfg.population_size - len(elites) - n_immigrants, 0)
+
+        for _ in range(n_bred):
+            parent_a = _tournament_select(population, rng)
+            parent_b = _tournament_select(population, rng)
+            child_genome = _crossover(parent_a.genome, parent_b.genome, rng)
+            child_genome = _mutate(child_genome, genes, cfg.mutation_rate, cfg.mutation_strength, rng)
+            next_pop.append(evaluate(child_genome, gen))
+
+        while len(next_pop) < cfg.population_size:
+            next_pop.append(evaluate([_random_gene_value(g, rng) for g in genes], gen))
+
+        population = next_pop
+        gen_summary = _summarize_generation(gen, population, genes)
+        generation_history.append(gen_summary)
+
+        gen_best = max(population, key=lambda c: c.fitness)
+        if gen_best.fitness > best_ever.fitness:
+            best_ever = gen_best
+
+        log(
+            f"Generation {gen}/{cfg.generations}: best={gen_summary.best_fitness:.3f}  "
+            f"mean={gen_summary.mean_fitness:.3f}  diversity={gen_summary.diversity:.3f}  "
+            f"(best-ever={best_ever.fitness:.3f})"
+        )
+
+    log("Running full-fidelity Monte Carlo on the best-ever configuration...")
+    final_fitness, final_stats, final_prop, final_mc_summary, final_bt, final_mc, final_single = _evaluate(
+        df, best_ever.config, risk, prop_rules, mc_config, cfg.fitness_metric, keep_full=True,
+    )
+    best_final = Candidate(
+        generation=best_ever.generation, genome=best_ever.genome, config=best_ever.config,
+        fitness=final_fitness, statistics=final_stats, prop_summary=final_prop,
+        mc_summary=final_mc_summary, bt_result=final_bt, mc_result=final_mc, single_run=final_single,
+    )
+
+    holdout_comparison = None
+    if final_bt is not None and final_bt.trades:
+        log("Running out-of-sample holdout check on the optimized configuration...")
+        try:
+            holdout_comparison = run_holdout_comparison(
+                df, ManualStrategy(best_ever.config), risk, holdout_frac=0.2,
+            )
+        except Exception:
+            warnings.append(
+                "Holdout check on the optimized configuration could not be "
+                "completed (not enough data to split)."
+            )
+
+    leaderboard = sorted(population, key=lambda c: c.fitness, reverse=True)
+    elapsed = time.time() - t0
+    log(f"Iterative Refinement complete in {elapsed:.1f}s.")
+
+    return RefinementResult(
+        refinement_config=cfg,
+        fitness_metric=cfg.fitness_metric,
+        genes=genes,
+        baseline=baseline,
+        best=best_final,
+        generation_history=generation_history,
+        leaderboard=leaderboard,
+        holdout_comparison=holdout_comparison,
+        elapsed_seconds=elapsed,
+        warnings=warnings,
+    )

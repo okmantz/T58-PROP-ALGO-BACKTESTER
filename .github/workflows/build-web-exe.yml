@@ -1,0 +1,183 @@
+name: build-web-exe
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  workflow_dispatch: {}
+
+jobs:
+  build-windows-web-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Verify repository structure
+        shell: pwsh
+        run: |
+          Write-Host "=== VERIFYING REPOSITORY ==="
+
+          if (-not (Test-Path "run_web.py")) {
+            Write-Error "run_web.py was NOT found."
+            exit 1
+          }
+
+          if (-not (Test-Path "app\web\server.py")) {
+            Write-Error "app/web/server.py was NOT found."
+            exit 1
+          }
+
+          if (-not (Test-Path "app\web\launcher.py")) {
+            Write-Error "app/web/launcher.py was NOT found."
+            exit 1
+          }
+
+          if (-not (Test-Path "app\web\templates")) {
+            Write-Error "app/web/templates was NOT found."
+            exit 1
+          }
+
+          if (-not (Test-Path "app\web\static")) {
+            Write-Error "app/web/static was NOT found."
+            exit 1
+          }
+
+      - name: Build Windows web-app executable
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --console `
+            --name "T58-Web-App" `
+            --paths . `
+            --hidden-import "app" `
+            --hidden-import "app.web" `
+            --hidden-import "app.web.server" `
+            --hidden-import "app.web.launcher" `
+            --hidden-import "app.strategy" `
+            --hidden-import "app.strategy.manual" `
+            --hidden-import "app.strategy.expr" `
+            --hidden-import "app.strategy.indicators" `
+            --hidden-import "app.strategy.base" `
+            --hidden-import "app.strategy.mql5" `
+            --hidden-import "app.strategy.pinescript" `
+            --hidden-import "app.strategy.python" `
+            --hidden-import "app.backtest" `
+            --hidden-import "app.backtest.engine" `
+            --hidden-import "app.backtest.risk" `
+            --hidden-import "app.backtest.statistics" `
+            --hidden-import "app.backtest.execution" `
+            --hidden-import "app.data" `
+            --hidden-import "app.data.importer" `
+            --hidden-import "app.data.storage" `
+            --hidden-import "app.data.multi_timeframe" `
+            --hidden-import "app.monte_carlo" `
+            --hidden-import "app.monte_carlo.engine" `
+            --hidden-import "app.prop" `
+            --hidden-import "app.prop.simulator" `
+            --hidden-import "app.reports" `
+            --hidden-import "app.reports.generator" `
+            --hidden-import "app.reports.charts" `
+            --hidden-import "app.reports._assets" `
+            --hidden-import "qrcode" `
+            --hidden-import "PIL" `
+            --add-data "app/web/templates;app/web/templates" `
+            --add-data "app/web/static;app/web/static" `
+            --add-data "data/examples;data/examples" `
+            run_web.py
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          Write-Host "=== VERIFYING EXE ==="
+
+          if (-not (Test-Path "dist\T58-Web-App.exe")) {
+            Write-Error "Executable was not created."
+            exit 1
+          }
+
+          $exe = Get-Item "dist\T58-Web-App.exe"
+
+          Write-Host "EXE CREATED:"
+          Write-Host "Path: $($exe.FullName)"
+          Write-Host "Size: $($exe.Length) bytes"
+
+      - name: Create application package
+        shell: pwsh
+        run: |
+          Write-Host "=== CREATING RELEASE PACKAGE ==="
+
+          Remove-Item -Recurse -Force "release-web" -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force -Path "release-web" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release-web\data" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release-web\data\examples" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release-web\data\raw" | Out-Null
+
+          Copy-Item `
+            "dist\T58-Web-App.exe" `
+            "release-web\T58-Web-App.exe" `
+            -Force
+
+          if (Test-Path "data\examples") {
+            $exampleFiles = Get-ChildItem "data\examples" -File -ErrorAction SilentlyContinue
+            if ($exampleFiles.Count -gt 0) {
+              Copy-Item "data\examples\*" "release-web\data\examples\" -Recurse -Force
+            }
+          }
+
+          if (Test-Path "data\raw") {
+            $rawFiles = Get-ChildItem "data\raw" -File -ErrorAction SilentlyContinue
+            if ($rawFiles.Count -gt 0) {
+              Copy-Item "data\raw\*" "release-web\data\raw\" -Recurse -Force
+            }
+          }
+
+          Copy-Item "HOW_TO_OPEN_ON_YOUR_PHONE.md" "release-web\HOW_TO_OPEN_ON_YOUR_PHONE.md" -Force -ErrorAction SilentlyContinue
+
+          Write-Host ""
+          Write-Host "=== FINAL RELEASE STRUCTURE ==="
+          Get-ChildItem "release-web" -Recurse | Select-Object FullName, Length
+
+      - name: Create ZIP package
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "release-web\*" `
+            -DestinationPath "T58-Web-App-Windows.zip" `
+            -Force
+
+          Write-Host ""
+          Write-Host "=== ZIP CREATED ==="
+          $zip = Get-Item "T58-Web-App-Windows.zip"
+          Write-Host "Path: $($zip.FullName)"
+          Write-Host "Size: $($zip.Length) bytes"
+
+      - name: Upload Windows web-app package
+        uses: actions/upload-artifact@v4
+        with:
+          name: T58-Web-App-Windows
+          path: T58-Web-App-Windows.zip
+          if-no-files-found: error
+
+      - name: Attach Windows web-app package to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: T58-Web-App-Windows.zip

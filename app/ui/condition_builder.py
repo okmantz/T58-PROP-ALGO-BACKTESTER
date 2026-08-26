@@ -25,14 +25,18 @@ from tkinter import Frame, Label, Entry, StringVar, ttk
 # ---------------------------------------------------------------------------
 # Palette (kept local to avoid a circular import with main_window.py)
 # ---------------------------------------------------------------------------
-PANEL_2 = "#15191F"
-PANEL_3 = "#1B2027"
-BORDER = "#292E36"
-TEXT = "#E5E7EB"
-TEXT_DIM = "#626A75"
-GREEN = "#43D17A"
-RED = "#F05B63"
+PANEL_2 = "#171B25"
+PANEL_3 = "#1E232E"
+PANEL_HOVER = "#242A37"
+BORDER = "#272C38"
+BORDER_LIGHT = "#3D4453"
+TEXT = "#E9EBEF"
+TEXT_DIM = "#5C6472"
+GREEN = "#3ED685"
+RED = "#F0596A"
 BLUE = "#6FA8FF"
+ACCENT = "#7C6FFF"
+ACCENT_HOVER = "#9089FF"
 FONT = "Segoe UI"
 
 # ---------------------------------------------------------------------------
@@ -185,6 +189,8 @@ class ConditionRow(Frame):
                                  font=(FONT, 8, "bold"), cursor="hand2")
         self.remove_btn.pack(side="right", padx=(6, 0))
         self.remove_btn.bind("<Button-1>", lambda _e: self._on_remove(self))
+        self.remove_btn.bind("<Enter>", lambda _e: self.remove_btn.config(fg="#FF8790"))
+        self.remove_btn.bind("<Leave>", lambda _e: self.remove_btn.config(fg=RED))
 
         self._refresh()
 

@@ -162,3 +162,32 @@ def test_equity_curve_reflects_mark_to_market_not_only_realized():
     # nothing has "realized" yet.
     equity_bar1 = equity_df.iloc[1]["equity"]
     assert equity_bar1 < risk.initial_balance
+
+
+def test_eod_drawdown_mode_survives_intraday_dip_that_recovers_by_close():
+    """
+    In 'eod' drawdown_check_mode, a day with two trades -- a big intraday
+    loss followed by a recovery, netting a SMALL loss for the day overall
+    -- must NOT fail on the first (losing) trade the way 'intrabar' mode
+    would. Only the day's final cumulative P&L matters.
+    """
+    from app.prop.simulator import PropRules, simulate_account
+
+    rules_intrabar = PropRules(
+        account_size=100_000.0, daily_loss_limit_pct=5.0, max_drawdown_pct=50.0,
+        consistency_rule_pct=None, min_trading_days=1, drawdown_check_mode="intrabar",
+    )
+    rules_eod = PropRules(
+        account_size=100_000.0, daily_loss_limit_pct=5.0, max_drawdown_pct=50.0,
+        consistency_rule_pct=None, min_trading_days=1, drawdown_check_mode="eod",
+    )
+    # Same day: first trade loses $6,000 (> 5% of 100k = $5,000 -- breaches
+    # intrabar), second trade (same day) recovers $5,500, net day = -$500.
+    dates = [pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-01")]
+    pnls = [-6000.0, 5500.0]
+
+    result_intrabar = simulate_account(pnls, dates, rules_intrabar)
+    result_eod = simulate_account(pnls, dates, rules_eod)
+
+    assert result_intrabar.failed and result_intrabar.failure_reason == "daily_loss_limit"
+    assert not result_eod.failed

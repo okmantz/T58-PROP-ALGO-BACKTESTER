@@ -150,6 +150,7 @@ def run_pipeline():
             daily_loss_limit_pct=float(form.get("daily_loss", 5)),
             max_drawdown_pct=float(form.get("max_dd", 10)),
             drawdown_type=form.get("dd_type", "trailing"),
+            drawdown_check_mode=form.get("dd_check_mode", "intrabar"),
             consistency_rule_pct=float(form.get("consistency", 30)) if form.get("consistency") else None,
             min_trading_days=int(form.get("min_days", 5)),
             payout_threshold_pct=float(form.get("payout_threshold", 0)),

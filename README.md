@@ -68,15 +68,34 @@ Tkinter (the desktop GUI toolkit) can't run on a phone, so mobile access is
 provided as a lightweight **Flask web app that reuses the exact same
 engine** — no logic is duplicated between the desktop and mobile versions.
 
+### Easiest: download `T58-Web-App.exe` (no Python install, no terminal)
+
+Same idea as the desktop `.exe`: grab `T58-Web-App-Windows.zip` from
+[GitHub Releases](../../releases) (built by `.github/workflows/build-web-exe.yml`),
+extract it, and double-click `T58-Web-App.exe`. It finds your PC's Wi-Fi
+address for you and pops up a **QR code** — scan it with your phone's
+camera (same Wi-Fi network) to open the backtester, then use your
+browser's **"Add to Home Screen"** to get a real app icon. Full
+step-by-step with screenshots-in-words: see
+[`HOW_TO_OPEN_ON_YOUR_PHONE.md`](HOW_TO_OPEN_ON_YOUR_PHONE.md).
+
+Your phone is a remote screen for the app running on your PC — no
+hosting account, no Play Store, no Termux — but your PC does need to
+stay on while you use it from your phone.
+
+### Alternative: run it from source
+
 ```bash
 pip install -r requirements.txt
-python -m app.web.server
+python run_web.py
 ```
 
-This serves on `http://0.0.0.0:5000`. On your phone, connect to the **same
-Wi-Fi** as the computer running the server and open
-`http://<your-computer's-LAN-IP>:5000` (find your LAN IP with `ipconfig`
-on Windows or `ifconfig`/`ip addr` on Mac/Linux). From there:
+This does the same thing as the exe (prints your LAN address, opens a
+QR code, serves on `http://0.0.0.0:5000`). You can also run the plainer
+`python -m app.web.server` if you'd rather find your LAN IP manually
+(`ipconfig` on Windows, `ifconfig`/`ip addr` on Mac/Linux).
+
+From your phone's browser:
 
 - The page is mobile-responsive with the full 5-step workflow (upload CSV,
   pick a strategy, set prop rules/risk, run).

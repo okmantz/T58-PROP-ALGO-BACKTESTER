@@ -24,10 +24,12 @@ phone (as opposed to browsing to one) is out of scope for this MVP.
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, jsonify, redirect, render_template, request, send_from_directory, url_for
 
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
@@ -36,6 +38,11 @@ from app.data.storage import get_app_base_dir, get_raw_data_dir, list_stored_dat
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
+from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
+from app.search.search_report import generate_search_report
+from app.search.strategy_space import (
+    StrategySpaceError, family_description, generate_search_space, list_families,
+)
 from app.strategy.base import StrategyError
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
@@ -53,6 +60,8 @@ from app.strategy.python import PythonStrategy
 BASE_DIR = get_app_base_dir()
 REPORTS_DIR = BASE_DIR / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+SEARCH_DIR = BASE_DIR / "reports" / "search"
+SEARCH_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -89,6 +98,59 @@ def _build_strategy(mode: str, form, files):
     raise StrategyError(f"Unknown strategy mode: {mode}")
 
 
+def _resolve_dataset(form, files):
+    """
+    Shared by /run and /search/start: picks the active DataFrame from
+    either newly-uploaded CSV file(s) or a previously-stored dataset,
+    exactly the same precedence /run has always used (most recently
+    uploaded valid file wins over a selected stored dataset). Returns
+    (df, label, import_note, error_message) -- df is None and
+    error_message is set if nothing usable was provided.
+    """
+    uploaded_files = [f for f in files.getlist("csv_file") if f and f.filename]
+    existing_choice = (form.get("existing_dataset") or "").strip()
+
+    imported_names, failed = [], []
+    active_df = None
+    active_label = None
+
+    for f in uploaded_files:
+        content = f.read()
+        result = import_csv_bytes(content)
+        if not result.is_valid:
+            failed.append((f.filename, "; ".join(result.errors)))
+            continue
+        store_csv_bytes(content, f.filename)
+        imported_names.append(f.filename)
+        active_df = result.dataframe  # most recently imported valid file becomes active
+        active_label = f.filename
+
+    if active_df is None and existing_choice:
+        candidate = get_raw_data_dir() / existing_choice
+        if candidate.exists():
+            result = import_csv(candidate)
+            if result.is_valid:
+                active_df = result.dataframe
+                active_label = existing_choice
+
+    if active_df is None:
+        msg = "Please upload at least one valid CSV, or choose a previously stored dataset."
+        if failed:
+            msg += " Failed upload(s): " + "; ".join(f"{n} ({e})" for n, e in failed)
+        return None, None, None, msg
+
+    import_note = None
+    if imported_names:
+        import_note = f"Stored {len(imported_names)} file(s) in data/raw/: {', '.join(imported_names)}."
+        if failed:
+            import_note += f" {len(failed)} file(s) failed and were skipped: " + \
+                "; ".join(f"{n} ({e})" for n, e in failed)
+
+    return active_df, active_label, import_note, None
+
+
+
+
 @app.route("/")
 def index():
     return render_template("index.html", stored_datasets=list_stored_datasets())
@@ -102,40 +164,9 @@ def manifest():
 @app.route("/run", methods=["POST"])
 def run_pipeline():
     try:
-        stored_datasets = list_stored_datasets()  # re-used below if this request fails and we re-render
-        uploaded_files = [f for f in request.files.getlist("csv_file") if f and f.filename]
-        existing_choice = (request.form.get("existing_dataset") or "").strip()
-
-        imported_names, failed = [], []
-        active_df = None
-        active_label = None
-
-        for f in uploaded_files:
-            content = f.read()
-            result = import_csv_bytes(content)
-            if not result.is_valid:
-                failed.append((f.filename, "; ".join(result.errors)))
-                continue
-            store_csv_bytes(content, f.filename)
-            imported_names.append(f.filename)
-            active_df = result.dataframe  # most recently imported valid file becomes active
-            active_label = f.filename
-
-        if active_df is None and existing_choice:
-            candidate = get_raw_data_dir() / existing_choice
-            if candidate.exists():
-                result = import_csv(candidate)
-                if result.is_valid:
-                    active_df = result.dataframe
-                    active_label = existing_choice
-
-        if active_df is None:
-            msg = "Please upload at least one valid CSV, or choose a previously stored dataset."
-            if failed:
-                msg += " Failed upload(s): " + "; ".join(f"{n} ({e})" for n, e in failed)
-            return render_template("index.html", error=msg, stored_datasets=list_stored_datasets()), 400
-
-        df = active_df
+        df, active_label, import_note, dataset_error = _resolve_dataset(request.form, request.files)
+        if dataset_error:
+            return render_template("index.html", error=dataset_error, stored_datasets=list_stored_datasets()), 400
 
         form = request.form
         strategy = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
@@ -222,13 +253,6 @@ def run_pipeline():
             price_df=df,
         )
 
-        import_note = None
-        if imported_names:
-            import_note = f"Stored {len(imported_names)} file(s) in data/raw/: {', '.join(imported_names)}."
-            if failed:
-                import_note += f" {len(failed)} file(s) failed and were skipped: " + \
-                    "; ".join(f"{n} ({e})" for n, e in failed)
-
         return render_template(
             "index.html",
             stored_datasets=list_stored_datasets(),
@@ -268,8 +292,253 @@ def health():
     return jsonify({"status": "ok"})
 
 
+# ---------------------------------------------------------------------------
+# Search Lab (Stages 1-5) -- same engine as the desktop app's Search Lab tab.
+#
+# A search run can take anywhere from ~10 seconds to several minutes
+# (hundreds of candidates x GA refinement x full Monte Carlo x walk-forward
+# x robustness), which is too long to hold open a single HTTP request/response
+# for. So this runs the search in a background thread and hands the browser
+# a job_id immediately; the job status page polls a small JSON endpoint
+# every couple of seconds and renders the live log + leaderboard once done --
+# the same "kick off a background job, poll for status" shape any long job
+# on the web needs, just backed by a plain in-memory dict since this app is
+# a single-user local/LAN tool (same trust model as the rest of this server).
+# ---------------------------------------------------------------------------
+
+_SEARCH_JOBS: dict[str, dict] = {}
+_SEARCH_JOBS_LOCK = threading.Lock()
+
+
+def _job_log(job_id: str, msg: str) -> None:
+    with _SEARCH_JOBS_LOCK:
+        job = _SEARCH_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_search_job(
+    job_id: str, df, risk: RiskConfig, rules: PropRules, space, stage_cfg: SearchStageConfig,
+    instrument: str, db_path: str,
+) -> None:
+    try:
+        summary = run_search(
+            df, risk, rules, space, stage_cfg, db_path=db_path,
+            instrument=instrument, timeframe="unknown",
+            progress_cb=lambda msg: _job_log(job_id, msg),
+        )
+        report_paths = generate_search_report(
+            output_dir=str(SEARCH_DIR), summary=summary, space=space,
+            instrument=instrument, timeframe="unknown",
+        )
+        with _SEARCH_JOBS_LOCK:
+            job = _SEARCH_JOBS[job_id]
+            job["done"] = True
+            job["summary"] = summary
+            job["db_path"] = db_path
+            job["df"] = df
+            job["risk"] = risk
+            job["rules"] = rules
+            job["report_html"] = f"/search_reports/{report_paths['html'].name}"
+            job["report_json"] = f"/search_reports/{report_paths['json'].name}"
+    except Exception as exc:  # noqa: BLE001 -- a search job must fail visibly on the status page, not crash a thread silently
+        with _SEARCH_JOBS_LOCK:
+            job = _SEARCH_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+
+
+@app.route("/search")
+def search_form():
+    return render_template(
+        "search.html",
+        stored_datasets=list_stored_datasets(),
+        families=[{"name": n, "description": family_description(n)} for n in list_families()],
+    )
+
+
+@app.route("/search/start", methods=["POST"])
+def search_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template(
+                "search.html", error=dataset_error, stored_datasets=list_stored_datasets(),
+                families=[{"name": n, "description": family_description(n)} for n in list_families()],
+            ), 400
+
+        mode_key = form.get("search_mode", "family_named")
+        seed = int(form.get("seed", 42) or 42)
+        max_candidates = int(form.get("max_candidates", 200) or 200)
+
+        if mode_key == "single":
+            strategy = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+            space = generate_search_space(mode="single", strategy=strategy)
+        elif mode_key == "family_grid":
+            strategy = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+            space = generate_search_space(
+                mode="family", strategy=strategy,
+                grid_points_per_gene=int(form.get("grid_points", 3) or 3),
+                max_candidates=max_candidates, seed=seed,
+            )
+        else:
+            family_key = form.get("family", "all") or "all"
+            space = generate_search_space(mode="family", family=family_key, max_candidates=max_candidates, seed=seed)
+
+        workers_raw = (form.get("workers") or "").strip()
+        stage_cfg = SearchStageConfig(
+            min_trades=int(form.get("min_trades", 20) or 20),
+            min_profit_factor=float(form.get("min_profit_factor", 1.05) or 1.05),
+            stage1_top_n=int(form.get("stage1_top_n", 40) or 40),
+            ga_population=int(form.get("ga_population", 10) or 10),
+            ga_generations=int(form.get("ga_generations", 4) or 4),
+            stage2_top_n=int(form.get("stage2_top_n", 10) or 10),
+            full_mc_sims=int(form.get("full_mc_sims", 3000) or 3000),
+            walk_forward_folds=int(form.get("walk_forward_folds", 4) or 4),
+            robustness_neighbors=int(form.get("robustness_neighbors", 6) or 6),
+            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            workers=int(workers_raw) if workers_raw else None,
+            random_seed=seed,
+        )
+        risk = RiskConfig()
+        rules = PropRules()
+
+        job_id = uuid.uuid4().hex[:12]
+        db_path = str(SEARCH_DIR / f"search_{job_id}.db")
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _SEARCH_JOBS_LOCK:
+            _SEARCH_JOBS[job_id] = {
+                "log": initial_log,
+                "done": False, "error": None, "summary": None,
+                "started_at": time.time(), "instrument": active_label, "mode": mode_key,
+            }
+        thread = threading.Thread(
+            target=_run_search_job,
+            args=(job_id, df, risk, rules, space, stage_cfg, active_label, db_path),
+            daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("search_job", job_id=job_id))
+
+    except StrategySpaceError as exc:
+        return render_template(
+            "search.html", error=str(exc), stored_datasets=list_stored_datasets(),
+            families=[{"name": n, "description": family_description(n)} for n in list_families()],
+        ), 400
+    except StrategyError as exc:
+        return render_template(
+            "search.html", error=str(exc), stored_datasets=list_stored_datasets(),
+            families=[{"name": n, "description": family_description(n)} for n in list_families()],
+        ), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template(
+            "search.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(),
+            families=[{"name": n, "description": family_description(n)} for n in list_families()],
+        ), 500
+
+
+@app.route("/search/job/<job_id>")
+def search_job(job_id):
+    with _SEARCH_JOBS_LOCK:
+        job = _SEARCH_JOBS.get(job_id)
+    if job is None:
+        return render_template("search_job.html", job_id=job_id, not_found=True), 404
+    return render_template("search_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/search/job/<job_id>/status.json")
+def search_job_status(job_id):
+    with _SEARCH_JOBS_LOCK:
+        job = _SEARCH_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+
+    summary = job.get("summary")
+    leaderboard = None
+    if summary is not None:
+        leaderboard = [
+            {
+                "candidate_id": row.get("candidate_id"),
+                "source_type": row.get("source_type", "manual"),
+                "family": row.get("family"),
+                "composite_score": row.get("composite_score"),
+                "psr": (row.get("deflated_sharpe") or {}).get("probabilistic_sharpe"),
+                "net_profit": (row.get("statistics") or {}).get("net_profit"),
+                "profit_factor": (row.get("statistics") or {}).get("profit_factor"),
+                "win_rate": (row.get("statistics") or {}).get("win_rate"),
+                "total_trades": (row.get("statistics") or {}).get("total_trades"),
+                "eval_pass_pct": (row.get("mc_summary") or {}).get("evaluation_pass_probability"),
+                "passed_gate": bool(row.get("passed_stage3_gate")),
+                "gate_notes": row.get("gate_notes") or "",
+            }
+            for row in (summary.leaderboard or [])
+        ]
+
+    return jsonify({
+        "found": True,
+        "done": job["done"],
+        "error": job["error"],
+        "log": job["log"],
+        "instrument": job.get("instrument"),
+        "summary": None if summary is None else {
+            "mode": summary.mode, "family": summary.family,
+            "total_candidates": summary.total_candidates,
+            "stage1_survivors": summary.stage1_survivors,
+            "stage2_survivors": summary.stage2_survivors,
+            "stage3_survivors": summary.stage3_survivors,
+            "champion_candidate_id": summary.champion_candidate_id,
+            "elapsed_seconds": summary.elapsed_seconds,
+            "report_html": job.get("report_html"),
+            "report_json": job.get("report_json"),
+        },
+        "leaderboard": leaderboard,
+    })
+
+
+@app.route("/search/job/<job_id>/promote", methods=["POST"])
+def search_job_promote(job_id):
+    with _SEARCH_JOBS_LOCK:
+        job = _SEARCH_JOBS.get(job_id)
+    if job is None or not job.get("done") or job.get("summary") is None:
+        return jsonify({"ok": False, "error": "Job not found, not finished, or produced no results."}), 400
+
+    candidate_id = request.form.get("candidate_id")
+    if not candidate_id and request.is_json:
+        candidate_id = (request.get_json(silent=True) or {}).get("candidate_id")
+    if not candidate_id:
+        return jsonify({"ok": False, "error": "candidate_id is required."}), 400
+
+    try:
+        result = promote_champion(
+            job["db_path"], job["summary"].run_id, candidate_id,
+            job["df"], job["risk"], job["rules"],
+            output_dir=str(SEARCH_DIR / "champion" / job_id),
+        )
+        with _SEARCH_JOBS_LOCK:
+            job.setdefault("promoted", {})[candidate_id] = {
+                "html": f"/search_reports_champion/{job_id}/{result['report_paths']['html'].name}",
+                "json": f"/search_reports_champion/{job_id}/{result['report_paths']['json'].name}",
+            }
+        return jsonify({"ok": True, "report_html": job["promoted"][candidate_id]["html"]})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/search_reports/<path:filename>")
+def serve_search_report(filename):
+    return send_from_directory(SEARCH_DIR, filename)
+
+
+@app.route("/search_reports_champion/<job_id>/<path:filename>")
+def serve_search_champion_report(job_id, filename):
+    return send_from_directory(SEARCH_DIR / "champion" / job_id, filename)
+
+
 def main():
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

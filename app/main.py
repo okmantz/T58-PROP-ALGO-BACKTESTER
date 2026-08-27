@@ -173,6 +173,104 @@ def run_cli(
         print(f"  {k}: {p}")
 
 
+def run_search_cli(
+    csv_path: str | None,
+    output_dir: str,
+    mode: str = "family",
+    family: str | None = "all",
+    max_candidates: int = 500,
+    workers: int | None = None,
+    min_trades: int = 20,
+    min_profit_factor: float = 1.05,
+    stage1_top_n: int = 40,
+    stage2_top_n: int = 10,
+    ga_population: int = 10,
+    ga_generations: int = 4,
+    full_mc_sims: int = 3000,
+    walk_forward_folds: int = 4,
+    robustness_neighbors: int = 6,
+    fitness_metric: str = "composite_prop_score",
+    seed: int = 42,
+    db_path: str | None = None,
+    promote: bool = True,
+) -> None:
+    """
+    Search Lab: Stages 1-5. Generates a candidate pool (mode="single" wraps
+    the same DEFAULT_MANUAL_STRATEGY the rest of --cli uses; mode="family"
+    combinatorially expands a named strategy family, or every family if
+    `family` is None/"all"), runs it through the cheap filter -> GA
+    refinement -> validation gate -> leaderboard funnel, and (by default)
+    promotes the champion, if any, through the normal single-strategy
+    report pipeline.
+    """
+    from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
+    from app.search.search_report import generate_search_report
+    from app.search.strategy_space import generate_search_space, list_families
+
+    if csv_path is None:
+        csv_path = _resolve_default_csv()
+    else:
+        csv_path = str(store_csv_path(csv_path))
+
+    import_result = import_csv(csv_path)
+    if not import_result.is_valid:
+        print("Import failed:")
+        for e in import_result.errors:
+            print(f"  ERROR: {e}")
+        sys.exit(1)
+    df = import_result.dataframe
+    print(f"Loaded {len(df)} bars from {csv_path}")
+
+    if mode == "family" and family not in (None, "all") and family not in list_families():
+        print(f"Unknown family '{family}'. Known families: {list(list_families())}")
+        sys.exit(1)
+
+    space = generate_search_space(
+        mode=mode,
+        family=family,
+        single_config=DEFAULT_MANUAL_STRATEGY if mode == "single" else None,
+        max_candidates=max_candidates,
+        seed=seed,
+    )
+
+    stage_cfg = SearchStageConfig(
+        min_trades=min_trades, min_profit_factor=min_profit_factor,
+        stage1_top_n=stage1_top_n, stage2_top_n=stage2_top_n,
+        ga_population=ga_population, ga_generations=ga_generations,
+        full_mc_sims=full_mc_sims, walk_forward_folds=walk_forward_folds,
+        robustness_neighbors=robustness_neighbors, fitness_metric=fitness_metric,
+        workers=workers, random_seed=seed,
+    )
+    risk = RiskConfig()
+    rules = PropRules()
+    resolved_db_path = db_path or str(Path(output_dir) / "search.db")
+
+    summary = run_search(
+        df, risk, rules, space, stage_cfg, db_path=resolved_db_path,
+        instrument=Path(csv_path).name, timeframe="unknown", progress_cb=print,
+    )
+
+    report_paths = generate_search_report(
+        output_dir=output_dir, summary=summary, space=space,
+        instrument=Path(csv_path).name, timeframe="unknown",
+    )
+    print("\nSearch leaderboard written to:")
+    for k, p in report_paths.items():
+        print(f"  {k}: {p}")
+
+    if promote and summary.champion_candidate_id:
+        print(f"\nPromoting champion candidate {summary.champion_candidate_id} to a full report...")
+        promo = promote_champion(
+            resolved_db_path, summary.run_id, summary.champion_candidate_id,
+            df, risk, rules, output_dir=str(Path(output_dir) / "champion"),
+        )
+        print("Champion report written to:")
+        for k, p in promo["report_paths"].items():
+            print(f"  {k}: {p}")
+    elif promote:
+        print("\nNo champion to promote -- no candidate passed every Stage 3 gate this run.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="T58 Trading — Prop Algo Backtester")
     parser.add_argument("--cli", action="store_true", help="run headlessly instead of launching the GUI")
@@ -197,9 +295,69 @@ def main():
         help="Iterative Refinement: fitness metric to optimize for",
     )
     parser.add_argument("--refine-seed", type=int, default=42, help="Iterative Refinement: random seed")
+
+    parser.add_argument(
+        "--search", action="store_true",
+        help="run the Search Lab (Stages 1-5: cheap filter -> GA refinement -> validation gate -> "
+             "leaderboard -> champion promotion) instead of the normal single-strategy pipeline.",
+    )
+    parser.add_argument(
+        "--search-mode", default="family", choices=["single", "family"],
+        help="'single' re-validates DEFAULT_MANUAL_STRATEGY through the full Stage 1-5 funnel; "
+             "'family' generates and searches a combinatorial grid (default).",
+    )
+    parser.add_argument(
+        "--search-family", default="all",
+        help="strategy family to search (see app.search.strategy_space.list_families()), or 'all' "
+             "to search every family together (default). Ignored when --search-mode=single.",
+    )
+    parser.add_argument("--search-max-candidates", type=int, default=500,
+                         help="cap on how many generated candidates Stage 1 evaluates (random sample if the "
+                              "full grid is larger).")
+    parser.add_argument("--search-workers", type=int, default=None,
+                         help="parallel worker processes for Stages 1-3 (default: all CPU cores).")
+    parser.add_argument("--search-min-trades", type=int, default=20,
+                         help="Stage 1 cheap filter: minimum trades a candidate must produce to survive.")
+    parser.add_argument("--search-min-profit-factor", type=float, default=1.05,
+                         help="Stage 1 cheap filter: minimum profit factor a candidate must clear to survive.")
+    parser.add_argument("--search-stage1-top-n", type=int, default=40,
+                         help="how many Stage 1 survivors advance to Stage 2 (GA refinement).")
+    parser.add_argument("--search-stage2-top-n", type=int, default=10,
+                         help="how many Stage 2 winners advance to Stage 3 (the validation gate).")
+    parser.add_argument("--search-ga-population", type=int, default=10, help="Stage 2 GA population size.")
+    parser.add_argument("--search-ga-generations", type=int, default=4, help="Stage 2 GA generations.")
+    parser.add_argument("--search-full-mc-sims", type=int, default=3000,
+                         help="Monte Carlo simulations per candidate during Stage 3 (full fidelity).")
+    parser.add_argument("--search-walk-forward-folds", type=int, default=4,
+                         help="Stage 3 walk-forward fold count (0 disables the walk-forward check).")
+    parser.add_argument("--search-robustness-neighbors", type=int, default=6,
+                         help="Stage 3 parameter-neighborhood perturbation samples (0 disables the check).")
+    parser.add_argument(
+        "--search-metric", default="composite_prop_score",
+        choices=["composite_prop_score", "eval_pass_probability", "first_payout_probability",
+                 "expected_payout", "net_profit", "profit_factor", "sharpe_ratio"],
+        help="fitness metric used by Stage 2/3.",
+    )
+    parser.add_argument("--search-seed", type=int, default=42, help="Search Lab: random seed")
+    parser.add_argument("--search-db", default=None,
+                         help="path to the SQLite results database (default: <output>/search.db)")
+    parser.add_argument("--search-no-promote", action="store_true",
+                         help="skip Stage 5 (don't auto-promote the champion to a full report).")
     args = parser.parse_args()
 
-    if args.cli:
+    if args.search:
+        run_search_cli(
+            args.csv, args.output,
+            mode=args.search_mode, family=args.search_family,
+            max_candidates=args.search_max_candidates, workers=args.search_workers,
+            min_trades=args.search_min_trades, min_profit_factor=args.search_min_profit_factor,
+            stage1_top_n=args.search_stage1_top_n, stage2_top_n=args.search_stage2_top_n,
+            ga_population=args.search_ga_population, ga_generations=args.search_ga_generations,
+            full_mc_sims=args.search_full_mc_sims, walk_forward_folds=args.search_walk_forward_folds,
+            robustness_neighbors=args.search_robustness_neighbors, fitness_metric=args.search_metric,
+            seed=args.search_seed, db_path=args.search_db, promote=not args.search_no_promote,
+        )
+    elif args.cli:
         run_cli(
             args.csv, args.sims, args.output,
             refine=args.refine,

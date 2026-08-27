@@ -21,6 +21,9 @@
   header { padding: 18px 16px 8px; border-bottom: 1px solid #262626; }
   header h1 { font-size: 18px; margin: 0; }
   header p { margin: 4px 0 0; font-size: 12px; color: #888; }
+  nav { display: flex; gap: 14px; padding: 10px 16px 0; }
+  nav a { color: #9ecbff; font-size: 13px; text-decoration: none; }
+  nav a.active { color: #eee; font-weight: 700; }
   main { padding: 16px; max-width: 640px; margin: 0 auto; }
   .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
   .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #aaa; margin: 0 0 10px; }
@@ -57,6 +60,10 @@
   <h1>T58 Trading — Prop Algo Backtester</h1>
   <p>Backtest &rarr; prop-firm simulation &rarr; Monte Carlo probability of passing &amp; getting paid.</p>
 </header>
+<nav>
+  <a href="/" class="active">Run &amp; Report</a>
+  <a href="/search">Search Lab</a>
+</nav>
 <main>
 
 {% if error %}

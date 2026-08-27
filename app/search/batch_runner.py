@@ -48,6 +48,7 @@ that writes to the results database.
 from __future__ import annotations
 
 import math
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -449,6 +450,17 @@ def run_search(
         with ProcessPoolExecutor(
             max_workers=workers, initializer=_init_worker,
             initargs=(str(df_path), risk_kwargs, prop_kwargs, str(tmp_dir)),
+            # Explicit "spawn" rather than the platform default (fork on
+            # Linux/macOS): run_search() is routinely called from a
+            # background thread rather than a process's main thread -- the
+            # desktop GUI's Search Lab tab and the web app's search job
+            # both do this so the UI/HTTP response isn't blocked for
+            # minutes. forking a multi-threaded process is documented as
+            # unsafe (can deadlock if another thread held a lock at fork
+            # time) and Python 3.12+ warns about exactly this. spawn avoids
+            # the hazard entirely at the cost of slightly slower worker
+            # startup, which is negligible next to a Stage 1-3 run.
+            mp_context=multiprocessing.get_context("spawn"),
         ) as pool:
             # ---------------- Stage 1: cheap filter ----------------
             log(f"Stage 1/5: cheap filter across {len(space.candidates)} candidate(s) on {workers} worker(s)...")

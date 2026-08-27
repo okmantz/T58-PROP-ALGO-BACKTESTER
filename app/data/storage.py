@@ -26,7 +26,9 @@ def get_app_base_dir() -> Path:
 
 
 def _seed_bundled_raw_data(raw_dir: Path) -> None:
-    """Copy CSVs embedded by PyInstaller into the persistent raw-data folder."""
+    """Copy CSVs embedded by PyInstaller into the persistent raw-data folder,
+    preserving any instrument subfolders in the bundle rather than flattening
+    them (mirrors list_stored_datasets()'s recursive scan below)."""
     if not getattr(sys, "frozen", False):
         return
     bundle_root = getattr(sys, "_MEIPASS", None)
@@ -35,10 +37,11 @@ def _seed_bundled_raw_data(raw_dir: Path) -> None:
     bundled_raw = Path(bundle_root) / "data" / "raw"
     if not bundled_raw.exists():
         return
-    for source in bundled_raw.glob("*.csv"):
-        destination = raw_dir / source.name
+    for source in bundled_raw.rglob("*.csv"):
+        destination = raw_dir / source.relative_to(bundled_raw)
         if not destination.exists():
             try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
             except OSError:
                 continue
@@ -54,16 +57,30 @@ def get_raw_data_dir() -> Path:
 
 @dataclass
 class StoredDataset:
-    name: str
+    name: str   # path relative to data/raw/, POSIX-style (e.g. "EURUSD/EURUSD5.csv")
+                # -- so instrument subfolders show up as "EURUSD/EURUSD5.csv"
+                # rather than colliding on/hiding behind the bare filename.
     path: Path
     size_bytes: int
 
 
 def list_stored_datasets() -> list[StoredDataset]:
-    """Return all CSVs in data/raw/, newest first."""
+    """
+    Return every CSV under data/raw/, newest first -- including CSVs
+    organized into subfolders (e.g. data/raw/EURUSD/EURUSD5.csv), not just
+    ones directly in data/raw/ itself. `name` is the POSIX-style path
+    relative to data/raw/, which both the desktop app's stored-dataset list
+    and the web app's dropdown display as-is and (for the web app) submit
+    back as the selection value -- `get_raw_data_dir() / name` resolves a
+    subfolder entry correctly either way, since Path() accepts "/"
+    separators on every platform including Windows.
+    """
     raw_dir = get_raw_data_dir()
-    files = sorted(raw_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [StoredDataset(name=f.name, path=f, size_bytes=f.stat().st_size) for f in files]
+    files = sorted(raw_dir.rglob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [
+        StoredDataset(name=f.relative_to(raw_dir).as_posix(), path=f, size_bytes=f.stat().st_size)
+        for f in files
+    ]
 
 
 def _unique_destination(raw_dir: Path, filename: str) -> Path:

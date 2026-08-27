@@ -34,6 +34,9 @@ from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_itera
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
 from app.reports.refinement_report import generate_refinement_report
+from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
+from app.search.search_report import generate_search_report
+from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
 from app.strategy.base import StrategyError
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
@@ -250,6 +253,7 @@ class MainWindow:
         self.tab_risk = Frame(self.nb, bg=BG)
         self.tab_run = Frame(self.nb, bg=BG)
         self.tab_refine = Frame(self.nb, bg=BG)
+        self.tab_search = Frame(self.nb, bg=BG)
 
         self.nb.add(self.tab_data, text="  01 ▤  DATA  ")
         self.nb.add(self.tab_strategy, text="  02 ⚙  STRATEGY  ")
@@ -257,6 +261,7 @@ class MainWindow:
         self.nb.add(self.tab_risk, text="  04 ◈  RISK  ")
         self.nb.add(self.tab_run, text="  05 ▶  RUN & REPORT  ")
         self.nb.add(self.tab_refine, text="  06 ↻  REFINEMENT  ")
+        self.nb.add(self.tab_search, text="  07 ▦  SEARCH LAB  ")
 
         # Thin accent underline that tracks whichever tab is active, giving
         # the tab strip a focal point beyond the stock ttk selected-color
@@ -272,6 +277,7 @@ class MainWindow:
         self._build_risk_tab()
         self._build_run_tab()
         self._build_refine_tab()
+        self._build_search_tab()
 
         for delay in (50, 150, 400):
             self.root.after(delay, self._update_tab_indicator)
@@ -1915,8 +1921,327 @@ class MainWindow:
         finally:
             self.progress.stop()
 
+    # -----------------------------------------------------------------------
+    # Tab 7 — Search Lab (Stages 1-5: cheap filter -> GA refinement ->
+    # validation gate -> leaderboard -> champion promotion)
+    # -----------------------------------------------------------------------
+
+    _SEARCH_MODE_LABELS = {
+        "Family (search a grid of many strategy variations)": "family",
+        "Single (re-validate the current Strategy tab config through the full funnel)": "single",
+    }
+
+    def _build_search_tab(self):
+        f = self._scrollable(self.tab_search)
+
+        self._page_header(
+            f,
+            "07 / Search Lab",
+            "Search Lab (Stages 1-5)",
+            "Generates and tests many strategy variations at once instead of one at a "
+            "time: a fast filter narrows thousands of candidates down to a shortlist, "
+            "the same Iterative Refinement engine from Step 6 tunes each shortlisted "
+            "candidate, and a strict validation gate (walk-forward, lookahead check, "
+            "parameter-neighborhood robustness, a deflated Sharpe ratio that corrects "
+            "for how many candidates were tried) decides what actually survives. "
+            "Completely separate from the normal Run & Report pipeline and from Step 6 "
+            "-- nothing here changes unless you click Run below.",
+        )
+
+        mode_section = self._section(
+            f, "What to search",
+            "Family mode generates a combinatorial grid of a named strategy hypothesis. "
+            "Single mode instead takes whatever is currently configured on the Strategy "
+            "tab (Step 2) and puts that ONE strategy through the exact same 5-stage "
+            "funnel, as an independent stress test -- useful for re-validating a "
+            "hand-built strategy rather than searching a family.",
+        )
+        self.search_mode = LabeledCombo(
+            mode_section, "Mode", list(self._SEARCH_MODE_LABELS.keys()),
+            "Family (search a grid of many strategy variations)",
+        )
+        self.search_mode.combo.bind("<<ComboboxSelected>>", lambda _e: self._on_search_mode_changed())
+
+        family_labels = ["All families (search every hypothesis together)"] + [
+            f"{label} [{name}]" for name, label in list_families().items()
+        ]
+        self._search_family_label_to_key = {"All families (search every hypothesis together)": "all"}
+        for name, label in list_families().items():
+            self._search_family_label_to_key[f"{label} [{name}]"] = name
+        self.search_family = LabeledCombo(
+            mode_section, "Strategy family (Family mode only)", family_labels, family_labels[0],
+        )
+
+        space_section = self._section(
+            f, "Search space size",
+            "How many generated candidates Stage 1 actually evaluates. If the full grid "
+            "for a family is larger than this, a random (reproducible) sample is taken "
+            "instead of just the first N -- see the random seed below.",
+        )
+        self.search_max_candidates = LabeledEntry(space_section, "Max candidates (Family mode)", 500)
+        self.search_workers = LabeledEntry(space_section, "Parallel workers (blank = all CPU cores)", "")
+        self.search_seed = LabeledEntry(space_section, "Random seed", 42)
+
+        stage1_section = self._section(
+            f, "Stage 1 -- cheap filter",
+            "One fast backtest per candidate, no Monte Carlo. Kills the vast majority "
+            "of candidates in minutes, not hours. Loosen these if a run reports zero "
+            "Stage 1 survivors.",
+        )
+        self.search_min_trades = LabeledEntry(stage1_section, "Minimum trades to survive", 20)
+        self.search_min_pf = LabeledEntry(stage1_section, "Minimum profit factor to survive", 1.05)
+        self.search_stage1_top_n = LabeledEntry(stage1_section, "Survivors that advance to Stage 2 (GA)", 40)
+
+        stage2_section = self._section(
+            f, "Stage 2 -- GA refinement",
+            "The same genetic-algorithm engine as Step 6, applied to every Stage 1 "
+            "survivor instead of to one hand-picked strategy.",
+        )
+        self.search_ga_population = LabeledEntry(stage2_section, "GA population size", 10)
+        self.search_ga_generations = LabeledEntry(stage2_section, "GA generations", 4)
+        self.search_stage2_top_n = LabeledEntry(stage2_section, "Survivors that advance to Stage 3 (validation)", 10)
+
+        stage3_section = self._section(
+            f, "Stage 3 -- validation gate",
+            "Full-fidelity Monte Carlo, multi-fold walk-forward, the lookahead-bias "
+            "detector, and parameter-neighborhood robustness. A candidate must clear "
+            "every gate to become the champion -- this is deliberately strict.",
+        )
+        self.search_full_mc_sims = LabeledEntry(stage3_section, "Monte Carlo simulations (full fidelity)", 3000)
+        self.search_walk_forward_folds = LabeledEntry(stage3_section, "Walk-forward folds (0 disables)", 4)
+        self.search_robustness_neighbors = LabeledEntry(
+            stage3_section, "Parameter-neighborhood samples (0 disables)", 6,
+        )
+        self._search_metric_labels = list(FITNESS_METRICS.values())
+        self.search_metric = LabeledCombo(
+            stage3_section, "Fitness metric (what \u201cbest\u201d means)", self._search_metric_labels,
+            FITNESS_METRICS["composite_prop_score"],
+        )
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+
+        self._button(button_row, "RUN SEARCH LAB", self._search_run_clicked, primary=True).pack(side="left")
+
+        self.open_search_report_btn = self._button(
+            button_row, "OPEN LEADERBOARD", self._open_search_report,
+        )
+        self.open_search_report_btn.config(state="disabled")
+        self.open_search_report_btn.pack(side="left", padx=8)
+
+        self.promote_champion_btn = self._button(
+            button_row, "PROMOTE CHAMPION TO FULL REPORT", self._promote_search_champion_clicked,
+        )
+        self.promote_champion_btn.config(state="disabled")
+        self.promote_champion_btn.pack(side="left", padx=8)
+
+        self.open_champion_report_btn = self._button(
+            button_row, "OPEN CHAMPION REPORT", self._open_champion_report,
+        )
+        self.open_champion_report_btn.config(state="disabled")
+        self.open_champion_report_btn.pack(side="left", padx=8)
+
+        self.search_progress = ttk.Progressbar(
+            f, mode="indeterminate", style="T58.Horizontal.TProgressbar",
+        )
+        self.search_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Search Lab output", "Live funnel log.")
+        self.search_output = Text(
+            output_section, height=18, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.search_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_search_summary = None
+        self._last_search_space = None
+        self._last_search_html_path = None
+        self._last_search_db_path = None
+        self._last_search_df = None
+        self._last_search_risk = None
+        self._last_search_rules = None
+        self._last_champion_html_path = None
+
+    def _on_search_mode_changed(self):
+        mode = self._SEARCH_MODE_LABELS.get(self.search_mode.get_str())
+        # Family-only settings are visually left enabled either way (Tk
+        # combobox rebuilding is more churn than it's worth for a disabled
+        # look) -- they're simply ignored by _search_run_pipeline in Single
+        # mode.
+
+    def _log_search(self, msg: str):
+        self.search_output.insert(END, msg + "\n")
+        self.search_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_search_report(self):
+        if self._last_search_html_path:
+            webbrowser.open(f"file://{self._last_search_html_path.resolve()}")
+
+    def _open_champion_report(self):
+        if self._last_champion_html_path:
+            webbrowser.open(f"file://{self._last_champion_html_path.resolve()}")
+
+    def _build_search_stage_config(self) -> SearchStageConfig:
+        metric_label = self.search_metric.get_str()
+        metric_key = self._refine_metric_label_to_key.get(metric_label, "composite_prop_score")
+        workers_raw = self.search_workers.get_str().strip()
+        workers = int(workers_raw) if workers_raw else None
+        return SearchStageConfig(
+            min_trades=self.search_min_trades.get_int(20),
+            min_profit_factor=self.search_min_pf.get_float(1.05),
+            stage1_top_n=self.search_stage1_top_n.get_int(40),
+            ga_population=self.search_ga_population.get_int(10),
+            ga_generations=self.search_ga_generations.get_int(4),
+            stage2_top_n=self.search_stage2_top_n.get_int(10),
+            full_mc_sims=self.search_full_mc_sims.get_int(3000),
+            walk_forward_folds=self.search_walk_forward_folds.get_int(4),
+            robustness_neighbors=self.search_robustness_neighbors.get_int(6),
+            fitness_metric=metric_key,
+            workers=workers,
+            random_seed=self.search_seed.get_int(42),
+        )
+
+    def _search_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning(
+                "Missing data",
+                "Please select a market data CSV in Step 1.",
+            )
+            return
+        self.search_output.delete("1.0", END)
+        self.open_search_report_btn.config(state="disabled")
+        self.promote_champion_btn.config(state="disabled")
+        self.open_champion_report_btn.config(state="disabled")
+        self.search_progress.start(10)
+        threading.Thread(target=self._search_run_pipeline, daemon=True).start()
+
+    def _search_run_pipeline(self):
+        try:
+            self._log_search("Importing market data...")
+            per_file_results = []
+            for p in self.csv_paths:
+                result = import_csv(p)
+                if not result.is_valid:
+                    self._log_search(
+                        f"Import errors ({os.path.basename(p)}):\n" + "\n".join(result.errors)
+                    )
+                    return
+                per_file_results.append((p, result))
+
+            if len(per_file_results) == 1:
+                df = per_file_results[0][1].dataframe
+            else:
+                df, _labels = merge_multi_timeframe([r.dataframe for _, r in per_file_results])
+            self._log_search(f"Loaded {len(df)} bars.")
+
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+
+            mode = self._SEARCH_MODE_LABELS.get(self.search_mode.get_str(), "family")
+            if mode == "single":
+                if self.strategy_mode.get() != "manual":
+                    self._log_search(
+                        "\nSingle mode requires a Manual Strategy Builder configuration on the "
+                        "Strategy tab (Step 2) -- Search Lab only runs Manual Strategy configs "
+                        "through its funnel. Switch Step 2 to Manual mode, or use Family mode "
+                        "instead."
+                    )
+                    return
+                strategy = self._build_strategy()
+                space = generate_search_space(mode="single", single_config=strategy.config)
+            else:
+                family_label = self.search_family.get_str()
+                family_key = self._search_family_label_to_key.get(family_label, "all")
+                space = generate_search_space(
+                    mode="family", family=family_key,
+                    max_candidates=self.search_max_candidates.get_int(500),
+                    seed=self.search_seed.get_int(42),
+                )
+
+            # (run_search() itself logs the "Search space ready..." line via
+            # progress_cb once it starts -- not duplicated here.)
+            stage_cfg = self._build_search_stage_config()
+            instrument = (
+                os.path.basename(self.csv_paths[0]) if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+            db_path = str(OUTPUT_DIR / "search" / "search.db")
+
+            summary = run_search(
+                df, risk, rules, space, stage_cfg, db_path=db_path,
+                instrument=instrument, timeframe="unknown", progress_cb=self._log_search,
+            )
+
+            report_paths = generate_search_report(
+                output_dir=str(OUTPUT_DIR / "search"), summary=summary, space=space,
+                instrument=instrument, timeframe="unknown",
+            )
+
+            self._last_search_summary = summary
+            self._last_search_space = space
+            self._last_search_html_path = report_paths["html"]
+            self._last_search_db_path = db_path
+            self._last_search_df = df
+            self._last_search_risk = risk
+            self._last_search_rules = rules
+
+            self.open_search_report_btn.config(state="normal")
+            if summary.champion_candidate_id:
+                self.promote_champion_btn.config(state="normal")
+
+            self._log_search("\nDone. Search leaderboard written to:")
+            for k, p in report_paths.items():
+                self._log_search(f"  {k}: {p}")
+
+        except StrategySpaceError as exc:
+            self._log_search(f"\nSearch space error: {exc}")
+        except StrategyError as exc:
+            self._log_search(f"\nStrategy error: {exc}")
+        except Exception:
+            self._log_search("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.search_progress.stop()
+
+    def _promote_search_champion_clicked(self):
+        summary = self._last_search_summary
+        if not summary or not summary.champion_candidate_id:
+            messagebox.showinfo(
+                "No champion",
+                "Run Search Lab first -- promotion is only available when a run has "
+                "at least one candidate that passed every Stage 3 gate.",
+            )
+            return
+        self.promote_champion_btn.config(state="disabled")
+        self.search_progress.start(10)
+        threading.Thread(target=self._promote_search_champion_pipeline, daemon=True).start()
+
+    def _promote_search_champion_pipeline(self):
+        try:
+            summary = self._last_search_summary
+            self._log_search(
+                f"\nPromoting champion candidate {summary.champion_candidate_id} to a full report..."
+            )
+            promo = promote_champion(
+                self._last_search_db_path, summary.run_id, summary.champion_candidate_id,
+                self._last_search_df, self._last_search_risk, self._last_search_rules,
+                output_dir=str(OUTPUT_DIR / "search" / "champion"),
+            )
+            self._last_champion_html_path = promo["report_paths"]["html"]
+            self.open_champion_report_btn.config(state="normal")
+            self._log_search("Champion report written to:")
+            for k, p in promo["report_paths"].items():
+                self._log_search(f"  {k}: {p}")
+        except Exception:
+            self._log_search("\nChampion promotion failed:\n" + traceback.format_exc())
+        finally:
+            self.promote_champion_btn.config(state="normal")
+            self.search_progress.stop()
+
 
 def launch():
     root = Tk()
     MainWindow(root)
     root.mainloop()
+

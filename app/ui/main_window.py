@@ -39,9 +39,12 @@ from app.search.search_report import generate_search_report
 from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
 from app.strategy.base import StrategyError
 from app.strategy.library import (
-    STRATEGY_TYPES, StrategyAlreadyExists, delete_saved_strategy, export_library_zip,
-    get_strategy_library_dir, list_saved_strategies, record_backtest_result,
-    rename_saved_strategy, save_strategy_bytes, save_strategy_metadata, save_strategy_path,
+    STRATEGY_STATUSES, STRATEGY_TYPES, StrategyAlreadyExists, delete_many,
+    delete_saved_strategy, export_library_zip, get_strategy_library_dir,
+    list_all_markets, list_all_tags, list_saved_strategies, record_backtest_result,
+    record_lookahead_result, record_search_result, rename_saved_strategy,
+    save_strategy_bytes, save_strategy_metadata, save_strategy_path,
+    set_strategy_status, set_strategy_tags,
 )
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
@@ -902,6 +905,7 @@ class MainWindow:
             "Strategies live here inside the app instead of only on your computer. "
             "Importing a file above automatically saves a copy into the library; "
             "you can also load, rename, or delete a previously saved one below. "
+            "Ctrl/Cmd-click or Shift-click to select more than one for bulk delete/export. "
             "Note: a packaged .exe's library lives next to the .exe, not in your "
             "git repo — use EXPORT LIBRARY AS ZIP below and unzip it into the "
             "repo's strategies/ folder to keep them in sync.",
@@ -910,13 +914,27 @@ class MainWindow:
         self.strategy_search = LabeledEntry(library_section, "Search (name / market / tags)", "")
         self.strategy_search.entry.bind("<KeyRelease>", lambda _e: self._refresh_strategy_library())
 
+        filter_row = Frame(library_section, bg=PANEL)
+        filter_row.pack(fill="x", padx=0, pady=(0, 2))
+
+        self.strategy_filter_market = LabeledCombo(filter_row, "Browse market", ["All markets"], default="All markets")
+        self.strategy_filter_market.combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_strategy_library())
+
+        self.strategy_filter_tag = LabeledCombo(filter_row, "Browse tag", ["All tags"], default="All tags")
+        self.strategy_filter_tag.combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_strategy_library())
+
+        self.strategy_filter_status = LabeledCombo(
+            filter_row, "Browse status", ["All statuses", *STRATEGY_STATUSES], default="All statuses"
+        )
+        self.strategy_filter_status.combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_strategy_library())
+
         lib_list_frame = Frame(library_section, bg=PANEL)
         lib_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 8))
 
         self.strategy_library_listbox = Listbox(
             lib_list_frame,
             height=6,
-            selectmode=SINGLE,
+            selectmode=EXTENDED,
             exportselection=False,
             bg=PANEL_3,
             fg=TEXT,
@@ -969,8 +987,11 @@ class MainWindow:
             lib_btn_row_2, "OPEN LIBRARY FOLDER", self._open_strategy_library_folder
         ).pack(side="left")
         self._button(
-            lib_btn_row_2, "EXPORT LIBRARY AS ZIP", self._export_strategy_library
+            lib_btn_row_2, "EXPORT SELECTED AS ZIP", self._export_selected_library_strategies
         ).pack(side="left", padx=8)
+        self._button(
+            lib_btn_row_2, "EXPORT LIBRARY AS ZIP", self._export_strategy_library
+        ).pack(side="left")
 
         # ---- Metadata for the selected saved strategy -------------
         meta_frame = Frame(library_section, bg=PANEL)
@@ -978,6 +999,8 @@ class MainWindow:
 
         self.strategy_meta_description = LabeledEntry(meta_frame, "Description", "")
         self.strategy_meta_market = LabeledEntry(meta_frame, "Market / timeframe", "")
+        self.strategy_meta_tags = LabeledEntry(meta_frame, "Tags (comma-separated)", "")
+        self.strategy_meta_status = LabeledCombo(meta_frame, "Status", list(STRATEGY_STATUSES), default="draft")
 
         self._button(
             meta_frame, "SAVE INFO TO SELECTED", self._save_selected_library_metadata
@@ -1258,25 +1281,57 @@ class MainWindow:
             )
             return
 
+        # Keep the market/tag filter dropdowns' options current -- new
+        # values show up here as soon as they're saved on any strategy.
+        markets = list_all_markets(mode)
+        self.strategy_filter_market.combo["values"] = ["All markets", *markets]
+        if self.strategy_filter_market.get_str() not in ("All markets", *markets):
+            self.strategy_filter_market.var.set("All markets")
+        tags = list_all_tags(mode)
+        self.strategy_filter_tag.combo["values"] = ["All tags", *tags]
+        if self.strategy_filter_tag.get_str() not in ("All tags", *tags):
+            self.strategy_filter_tag.var.set("All tags")
+
         query = self.strategy_search.get_str().strip() if hasattr(self, "strategy_search") else ""
-        self._strategy_library_items = list_saved_strategies(mode, query=query)
+        market_filter = self.strategy_filter_market.get_str()
+        tag_filter = self.strategy_filter_tag.get_str()
+        status_filter = self.strategy_filter_status.get_str()
+
+        self._strategy_library_items = list_saved_strategies(
+            mode,
+            query=query,
+            market=None if market_filter in ("", "All markets") else market_filter,
+            tag=None if tag_filter in ("", "All tags") else tag_filter,
+            status=None if status_filter in ("", "All statuses") else status_filter,
+        )
         for item in self._strategy_library_items:
             kb = item.size_bytes / 1024
             desc = item.metadata.get("description", "")
             suffix = f"  —  {desc}" if desc else ""
-            self.strategy_library_listbox.insert(END, f"  {item.name}  ({kb:.1f} KB){suffix}")
+            lookahead = item.metadata.get("lookahead")
+            if lookahead is None:
+                badge = ""
+            elif lookahead.get("clean"):
+                badge = "  ✓clean"
+            else:
+                badge = "  ⚠LOOKAHEAD"
+            self.strategy_library_listbox.insert(
+                END, f"  [{item.status.upper()}]  {item.name}  ({kb:.1f} KB){badge}{suffix}"
+            )
 
         d = get_strategy_library_dir(mode)
         total = len(list_saved_strategies(mode))
+        filtered = query or market_filter not in ("", "All markets") or \
+            tag_filter not in ("", "All tags") or status_filter not in ("", "All statuses")
         if self._strategy_library_items:
             shown = (
                 f"{len(self._strategy_library_items)} of {total} saved {mode} strategy(ies)"
-                if query else f"{total} saved {mode} strategy(ies)"
+                if filtered else f"{total} saved {mode} strategy(ies)"
             )
             self.strategy_library_status.config(text=f"{shown}  •  {d}", fg=TEXT_DIM)
-        elif total and query:
+        elif total and filtered:
             self.strategy_library_status.config(
-                text=f"No saved {mode} strategies match '{query}'.", fg=TEXT_DIM,
+                text=f"No saved {mode} strategies match the current search/filters.", fg=TEXT_DIM,
             )
         else:
             self.strategy_library_status.config(
@@ -1287,44 +1342,72 @@ class MainWindow:
         self._clear_strategy_metadata_panel()
 
     def _selected_library_item(self):
+        """First selected item, for actions that only make sense on one at
+        a time (load, rename, edit info)."""
+        items = self._selected_library_items()
+        return items[0] if items else None
+
+    def _selected_library_items(self):
+        """All currently highlighted items, for bulk actions (delete,
+        export). The listbox allows multi-select (Ctrl/Cmd/Shift-click)."""
         mode = self.strategy_mode.get()
         if mode not in STRATEGY_TYPES:
-            return None
+            return []
         sel = self.strategy_library_listbox.curselection()
-        if not sel:
-            return None
-        return self._strategy_library_items[sel[0]]
+        return [self._strategy_library_items[i] for i in sel]
 
     def _clear_strategy_metadata_panel(self):
         if hasattr(self, "strategy_meta_description"):
             self.strategy_meta_description.var.set("")
             self.strategy_meta_market.var.set("")
+            self.strategy_meta_tags.var.set("")
+            self.strategy_meta_status.var.set("draft")
             self.strategy_meta_last_run.config(text="")
 
     def _on_library_selection_changed(self):
-        item = self._selected_library_item()
-        if item is None:
+        items = self._selected_library_items()
+        if len(items) != 1:
             self._clear_strategy_metadata_panel()
+            if len(items) > 1:
+                self.strategy_meta_last_run.config(
+                    text=f"{len(items)} strategies selected — bulk delete/export only "
+                    "(load/rename/info apply to a single selection)."
+                )
             return
+        item = items[0]
         self.strategy_meta_description.var.set(item.metadata.get("description", ""))
         self.strategy_meta_market.var.set(item.metadata.get("market", ""))
+        self.strategy_meta_tags.var.set(", ".join(item.tags))
+        self.strategy_meta_status.var.set(item.status)
+
+        lines = []
         last_run = item.metadata.get("last_run")
         if last_run:
-            parts = [f"{k}: {v}" for k, v in last_run.items()]
-            self.strategy_meta_last_run.config(text="Last run — " + "  •  ".join(parts))
-        else:
-            self.strategy_meta_last_run.config(text="No backtest recorded for this strategy yet.")
+            lines.append("Last run — " + "  •  ".join(f"{k}: {v}" for k, v in last_run.items()))
+        lookahead = item.metadata.get("lookahead")
+        if lookahead:
+            lines.append(f"Lookahead — {'clean' if lookahead.get('clean') else 'FAILED'}: "
+                         f"{lookahead.get('summary', '')}")
+        last_search = item.metadata.get("last_search")
+        if last_search:
+            lines.append("Last search — " + "  •  ".join(f"{k}: {v}" for k, v in last_search.items()))
+        self.strategy_meta_last_run.config(
+            text="\n".join(lines) if lines else "No backtest, lookahead check, or search recorded yet."
+        )
 
     def _save_selected_library_metadata(self):
         mode = self.strategy_mode.get()
         item = self._selected_library_item()
         if item is None:
-            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            messagebox.showinfo("No selection", "Select a single saved strategy from the list first.")
             return
         save_strategy_metadata(mode, item.name, {
             "description": self.strategy_meta_description.get_str().strip(),
             "market": self.strategy_meta_market.get_str().strip(),
         })
+        tags_raw = self.strategy_meta_tags.get_str().strip()
+        set_strategy_tags(mode, item.name, [t.strip() for t in tags_raw.split(",")] if tags_raw else [])
+        set_strategy_status(mode, item.name, self.strategy_meta_status.get_str())
         self._refresh_strategy_library()
 
     def _load_selected_library_strategy(self):
@@ -1344,7 +1427,7 @@ class MainWindow:
         mode = self.strategy_mode.get()
         item = self._selected_library_item()
         if item is None:
-            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            messagebox.showinfo("No selection", "Select a single saved strategy from the list first.")
             return
         new_name = simpledialog.askstring(
             "Rename saved strategy", "New filename:", initialvalue=item.name
@@ -1367,24 +1450,29 @@ class MainWindow:
 
     def _delete_selected_library_strategy(self):
         mode = self.strategy_mode.get()
-        item = self._selected_library_item()
-        if item is None:
-            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+        items = self._selected_library_items()
+        if not items:
+            messagebox.showinfo("No selection", "Select one or more saved strategies from the list first.")
             return
-        if not messagebox.askyesno(
-            "Delete saved strategy",
-            f"Permanently delete '{item.name}' from the strategy library? "
-            "This cannot be undone.",
-        ):
+        names = ", ".join(i.name for i in items)
+        prompt = (
+            f"Permanently delete '{items[0].name}' from the strategy library? This cannot be undone."
+            if len(items) == 1 else
+            f"Permanently delete {len(items)} strategies from the library? This cannot be undone.\n\n{names}"
+        )
+        if not messagebox.askyesno("Delete saved strategy(ies)", prompt):
             return
-        delete_saved_strategy(mode, item.name)
-        if self.strategy_py_path == str(item.path):
+        deleted, failed = delete_many((mode, i.name) for i in items)
+        if self._active_library_strategy and self._active_library_strategy[0] == mode and \
+                any(self._active_library_strategy[1] == i.name for i in items):
             self.strategy_py_path = None
             self._active_library_strategy = None
             self.strategy_file_status.config(
                 text="Only needed for Python / PineScript / MQL5 modes.",
                 fg=TEXT_DIM,
             )
+        if failed:
+            messagebox.showwarning("Some deletions failed", "\n".join(failed))
         self._refresh_strategy_library()
 
     def _open_strategy_library_folder(self):
@@ -1422,6 +1510,27 @@ class MainWindow:
             "Unzip it into your repo's strategies/ folder to keep a packaged "
             ".exe's saved strategies in sync with GitHub.",
         )
+
+    def _export_selected_library_strategies(self):
+        mode = self.strategy_mode.get()
+        items = self._selected_library_items()
+        if not items:
+            messagebox.showinfo("No selection", "Select one or more saved strategies from the list first.")
+            return
+        dest = filedialog.asksaveasfilename(
+            title="Export selected strategies",
+            defaultextension=".zip",
+            initialfile="t58_strategy_selection.zip",
+            filetypes=[("Zip archive", "*.zip")],
+        )
+        if not dest:
+            return
+        try:
+            export_library_zip(dest, selection=[(mode, i.name) for i in items])
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        messagebox.showinfo("Export complete", f"Exported {len(items)} strategy(ies) to:\n{dest}")
 
     def _stop_target_block(self, type_widget, value_widget, atr_period_widget) -> tuple[str, float | None, int]:
         label = type_widget.get_str()
@@ -2131,6 +2240,15 @@ class MainWindow:
                 try:
                     lookahead_result = check_for_lookahead(strategy, df, max_signal_checkpoints=8)
                     self._log(f"  {lookahead_result.summary()}")
+                    active_lib_strategy = getattr(self, "_active_library_strategy", None)
+                    if active_lib_strategy:
+                        try:
+                            record_lookahead_result(*active_lib_strategy, {
+                                "clean": not lookahead_result.bug_detected,
+                                "summary": lookahead_result.summary(),
+                            })
+                        except (FileNotFoundError, ValueError):
+                            pass  # strategy renamed/deleted mid-run -- not worth failing the run over
                 except Exception:
                     # This check is a best-effort audit, not part of the
                     # core pipeline -- never let it take down a run that
@@ -2567,6 +2685,18 @@ class MainWindow:
                 output_dir=str(OUTPUT_DIR / "search"), summary=summary, space=space,
                 instrument=instrument, timeframe="unknown",
             )
+
+            active_lib_strategy = getattr(self, "_active_library_strategy", None)
+            if mode_key in ("single", "family_grid") and active_lib_strategy and summary.leaderboard:
+                try:
+                    record_search_result(*active_lib_strategy, {
+                        "candidates_tested": summary.total_candidates,
+                        "best_fitness": round(summary.leaderboard[0].get("fitness", 0), 4),
+                        "fitness_metric": stage_cfg.fitness_metric,
+                        "report_html": str(report_paths["html"]),
+                    })
+                except (FileNotFoundError, ValueError):
+                    pass  # base strategy renamed/deleted mid-search -- not worth failing the run over
 
             self._last_search_summary = summary
             self._last_search_space = space

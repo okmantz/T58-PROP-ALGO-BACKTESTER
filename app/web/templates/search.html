@@ -48,6 +48,7 @@
     font-size: 16px; font-weight: 700; margin-top: 6px;
   }
   .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .notice { background: #142a1a; border: 1px solid #235a32; color: #b4ffcb; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
   details summary { font-size: 13px; color: #999; cursor: pointer; }
 </style>
 </head>
@@ -64,6 +65,10 @@
 
 {% if error %}
 <div class="error">{{ error }}</div>
+{% endif %}
+
+{% if strategy_notice %}
+<div class="notice">{{ strategy_notice }}</div>
 {% endif %}
 
 <form method="post" action="/search/start" enctype="multipart/form-data">
@@ -131,12 +136,49 @@
       </div>
 
       <div id="code-fields" style="display:none;">
+        <label>Search the library (name / description / market)</label>
+        <input type="text" id="strategy_search_input" placeholder="e.g. fvg, XAUUSD..." oninput="populateLibrarySelect(modeInput.value)">
+
         <label>Load a saved strategy from the library</label>
         <select id="existing_strategy_select" onchange="loadFromLibrary()">
           <option value="">— none, paste or upload below —</option>
         </select>
+        <p style="font-size:12px;color:#888;margin-top:6px;" id="library-count-note"></p>
 
-        <label>Or upload a strategy file (from this computer or your phone)</label>
+        <div id="library-manage-panel" style="display:none;border:1px solid #262626;border-radius:8px;padding:10px;margin-top:8px;">
+          <p style="font-size:12px;color:#999;margin:0 0 8px;">Managing: <b id="library-manage-name"></b></p>
+          <p style="font-size:12px;color:#9ecbff;margin:0 0 8px;" id="library-manage-last-run"></p>
+
+          <form method="post" action="/strategies/metadata" style="margin-bottom:8px;">
+            <input type="hidden" name="strategy_type" id="meta_strategy_type">
+            <input type="hidden" name="filename" id="meta_filename">
+            <input type="hidden" name="return_to" value="search">
+            <label>Description</label>
+            <input type="text" name="description" id="meta_description" placeholder="What this strategy does">
+            <label>Market / timeframe</label>
+            <input type="text" name="market" id="meta_market" placeholder="e.g. XAUUSD 15m">
+            <button type="submit" class="submit-btn" style="margin-top:8px;padding:10px;font-size:13px;">Save Info</button>
+          </form>
+
+          <form method="post" action="/strategies/rename" style="margin-bottom:8px;">
+            <input type="hidden" name="strategy_type" id="rename_strategy_type">
+            <input type="hidden" name="old_filename" id="rename_old_filename">
+            <input type="hidden" name="return_to" value="search">
+            <label>Rename to</label>
+            <input type="text" name="new_filename" id="rename_new_filename">
+            <label><input type="checkbox" name="overwrite" value="1"> Overwrite if that name is already taken</label>
+            <button type="submit" class="submit-btn" style="margin-top:8px;padding:10px;font-size:13px;">Rename</button>
+          </form>
+
+          <form method="post" action="/strategies/delete" onsubmit="return confirm('Permanently delete this saved strategy?');">
+            <input type="hidden" name="strategy_type" id="delete_strategy_type">
+            <input type="hidden" name="filename" id="delete_filename">
+            <input type="hidden" name="return_to" value="search">
+            <button type="submit" class="submit-btn" style="padding:10px;font-size:13px;background:#3a1616;color:#ffb4b4;">Delete From Library</button>
+          </form>
+        </div>
+
+        <label style="margin-top:14px;">Or upload a strategy file (from this computer or your phone)</label>
         <input type="file" id="strategy_file_input" name="strategy_file" accept=".py,.pine,.mq5">
 
         <label>Or paste strategy source</label>
@@ -151,6 +193,22 @@
             <input type="text" name="strategy_save_name" id="strategy_save_name" placeholder="e.g. my_strategy.py">
           </div>
         </div>
+        <div class="row">
+          <div>
+            <label><input type="checkbox" name="strategy_overwrite" value="1"> Overwrite existing (if that name's already saved)</label>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Description (optional)</label>
+            <input type="text" name="strategy_save_description" placeholder="What this strategy does">
+          </div>
+          <div>
+            <label>Market / timeframe (optional)</label>
+            <input type="text" name="strategy_save_market" placeholder="e.g. XAUUSD 15m">
+          </div>
+        </div>
+        <p style="font-size:12px;margin-top:10px;"><a href="/strategies/export">&darr; Download entire strategy library as a zip (backup)</a></p>
       </div>
 
       <div id="grid-points-field" style="display:none;">
@@ -240,28 +298,67 @@
   const manualFields = document.getElementById('manual-fields');
   const codeFields = document.getElementById('code-fields');
 
-  // {"python": ["a.py", ...], "pinescript": [...], "mql5": [...]}
+  // {"python": [{"name","description","market","last_run"}, ...], "pinescript": [...], "mql5": [...]}
   const SAVED_STRATEGIES = {{ saved_strategies_json | safe }};
 
   function populateLibrarySelect(mode) {
     const select = document.getElementById('existing_strategy_select');
+    const note = document.getElementById('library-count-note');
+    const query = (document.getElementById('strategy_search_input').value || '').toLowerCase().trim();
     select.innerHTML = '<option value="">— none, paste or upload below —</option>';
-    (SAVED_STRATEGIES[mode] || []).forEach(name => {
+    const all = SAVED_STRATEGIES[mode] || [];
+    const items = query
+      ? all.filter(s => (s.name + ' ' + s.description + ' ' + s.market).toLowerCase().includes(query))
+      : all;
+    items.forEach(s => {
       const opt = document.createElement('option');
-      opt.value = name;
-      opt.textContent = name;
+      opt.value = s.name;
+      opt.textContent = s.description ? `${s.name} — ${s.description}` : s.name;
       select.appendChild(opt);
     });
+    document.getElementById('library-manage-panel').style.display = 'none';
+    if (!all.length) {
+      note.textContent = `No saved ${mode} strategies yet — upload or paste one, then check "Save to strategy library".`;
+    } else if (query && !items.length) {
+      note.textContent = `No saved ${mode} strategies match "${query}".`;
+    } else {
+      note.textContent = query
+        ? `${items.length} of ${all.length} saved ${mode} strategy(ies) shown.`
+        : `${all.length} saved ${mode} strategy(ies) in the library.`;
+    }
   }
 
   function loadFromLibrary() {
     const mode = modeInput.value;
     const name = document.getElementById('existing_strategy_select').value;
-    if (!name) return;
+    const panel = document.getElementById('library-manage-panel');
+    if (!name) { panel.style.display = 'none'; return; }
+
     fetch(`/strategies/${encodeURIComponent(mode)}/${encodeURIComponent(name)}`)
       .then(r => r.ok ? r.text() : Promise.reject())
       .then(text => { document.getElementById('strategy_code').value = text; })
       .catch(() => alert('Could not load that saved strategy.'));
+
+    const item = (SAVED_STRATEGIES[mode] || []).find(s => s.name === name);
+    document.getElementById('library-manage-name').textContent = name;
+    document.getElementById('meta_strategy_type').value = mode;
+    document.getElementById('meta_filename').value = name;
+    document.getElementById('meta_description').value = item ? item.description : '';
+    document.getElementById('meta_market').value = item ? item.market : '';
+    document.getElementById('rename_strategy_type').value = mode;
+    document.getElementById('rename_old_filename').value = name;
+    document.getElementById('rename_new_filename').value = name;
+    document.getElementById('delete_strategy_type').value = mode;
+    document.getElementById('delete_filename').value = name;
+
+    const lastRunNote = document.getElementById('library-manage-last-run');
+    if (item && item.last_run) {
+      const parts = Object.entries(item.last_run).map(([k, v]) => `${k}: ${v}`);
+      lastRunNote.textContent = 'Last run — ' + parts.join('  •  ');
+    } else {
+      lastRunNote.textContent = 'No backtest recorded for this strategy yet.';
+    }
+    panel.style.display = 'block';
   }
 
   document.getElementById('strategy_file_input').addEventListener('change', (e) => {

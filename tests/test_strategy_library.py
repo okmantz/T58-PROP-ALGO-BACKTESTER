@@ -381,3 +381,211 @@ def test_export_library_zip_empty_library_still_produces_valid_zip():
     import io
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         assert zf.namelist() == []
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def test_set_strategy_tags_and_filter_by_tag():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.set_strategy_tags("python", "a.py", ["Mean-Reversion", "gold"])
+    library.save_strategy_bytes(b"x", "b.py", "python")
+    library.set_strategy_tags("python", "b.py", ["breakout"])
+
+    results = library.list_saved_strategies("python", tag="mean-reversion")
+    assert [s.name for s in results] == ["a.py"]
+
+    item = library.list_saved_strategies("python", tag="gold")[0]
+    assert item.tags == ["Mean-Reversion", "gold"]
+
+
+def test_set_strategy_tags_dedupes_and_strips():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.set_strategy_tags("python", "a.py", ["fvg", " FVG ", "fvg", "liquidity", ""])
+    item = library.list_saved_strategies("python")[0]
+    assert item.tags == ["fvg", "liquidity"]
+
+
+def test_list_all_tags_across_library():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.set_strategy_tags("python", "a.py", ["fvg", "gold"])
+    library.save_strategy_bytes(b"x", "b.pine", "pinescript")
+    library.set_strategy_tags("pinescript", "b.pine", ["breakout"])
+    assert library.list_all_tags() == ["breakout", "fvg", "gold"]
+    assert library.list_all_tags("python") == ["fvg", "gold"]
+
+
+def test_search_query_matches_tags():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.set_strategy_tags("python", "a.py", ["mean-reversion"])
+    results = library.list_saved_strategies("python", query="reversion")
+    assert [s.name for s in results] == ["a.py"]
+
+
+# ---------------------------------------------------------------------------
+# Market browsing (exact filter, distinct from free-text query)
+# ---------------------------------------------------------------------------
+
+def test_filter_by_exact_market():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.save_strategy_metadata("python", "a.py", {"market": "XAUUSD"})
+    library.save_strategy_bytes(b"x", "b.py", "python")
+    library.save_strategy_metadata("python", "b.py", {"market": "XAUUSD 15m"})
+
+    results = library.list_saved_strategies("python", market="XAUUSD")
+    assert [s.name for s in results] == ["a.py"]  # exact match, not "b.py"'s "XAUUSD 15m"
+
+
+def test_filter_by_market_is_case_insensitive():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.save_strategy_metadata("python", "a.py", {"market": "XAUUSD"})
+    assert [s.name for s in library.list_saved_strategies("python", market="xauusd")] == ["a.py"]
+
+
+def test_list_all_markets():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.save_strategy_metadata("python", "a.py", {"market": "XAUUSD"})
+    library.save_strategy_bytes(b"x", "b.py", "python")
+    library.save_strategy_metadata("python", "b.py", {"market": "EURUSD"})
+    library.save_strategy_bytes(b"x", "c.py", "python")  # no market set
+    assert library.list_all_markets("python") == ["EURUSD", "XAUUSD"]
+
+
+# ---------------------------------------------------------------------------
+# Status lifecycle
+# ---------------------------------------------------------------------------
+
+def test_default_status_is_draft():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    item = library.list_saved_strategies("python")[0]
+    assert item.status == "draft"
+
+
+def test_set_strategy_status_and_filter():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.set_strategy_status("python", "a.py", "validated")
+    library.save_strategy_bytes(b"x", "b.py", "python")
+
+    item = library.list_saved_strategies("python", status="validated")
+    assert [s.name for s in item] == ["a.py"]
+    by_name = {s.name: s for s in library.list_saved_strategies("python")}
+    assert by_name["b.py"].status == "draft"  # b.py untouched
+
+
+def test_set_strategy_status_rejects_unknown_value():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    with pytest.raises(ValueError):
+        library.set_strategy_status("python", "a.py", "deployed")
+
+
+def test_filtering_by_unknown_status_raises():
+    with pytest.raises(ValueError):
+        library.list_saved_strategies("python", status="nope")
+
+
+def test_all_three_lifecycle_statuses_settable():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    for status in library.STRATEGY_STATUSES:
+        library.set_strategy_status("python", "a.py", status)
+        assert library.list_saved_strategies("python")[0].status == status
+
+
+# ---------------------------------------------------------------------------
+# Wiring results in from other features (lookahead checker, search lab)
+# ---------------------------------------------------------------------------
+
+def test_record_lookahead_result():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.record_lookahead_result("python", "a.py", {"clean": False, "summary": "leak found"})
+    meta = library.load_strategy_metadata("python", "a.py")
+    assert meta["lookahead"]["clean"] is False
+    assert meta["lookahead"]["summary"] == "leak found"
+
+
+def test_record_lookahead_result_does_not_clobber_other_metadata():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.save_strategy_metadata("python", "a.py", {"description": "my strategy"})
+    library.record_lookahead_result("python", "a.py", {"clean": True})
+    meta = library.load_strategy_metadata("python", "a.py")
+    assert meta["description"] == "my strategy"
+    assert meta["lookahead"]["clean"] is True
+
+
+def test_record_search_result():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.record_search_result("python", "a.py", {"candidates_tested": 200, "best_fitness": 1.42})
+    meta = library.load_strategy_metadata("python", "a.py")
+    assert meta["last_search"]["candidates_tested"] == 200
+    assert meta["last_search"]["best_fitness"] == 1.42
+
+
+def test_list_saved_strategies_surfaces_lookahead_and_search_metadata():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.record_lookahead_result("python", "a.py", {"clean": True})
+    library.record_search_result("python", "a.py", {"best_fitness": 2.0})
+    item = library.list_saved_strategies("python")[0]
+    assert item.metadata["lookahead"]["clean"] is True
+    assert item.metadata["last_search"]["best_fitness"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Bulk delete
+# ---------------------------------------------------------------------------
+
+def test_delete_many_deletes_all_given_items():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    library.save_strategy_bytes(b"x", "b.py", "python")
+    library.save_strategy_bytes(b"x", "c.pine", "pinescript")
+
+    deleted, failed = library.delete_many([
+        ("python", "a.py"), ("python", "b.py"), ("pinescript", "c.pine"),
+    ])
+    assert set(deleted) == {"python/a.py", "python/b.py", "pinescript/c.pine"}
+    assert failed == []
+    assert library.list_saved_strategies() == []
+
+
+def test_delete_many_continues_past_a_missing_item():
+    library.save_strategy_bytes(b"x", "a.py", "python")
+    deleted, failed = library.delete_many([("python", "a.py"), ("python", "ghost.py")])
+    assert deleted == ["python/a.py"]
+    assert len(failed) == 1
+    assert "ghost.py" in failed[0]
+    assert library.list_saved_strategies() == []
+
+
+def test_delete_many_empty_selection():
+    deleted, failed = library.delete_many([])
+    assert deleted == []
+    assert failed == []
+
+
+# ---------------------------------------------------------------------------
+# Selective export (bulk export a subset)
+# ---------------------------------------------------------------------------
+
+def test_export_selection_only_includes_chosen_items():
+    library.save_strategy_bytes(b"a content", "a.py", "python")
+    library.save_strategy_bytes(b"b content", "b.py", "python")
+    library.save_strategy_metadata("python", "a.py", {"description": "keep"})
+
+    data = library.export_library_zip_bytes(selection=[("python", "a.py")])
+    import io
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = set(zf.namelist())
+        assert names == {"strategies/python/a.py", "strategies/python/a.py.meta.json"}
+        assert zf.read("strategies/python/a.py") == b"a content"
+
+
+def test_export_selection_without_metadata_sidecar_only_includes_the_file():
+    library.save_strategy_bytes(b"content", "a.py", "python")
+    data = library.export_library_zip_bytes(selection=[("python", "a.py")])
+    import io
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert zf.namelist() == ["strategies/python/a.py"]
+
+
+def test_export_selection_raises_for_missing_item():
+    with pytest.raises(FileNotFoundError):
+        library.export_library_zip_bytes(selection=[("python", "ghost.py")])

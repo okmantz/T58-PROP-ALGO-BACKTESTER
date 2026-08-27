@@ -29,6 +29,14 @@ over yourself (or use export_library_zip() below and unzip it into your
 repo's strategies/ folder). Saving from the app run out of the repo
 (`python -m app.web.server` / `python run_app.py`) writes directly into
 the repo's strategies/ folder and needs no extra step.
+
+Metadata sidecars (<file>.meta.json) hold everything besides the raw
+source: description, market, timeframe, tags (list[str]), status (one of
+STRATEGY_STATUSES -- the "draft -> validated -> live" lifecycle), and
+results other features stamp onto a saved strategy after they run against
+it: last_run (record_backtest_result), lookahead (record_lookahead_result),
+last_search (record_search_result). None of that is required -- an entry
+with no metadata at all is just a file with defaults (status "draft").
 """
 from __future__ import annotations
 
@@ -38,7 +46,7 @@ import shutil
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from app.data.storage import get_app_base_dir
 
@@ -51,6 +59,16 @@ _EXTENSIONS = {
 }
 
 _META_SUFFIX = ".meta.json"
+
+# The strategy lifecycle this library tracks, cheapest-to-riskiest:
+#   draft     -- default; being built/edited, not yet trusted
+#   validated -- passed whatever checks you consider sufficient (lookahead
+#                check, falsification kit, holdout, etc.)
+#   live      -- actually trading / deployed
+# Nothing in this module enforces the *order* of transitions; it's a status
+# label the person sets deliberately, not a state machine that blocks you.
+STRATEGY_STATUSES = ("draft", "validated", "live")
+DEFAULT_STATUS = "draft"
 
 
 class StrategyAlreadyExists(Exception):
@@ -71,6 +89,13 @@ def _normalize_type(strategy_type: str) -> str:
             f"Unknown strategy type '{strategy_type}'. Expected one of {STRATEGY_TYPES}."
         )
     return t
+
+
+def _normalize_status(status: str) -> str:
+    s = (status or "").strip().lower()
+    if s not in STRATEGY_STATUSES:
+        raise ValueError(f"Unknown status '{status}'. Expected one of {STRATEGY_STATUSES}.")
+    return s
 
 
 def _ensure_extension(filename: str, strategy_type: str) -> str:
@@ -108,6 +133,14 @@ class StoredStrategy:
     modified: float                 # unix timestamp — newest-first sort key
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def status(self) -> str:
+        return self.metadata.get("status") or DEFAULT_STATUS
+
+    @property
+    def tags(self) -> list[str]:
+        return list(self.metadata.get("tags") or [])
+
 
 def strategy_exists(strategy_type: str, filename: str) -> bool:
     """Whether a saved strategy with this exact filename already exists —
@@ -118,13 +151,29 @@ def strategy_exists(strategy_type: str, filename: str) -> bool:
     return (get_strategy_library_dir(t) / name).exists()
 
 
-def list_saved_strategies(strategy_type: str | None = None, query: str = "") -> list[StoredStrategy]:
-    """Return saved strategies, newest first. Pass strategy_type to filter
-    to one language; omit it to list across all three. Pass `query` to
-    filter by a case-insensitive substring match against the filename or
-    the metadata description/market/tags (empty query returns everything)."""
+def list_saved_strategies(
+    strategy_type: str | None = None,
+    query: str = "",
+    tag: str | None = None,
+    market: str | None = None,
+    status: str | None = None,
+) -> list[StoredStrategy]:
+    """Return saved strategies, newest first.
+
+    - strategy_type filters to one language; omit for all three.
+    - query is a free-text, case-insensitive substring match against the
+      filename, description, market, and tags (an OR-style search box).
+    - tag/market/status are exact-match filters (case-insensitive) for
+      *browsing* -- e.g. every strategy tagged "mean-reversion", or every
+      XAUUSD strategy, or everything still in "draft" -- as opposed to
+      query's free-text search. All provided filters combine with AND.
+    """
     types = (_normalize_type(strategy_type),) if strategy_type else STRATEGY_TYPES
     q = query.strip().lower()
+    tag_q = tag.strip().lower() if tag else None
+    market_q = market.strip().lower() if market else None
+    status_q = _normalize_status(status) if status else None
+
     out: list[StoredStrategy] = []
     for t in types:
         d = get_strategy_library_dir(t)
@@ -139,9 +188,35 @@ def list_saved_strategies(strategy_type: str | None = None, query: str = "") -> 
             )
             if q and not _matches_query(item, q):
                 continue
+            if tag_q and tag_q not in [x.lower() for x in item.tags]:
+                continue
+            if market_q and market_q != str(item.metadata.get("market", "")).strip().lower():
+                continue
+            if status_q and status_q != item.status:
+                continue
             out.append(item)
     out.sort(key=lambda s: s.modified, reverse=True)
     return out
+
+
+def list_all_tags(strategy_type: str | None = None) -> list[str]:
+    """Every distinct tag in use, sorted, for populating a "browse by tag"
+    filter control."""
+    tags: set[str] = set()
+    for item in list_saved_strategies(strategy_type):
+        tags.update(item.tags)
+    return sorted(tags, key=str.lower)
+
+
+def list_all_markets(strategy_type: str | None = None) -> list[str]:
+    """Every distinct non-empty market value in use, sorted, for populating
+    a "browse by market" filter control."""
+    markets = {
+        str(item.metadata.get("market", "")).strip()
+        for item in list_saved_strategies(strategy_type)
+        if str(item.metadata.get("market", "")).strip()
+    }
+    return sorted(markets, key=str.lower)
 
 
 def _matches_query(item: StoredStrategy, q: str) -> bool:
@@ -149,8 +224,7 @@ def _matches_query(item: StoredStrategy, q: str) -> bool:
         item.name,
         str(item.metadata.get("description", "")),
         str(item.metadata.get("market", "")),
-        str(item.metadata.get("timeframe", "")),
-        " ".join(item.metadata.get("tags", []) or []),
+        " ".join(item.tags),
     ]
     return any(q in h.lower() for h in haystacks)
 
@@ -243,6 +317,22 @@ def delete_saved_strategy(strategy_type: str, filename: str) -> None:
     meta_path.unlink(missing_ok=True)
 
 
+def delete_many(items: Iterable[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """Bulk delete. `items` is an iterable of (strategy_type, filename)
+    pairs. Returns (deleted, failed) -- `deleted` is a list of "type/name"
+    strings that were removed, `failed` is a list of "type/name: reason"
+    strings for ones that couldn't be. One bad item never aborts the rest."""
+    deleted, failed = [], []
+    for strategy_type, filename in items:
+        label = f"{strategy_type}/{filename}"
+        try:
+            delete_saved_strategy(strategy_type, filename)
+            deleted.append(label)
+        except (ValueError, FileNotFoundError) as exc:
+            failed.append(f"{label}: {exc}")
+    return deleted, failed
+
+
 def rename_saved_strategy(
     strategy_type: str, old_filename: str, new_filename: str, overwrite: bool = False
 ) -> Path:
@@ -269,7 +359,7 @@ def rename_saved_strategy(
 
 
 # ---------------------------------------------------------------------------
-# Metadata sidecars — market/timeframe/description/last-run-stats per strategy
+# Metadata sidecars — market/timeframe/description/tags/status/results
 # ---------------------------------------------------------------------------
 
 def _read_metadata_file(path: Path) -> dict[str, Any]:
@@ -283,7 +373,8 @@ def _read_metadata_file(path: Path) -> dict[str, Any]:
 
 def load_strategy_metadata(strategy_type: str, filename: str) -> dict[str, Any]:
     """Return the saved metadata dict for a strategy (description, market,
-    timeframe, tags, last_run, etc.), or {} if none has been saved yet."""
+    tags, status, last_run, lookahead, last_search, etc.), or {} if none
+    has been saved yet."""
     t = _normalize_type(strategy_type)
     d = get_strategy_library_dir(t)
     name = Path(filename).name
@@ -307,6 +398,24 @@ def save_strategy_metadata(strategy_type: str, filename: str, metadata: dict[str
     return path
 
 
+def set_strategy_tags(strategy_type: str, filename: str, tags: list[str]) -> Path:
+    """Replace a strategy's tag list wholesale (dedupes, strips, drops
+    blanks, case-preserving)."""
+    seen: dict[str, str] = {}
+    for tag in tags:
+        clean = tag.strip()
+        if clean and clean.lower() not in seen:
+            seen[clean.lower()] = clean
+    return save_strategy_metadata(strategy_type, filename, {"tags": list(seen.values())})
+
+
+def set_strategy_status(strategy_type: str, filename: str, status: str) -> Path:
+    """Set a strategy's lifecycle status: 'draft', 'validated', or 'live'.
+    This is a plain label the person sets deliberately -- nothing here
+    enforces moving through the stages in order."""
+    return save_strategy_metadata(strategy_type, filename, {"status": _normalize_status(status)})
+
+
 def record_backtest_result(strategy_type: str, filename: str, stats: dict[str, Any]) -> Path:
     """Convenience wrapper for saving a "last_run" block into a strategy's
     metadata right after a backtest/report finishes, e.g.:
@@ -319,35 +428,79 @@ def record_backtest_result(strategy_type: str, filename: str, stats: dict[str, A
     return save_strategy_metadata(strategy_type, filename, {"last_run": stats}, merge=True)
 
 
+def record_lookahead_result(strategy_type: str, filename: str, result: dict[str, Any]) -> Path:
+    """Convenience wrapper for stamping the lookahead checker's verdict onto
+    a saved strategy, e.g.:
+
+        record_lookahead_result("python", "fvg_v1.py", {
+            "clean": False, "summary": "Lookahead detected at 2 checkpoint(s)",
+        })
+
+    This is what makes the library list itself a trust signal instead of
+    just a list of filenames -- a strategy that's never been checked, one
+    that's clean, and one with a known leak all look different at a glance.
+    """
+    return save_strategy_metadata(strategy_type, filename, {"lookahead": result}, merge=True)
+
+
+def record_search_result(strategy_type: str, filename: str, result: dict[str, Any]) -> Path:
+    """Convenience wrapper for stamping a Search Lab run's outcome onto the
+    base strategy it searched around (single/family_grid modes), e.g.:
+
+        record_search_result("python", "fvg_v1.py", {
+            "candidates_tested": 200, "best_fitness": 1.42,
+            "fitness_metric": "composite_prop_score",
+        })
+    """
+    return save_strategy_metadata(strategy_type, filename, {"last_search": result}, merge=True)
+
+
 # ---------------------------------------------------------------------------
 # Backup / export
 # ---------------------------------------------------------------------------
 
-def export_library_zip_bytes() -> bytes:
-    """Zip the entire strategy library (every language, every strategy file
-    plus its metadata sidecar) and return the zip content as bytes -- for
-    streaming a download (the web app) without writing a temp file. The
-    zip's internal paths are rooted at "strategies/<type>/<file>" so
-    unzipping it directly into a repo checkout drops files in the right
-    place -- this is also the fix for a packaged .exe's library (which
-    lives next to the .exe, not in the git repo): export, unzip into the
-    repo's strategies/ folder, commit."""
+def _iter_export_files(selection: Iterable[tuple[str, str]] | None):
+    """Yield (real_path, arcname) pairs for either the whole library
+    (selection=None) or just the given (strategy_type, filename) pairs,
+    each strategy file paired with its metadata sidecar if it has one."""
     base = get_strategy_library_dir()
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+    if selection is None:
         for t in STRATEGY_TYPES:
             d = get_strategy_library_dir(t)
             for f in sorted(d.iterdir()):
                 if f.is_file():
-                    zf.write(f, arcname=str(f.relative_to(base.parent)))
+                    yield f, str(f.relative_to(base.parent))
+        return
+
+    for strategy_type, filename in selection:
+        path = resolve_saved_strategy_path(strategy_type, filename)
+        yield path, str(path.relative_to(base.parent))
+        meta_path = _metadata_path(path.parent, path.name)
+        if meta_path.exists():
+            yield meta_path, str(meta_path.relative_to(base.parent))
+
+
+def export_library_zip_bytes(selection: Iterable[tuple[str, str]] | None = None) -> bytes:
+    """Zip either the entire strategy library (selection=None) or just the
+    given (strategy_type, filename) pairs (bulk-export a selection), and
+    return the zip content as bytes -- for streaming a download (the web
+    app) without writing a temp file. The zip's internal paths are rooted
+    at "strategies/<type>/<file>" so unzipping it directly into a repo
+    checkout drops files in the right place -- this is also the fix for a
+    packaged .exe's library (which lives next to the .exe, not in the git
+    repo): export, unzip into the repo's strategies/ folder, commit."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for real_path, arcname in _iter_export_files(selection):
+            zf.write(real_path, arcname=arcname)
     return buffer.getvalue()
 
 
-def export_library_zip(destination_path: str | Path) -> Path:
+def export_library_zip(destination_path: str | Path, selection: Iterable[tuple[str, str]] | None = None) -> Path:
     """Same as export_library_zip_bytes but writes straight to
     `destination_path` on disk (the desktop app's EXPORT LIBRARY button).
     Returns the path written."""
     destination_path = Path(destination_path)
     destination_path.parent.mkdir(parents=True, exist_ok=True)
-    destination_path.write_bytes(export_library_zip_bytes())
+    destination_path.write_bytes(export_library_zip_bytes(selection))
     return destination_path

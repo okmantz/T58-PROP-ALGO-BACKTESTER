@@ -145,11 +145,55 @@ def test_walk_forward_builds_a_fresh_strategy_instance_each_call():
 # Parameter-neighborhood robustness
 # ---------------------------------------------------------------------------
 
+def _manual_spec(config=None):
+    return {"source_type": "manual", "config": config or _sma_config()}
+
+
+_PYTHON_SRC = '''STRATEGY_NAME = "Test EMA Cross"
+EMA_FAST = 5
+EMA_SLOW = 15
+STOP_LOSS_PIPS = 20
+TAKE_PROFIT_PIPS = 40
+
+def generate_signals(df):
+    fast = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    slow = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    sig = (fast > slow).astype(int) - (fast < slow).astype(int)
+    return sig
+'''
+
+_PINESCRIPT_SRC = '''//@version=5
+strategy("Test", overlay=true)
+fastLen = input.int(5, "Fast Length")
+slowLen = input.int(15, "Slow Length")
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+longCondition = ta.crossover(fast, slow)
+shortCondition = ta.crossunder(fast, slow)
+if longCondition
+    strategy.entry("Long", strategy.long)
+if shortCondition
+    strategy.entry("Short", strategy.short)
+// T58_SL_PIPS=20
+// T58_TP_PIPS=40
+'''
+
+_MQL5_SRC = '''void OnTick() {
+   double fastMA = iMA(_Symbol, PERIOD_CURRENT, 5, 0, MODE_EMA, PRICE_CLOSE);
+   double slowMA = iMA(_Symbol, PERIOD_CURRENT, 15, 0, MODE_EMA, PRICE_CLOSE);
+   if (fastMA > slowMA) { trade.Buy(0.1, _Symbol); }
+   if (fastMA < slowMA) { trade.Sell(0.1, _Symbol); }
+   // T58_SL_PIPS=20
+   // T58_TP_PIPS=40
+}
+'''
+
+
 def test_robustness_returns_none_when_no_tunable_parameters():
-    cfg = {"name": "no params", "long_entry": "close > 0"}
+    spec = {"source_type": "manual", "config": {"name": "no params", "long_entry": "close > 0"}}
     df = _trending_df(n=500)
     result = parameter_neighborhood_robustness(
-        cfg, df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20), n_neighbors=3,
+        spec, df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20), n_neighbors=3,
     )
     assert result is None
 
@@ -157,7 +201,7 @@ def test_robustness_returns_none_when_no_tunable_parameters():
 def test_robustness_runs_requested_neighbor_count():
     df = _trending_df(n=2000)
     result = parameter_neighborhood_robustness(
-        _sma_config(), df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
+        _manual_spec(), df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
         n_neighbors=4, seed=1,
     )
     assert result is not None
@@ -169,11 +213,56 @@ def test_robustness_runs_requested_neighbor_count():
 def test_robustness_is_reproducible_with_same_seed():
     df = _trending_df(n=2000)
     r1 = parameter_neighborhood_robustness(
-        _sma_config(), df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
+        _manual_spec(), df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
         n_neighbors=3, seed=7,
     )
     r2 = parameter_neighborhood_robustness(
-        _sma_config(), df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
+        _manual_spec(), df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
         n_neighbors=3, seed=7,
     )
     assert r1.neighbor_fitnesses == r2.neighbor_fitnesses
+
+
+def test_robustness_works_for_python_candidate(tmp_path):
+    path = tmp_path / "strat.py"
+    path.write_text(_PYTHON_SRC, encoding="utf-8")
+    spec = {"source_type": "python", "code_text": _PYTHON_SRC, "code_extension": ".py"}
+    df = _trending_df(n=2000)
+    result = parameter_neighborhood_robustness(
+        spec, df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
+        n_neighbors=3, seed=1, tmp_dir=tmp_path / "scratch",
+    )
+    assert result is not None
+    assert result.n_neighbors_tested == 3
+
+
+def test_robustness_works_for_pinescript_candidate():
+    spec = {"source_type": "pinescript", "code_text": _PINESCRIPT_SRC, "code_extension": ".pine"}
+    df = _trending_df(n=2000)
+    result = parameter_neighborhood_robustness(
+        spec, df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
+        n_neighbors=3, seed=1,
+    )
+    assert result is not None
+    assert result.n_neighbors_tested == 3
+
+
+def test_robustness_works_for_mql5_candidate():
+    spec = {"source_type": "mql5", "code_text": _MQL5_SRC, "code_extension": ".mq5"}
+    df = _trending_df(n=2000)
+    result = parameter_neighborhood_robustness(
+        spec, df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=20),
+        n_neighbors=3, seed=1,
+    )
+    assert result is not None
+    assert result.n_neighbors_tested == 3
+
+
+def test_robustness_python_candidate_requires_tmp_dir(tmp_path):
+    spec = {"source_type": "python", "code_text": _PYTHON_SRC, "code_extension": ".py"}
+    df = _trending_df(n=500)
+    with pytest.raises(Exception):
+        parameter_neighborhood_robustness(
+            spec, df, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=10),
+            n_neighbors=2, seed=1, tmp_dir=None,
+        )

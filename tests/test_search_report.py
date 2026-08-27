@@ -8,9 +8,10 @@ from app.search.search_report import generate_search_report
 from app.search.strategy_space import generate_search_space
 
 
-def _fake_leaderboard_row(candidate_id, composite_score, passed=True):
+def _fake_leaderboard_row(candidate_id, composite_score, passed=True, source_type="manual"):
     return {
         "candidate_id": candidate_id,
+        "source_type": source_type,
         "family": "trend_breakout",
         "composite_score": composite_score,
         "deflated_sharpe": {"probabilistic_sharpe": 0.62, "n_trials": 40},
@@ -32,8 +33,8 @@ def _summary(leaderboard, champion_id=None):
 
 def test_report_written_with_champion(tmp_path):
     space = generate_search_space("family", family="trend_breakout", max_candidates=5, seed=1)
-    board = [_fake_leaderboard_row("trend_breakout-aaa", 55.0, passed=True),
-             _fake_leaderboard_row("trend_breakout-bbb", 30.0, passed=False)]
+    board = [_fake_leaderboard_row("trend_breakout-aaa", 55.0, passed=True, source_type="manual"),
+             _fake_leaderboard_row("python_grid-bbb", 30.0, passed=False, source_type="python")]
     summary = _summary(board, champion_id="trend_breakout-aaa")
 
     paths = generate_search_report(str(tmp_path), summary, space, instrument="EURUSD", timeframe="5m")
@@ -44,6 +45,7 @@ def test_report_written_with_champion(tmp_path):
     assert "trend_breakout-aaa" in html
     assert "Champion" in html
     assert "PASSED" in html and "FAILED" in html
+    assert ">manual<" in html and ">python<" in html
 
     data = json.loads(paths["json"].read_text(encoding="utf-8"))
     assert data["run_id"] == "abc123def456"

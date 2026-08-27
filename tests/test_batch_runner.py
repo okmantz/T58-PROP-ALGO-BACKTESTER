@@ -19,6 +19,9 @@ from app.prop.simulator import PropRules
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
 from app.search.results_db import ResultsDB
 from app.search.strategy_space import generate_search_space
+from app.strategy.mql5 import MQL5Strategy
+from app.strategy.pinescript import PineScriptStrategy
+from app.strategy.python import PythonStrategy
 
 
 def _trending_df(n=2500, seed=3, drift=0.00015):
@@ -157,14 +160,13 @@ def test_run_search_lookahead_bug_excludes_a_candidate_regardless_of_profit():
     check runs inside the gate rather than being an advisory note only."""
     from app.search.batch_runner import _stage3_task
 
-    leaky_config = {
-        "name": "leaky",
-        # entry_conditions with a swing_high/low lookback of 0 degrades to a
-        # centered rolling window with no confirmation shift -- exercise the
-        # real gate path via a plain, deliberately-broken manual config
-        # instead of monkeypatching internals.
-        "long_entry": "close > close",  # will legitimately produce zero trades; used only
-        "risk_management": {"stop_type": "fixed", "stop_value": 20, "target_type": "fixed", "target_value": 40},
+    leaky_spec = {
+        "source_type": "manual",
+        "config": {
+            "name": "leaky",
+            "long_entry": "close > close",  # will legitimately produce zero trades; used only
+            "risk_management": {"stop_type": "fixed", "stop_value": 20, "target_type": "fixed", "target_value": 40},
+        },
     }
     # This config produces zero trades (close > close is never true), which
     # must be handled as a clean Stage 3 failure, not a crash.
@@ -175,8 +177,8 @@ def test_run_search_lookahead_bug_excludes_a_candidate_regardless_of_profit():
         df = _trending_df(n=200)
         df_path = f"{td}/data.pkl"
         df.to_pickle(df_path)
-        _init_worker(df_path, {}, {})
-        result = _stage3_task("leaky-1", leaky_config, {
+        _init_worker(df_path, {}, {}, td)
+        result = _stage3_task("leaky-1", leaky_spec, {
             "full_mc_sims": 20, "random_seed": 1, "fitness_metric": "composite_prop_score",
             "walk_forward_folds": 0, "walk_forward_metric": "profit_factor",
             "walk_forward_min_efficiency": 0.4, "robustness_neighbors": 0,
@@ -222,3 +224,128 @@ def test_promote_champion_produces_a_full_report(tmp_path, small_family_space):
     assert result["candidate_id"] == candidate_id
     assert result["report_paths"]["html"].exists()
     assert result["report_paths"]["json"].exists()
+
+
+# ---------------------------------------------------------------------------
+# Non-Manual source types: Python, PineScript, MQL5 -- both single mode and
+# family (grid-around-strategy) mode, run through the REAL Stage 1-5
+# pipeline end to end, same as the Manual tests above.
+# ---------------------------------------------------------------------------
+
+_PYTHON_SRC = '''STRATEGY_NAME = "Test EMA Cross"
+EMA_FAST = 5
+EMA_SLOW = 15
+STOP_LOSS_PIPS = 20
+TAKE_PROFIT_PIPS = 40
+
+def generate_signals(df):
+    fast = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    slow = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    sig = (fast > slow).astype(int) - (fast < slow).astype(int)
+    return sig
+'''
+
+_PINESCRIPT_SRC = '''//@version=5
+strategy("Test", overlay=true)
+fastLen = input.int(5, "Fast Length")
+slowLen = input.int(15, "Slow Length")
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+longCondition = ta.crossover(fast, slow)
+shortCondition = ta.crossunder(fast, slow)
+if longCondition
+    strategy.entry("Long", strategy.long)
+if shortCondition
+    strategy.entry("Short", strategy.short)
+// T58_SL_PIPS=20
+// T58_TP_PIPS=40
+'''
+
+_MQL5_SRC = '''void OnTick() {
+   double fastMA = iMA(_Symbol, PERIOD_CURRENT, 5, 0, MODE_EMA, PRICE_CLOSE);
+   double slowMA = iMA(_Symbol, PERIOD_CURRENT, 15, 0, MODE_EMA, PRICE_CLOSE);
+   if (fastMA > slowMA) { trade.Buy(0.1, _Symbol); }
+   if (fastMA < slowMA) { trade.Sell(0.1, _Symbol); }
+   // T58_SL_PIPS=20
+   // T58_TP_PIPS=40
+}
+'''
+
+
+@pytest.mark.parametrize("source_type", ["python", "pinescript", "mql5"])
+def test_run_search_single_mode_works_for_every_code_source_type(tmp_path, source_type):
+    df = _trending_df()
+    if source_type == "python":
+        path = tmp_path / "strat.py"
+        path.write_text(_PYTHON_SRC, encoding="utf-8")
+        strategy = PythonStrategy(path)
+    elif source_type == "pinescript":
+        strategy = PineScriptStrategy(_PINESCRIPT_SRC)
+    else:
+        strategy = MQL5Strategy(_MQL5_SRC)
+
+    space = generate_search_space(mode="single", strategy=strategy)
+    summary = run_search(
+        df, RiskConfig(), PropRules(), space, _fast_stage_cfg(stage1_top_n=1, stage2_top_n=1),
+        db_path=str(tmp_path / "search.db"), instrument="TEST", timeframe="5m",
+    )
+    assert summary.mode == "single"
+    assert summary.total_candidates == 1
+    assert summary.elapsed_seconds > 0
+
+
+@pytest.mark.parametrize("source_type", ["python", "pinescript", "mql5"])
+def test_run_search_family_grid_mode_works_for_every_code_source_type(tmp_path, source_type):
+    df = _trending_df()
+    if source_type == "python":
+        path = tmp_path / "strat.py"
+        path.write_text(_PYTHON_SRC, encoding="utf-8")
+        strategy = PythonStrategy(path)
+    elif source_type == "pinescript":
+        strategy = PineScriptStrategy(_PINESCRIPT_SRC)
+    else:
+        strategy = MQL5Strategy(_MQL5_SRC)
+
+    space = generate_search_space(
+        mode="family", strategy=strategy, grid_points_per_gene=2, max_candidates=8, seed=1,
+    )
+    assert space.family == f"{source_type}_grid"
+    assert len(space.candidates) > 1
+
+    summary = run_search(
+        df, RiskConfig(), PropRules(), space, _fast_stage_cfg(),
+        db_path=str(tmp_path / "search.db"), instrument="TEST", timeframe="5m",
+    )
+    assert summary.mode == "family"
+    assert summary.total_candidates == len(space.candidates)
+    for row in summary.leaderboard:
+        assert row["source_type"] == source_type
+        assert row["code_text"]  # persisted through the whole funnel, not just Stage 1
+
+
+def test_promote_champion_works_for_a_python_candidate(tmp_path):
+    df = _trending_df()
+    path = tmp_path / "strat.py"
+    path.write_text(_PYTHON_SRC, encoding="utf-8")
+    strategy = PythonStrategy(path)
+    space = generate_search_space(
+        mode="family", strategy=strategy, grid_points_per_gene=2, max_candidates=8, seed=1,
+    )
+    # Loose gates so at least one candidate is very likely to survive to Stage 3.
+    cfg = _fast_stage_cfg(min_trades=1, min_profit_factor=0.0, max_drawdown_buffer_mult=100.0)
+    db_path = tmp_path / "search.db"
+    summary = run_search(
+        df, RiskConfig(), PropRules(), space, cfg,
+        db_path=str(db_path), instrument="TEST", timeframe="5m",
+    )
+    assert summary.stage3_survivors > 0
+
+    candidate_id = summary.leaderboard[0]["candidate_id"]
+    assert summary.leaderboard[0]["source_type"] == "python"
+    result = promote_champion(
+        str(db_path), summary.run_id, candidate_id, df,
+        RiskConfig(), PropRules(), output_dir=str(tmp_path / "champion"), mc_sims=50,
+    )
+    assert result["candidate_id"] == candidate_id
+    assert result["spec"]["source_type"] == "python"
+    assert result["report_paths"]["html"].exists()

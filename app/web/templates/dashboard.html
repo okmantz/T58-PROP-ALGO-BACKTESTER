@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dashboard — T58 Prop Algo Backtester</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<style>
+  .t58-radar-wrap { display: flex; align-items: center; justify-content: center; }
+</style>
+</head>
+<body>
+{% set active_page = 'dashboard' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+
+<div class="t58-page-header">
+  <h1>Dashboard</h1>
+  <p>Live stats across every strategy run through the app -- desktop, web, and Search Lab all feed this.</p>
+</div>
+
+<div class="t58-grid cols-4" id="stat-cards">
+  <div class="t58-stat">
+    <div class="label">Strategies tested</div>
+    <div class="value" id="stat-total">{{ data.total_strategies }}</div>
+  </div>
+  <div class="t58-stat">
+    <div class="label">Eval pass rate</div>
+    <div class="value {{ 't58-glow-teal' if data.pass_rate >= 50 else 't58-glow-coral' }}" id="stat-pass-rate">{{ data.pass_rate }}%</div>
+  </div>
+  <div class="t58-stat">
+    <div class="label">Best Sharpe</div>
+    <div class="value t58-glow-violet" id="stat-sharpe">{{ "%.2f"|format(data.best.sharpe_ratio) if data.best else "--" }}</div>
+  </div>
+  <div class="t58-stat">
+    <div class="label">Leader</div>
+    <div class="value" style="font-size:15px;" id="stat-leader">{{ data.best.strategy_name if data.best else "--" }}</div>
+  </div>
+</div>
+
+<div class="t58-card">
+  <h2>Strategy universe</h2>
+  <div id="universe-graph"></div>
+</div>
+
+<div class="t58-grid cols-2">
+  <div class="t58-card">
+    <h2>Equity curves -- top strategies by net profit</h2>
+    <div id="equity-chart"></div>
+  </div>
+  <div class="t58-card">
+    <h2>Weekday x hour PnL (all runs, combined)</h2>
+    <div id="heatmap"></div>
+  </div>
+</div>
+
+<div class="t58-card">
+  <h2>Strategy scorecard</h2>
+  <div id="scorecard-wrap">
+    {% if data.strategies %}
+    <table class="t58-table">
+      <thead>
+        <tr>
+          <th>Strategy</th><th>Instrument</th><th>Trades</th><th>Net P/L</th>
+          <th>Win %</th><th>Sharpe</th><th>Max DD</th><th>Runs</th><th>Result</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in data.strategies %}
+        <tr>
+          <td>{{ s.strategy_name }}</td>
+          <td>{{ s.instrument }}</td>
+          <td>{{ s.trades }}</td>
+          <td style="color:{{ 'var(--teal)' if s.net_profit >= 0 else 'var(--coral)' }};">${{ "{:,.0f}".format(s.net_profit) }}</td>
+          <td>{{ "%.1f"|format(s.win_rate) }}%</td>
+          <td>{{ "%.2f"|format(s.sharpe_ratio) }}</td>
+          <td>{{ "%.1f"|format(s.max_drawdown_pct) }}%</td>
+          <td>{{ s.run_count }}</td>
+          <td><span class="t58-pill {{ 'pass' if s.single_run_passed else 'fail' }}">{{ 'pass' if s.single_run_passed else 'fail' }}</span></td>
+          <td>{% if s.report_html %}<a href="/reports/{{ s.report_html.split('/')[-1] }}" target="_blank">report &rarr;</a>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="t58-empty">No runs yet. Head to Run &amp; report and run your first strategy -- it'll show up here automatically.</div>
+    {% endif %}
+  </div>
+</div>
+
+</div>
+</div>
+
+<script src="/static/graph.js"></script>
+<script>
+  const DATA = {{ data | tojson | safe }};
+
+  function paint(data) {
+    T58Dashboard.renderUniverseGraph(document.getElementById('universe-graph'), data.graph);
+    T58Dashboard.renderEquityChart(document.getElementById('equity-chart'), data.equity_series);
+    T58Dashboard.renderHeatmap(document.getElementById('heatmap'), data.heatmap);
+  }
+  paint(DATA);
+
+  // Best-effort live refresh: if a run finishes on the desktop app or
+  // another browser tab while this page is open, pick it up without a
+  // manual reload. Purely additive -- if the fetch fails (offline, etc.)
+  // the page just keeps showing its last-known data.
+  setInterval(() => {
+    fetch('/api/dashboard-data').then(r => r.json()).then(data => {
+      document.getElementById('stat-total').textContent = data.total_strategies;
+      document.getElementById('stat-pass-rate').textContent = data.pass_rate + '%';
+      document.getElementById('stat-sharpe').textContent = data.best ? data.best.sharpe_ratio.toFixed(2) : '--';
+      document.getElementById('stat-leader').textContent = data.best ? data.best.strategy_name : '--';
+      paint(data);
+    }).catch(() => {});
+  }, 15000);
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

@@ -6,11 +6,21 @@ from app.data import storage
 
 
 @pytest.fixture(autouse=True)
-def clean_raw_dir():
-    """Each test gets an empty data/raw/ and cleans up after itself."""
+def clean_raw_dir(tmp_path, monkeypatch):
+    """
+    Isolate every test in this file from the real data/raw/ directory.
+
+    CRITICAL: get_raw_data_dir() resolves to <repo_root>/data/raw in normal
+    (non-frozen) runs -- the SAME directory a real user's stored market-data
+    CSVs live in. This fixture used to shutil.rmtree() that real directory
+    directly, before AND after every test, which means simply running this
+    test file with pytest permanently deleted a user's actual uploaded
+    datasets. Redirecting get_app_base_dir() to a pytest tmp_path for the
+    duration of each test gives every test its own throwaway data/raw/ to
+    freely create and destroy, with zero risk to the real one.
+    """
+    monkeypatch.setattr(storage, "get_app_base_dir", lambda: tmp_path)
     raw_dir = storage.get_raw_data_dir()
-    shutil.rmtree(raw_dir, ignore_errors=True)
-    raw_dir.mkdir(parents=True, exist_ok=True)
     yield
     shutil.rmtree(raw_dir, ignore_errors=True)
 

@@ -104,65 +104,63 @@ def _make_bigger_csv(seed: int) -> bytes:
     return df.to_csv(index=False).encode()
 
 
-def test_multi_file_upload_stores_all_and_uses_last_as_active():
-    import shutil
+def test_multi_file_upload_stores_all_and_uses_last_as_active(tmp_path, monkeypatch):
+    # CRITICAL: get_raw_data_dir() resolves to <repo_root>/data/raw in normal
+    # (non-frozen) runs -- the SAME directory a real user's stored
+    # market-data CSVs live in. This test used to shutil.rmtree() that real
+    # directory directly (before AND in `finally`), which means simply
+    # running this test permanently deleted a user's actual uploaded
+    # datasets. Redirecting get_app_base_dir() to a pytest tmp_path gives
+    # this test its own throwaway data/raw/ with zero risk to the real one.
+    monkeypatch.setattr(storage, "get_app_base_dir", lambda: tmp_path)
     raw_dir = storage.get_raw_data_dir()
-    shutil.rmtree(raw_dir, ignore_errors=True)
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        import io
-        client = app.test_client()
-        csv_a = _make_bigger_csv(1)
-        csv_b = _make_bigger_csv(2)
-        data = {
-            "csv_file": [(io.BytesIO(csv_a), "setA.csv"), (io.BytesIO(csv_b), "setB.csv")],
-            "strategy_mode": "manual", "sma_fast": "5", "sma_slow": "15", "sl_pips": "20", "tp_pips": "40",
-            "account_size": "100000", "profit_target": "8", "daily_loss": "5", "max_dd": "10",
-            "dd_type": "trailing", "consistency": "30", "min_days": "5", "payout_freq": "14",
-            "payout_threshold": "0", "buffer": "0", "payout_cap": "",
-            "initial_balance": "100000", "risk_mode": "percent", "risk_value": "1.0",
-            "max_trades_day": "10", "commission": "0", "slippage_pips": "0.5",
-            "spread_pips": "1.0", "pip_size": "0.0001",
-            "n_sims": "50", "mc_method": "bootstrap",
-        }
-        r = client.post("/run", data=data, content_type="multipart/form-data")
-        assert r.status_code == 200
-        stored_names = sorted(p.name for p in raw_dir.glob("*.csv"))
-        assert stored_names == ["setA.csv", "setB.csv"]
-        body = r.get_data(as_text=True)
-        assert "setB.csv" in body  # most recently uploaded file becomes active
-    finally:
-        shutil.rmtree(raw_dir, ignore_errors=True)
-        for f in REPORTS_DIR.glob("report_*"):
-            f.unlink()
+    import io
+    client = app.test_client()
+    csv_a = _make_bigger_csv(1)
+    csv_b = _make_bigger_csv(2)
+    data = {
+        "csv_file": [(io.BytesIO(csv_a), "setA.csv"), (io.BytesIO(csv_b), "setB.csv")],
+        "strategy_mode": "manual", "sma_fast": "5", "sma_slow": "15", "sl_pips": "20", "tp_pips": "40",
+        "account_size": "100000", "profit_target": "8", "daily_loss": "5", "max_dd": "10",
+        "dd_type": "trailing", "consistency": "30", "min_days": "5", "payout_freq": "14",
+        "payout_threshold": "0", "buffer": "0", "payout_cap": "",
+        "initial_balance": "100000", "risk_mode": "percent", "risk_value": "1.0",
+        "max_trades_day": "10", "commission": "0", "slippage_pips": "0.5",
+        "spread_pips": "1.0", "pip_size": "0.0001",
+        "n_sims": "50", "mc_method": "bootstrap",
+    }
+    r = client.post("/run", data=data, content_type="multipart/form-data")
+    assert r.status_code == 200
+    stored_names = sorted(p.name for p in raw_dir.glob("*.csv"))
+    assert stored_names == ["setA.csv", "setB.csv"]
+    body = r.get_data(as_text=True)
+    assert "setB.csv" in body  # most recently uploaded file becomes active
+    for f in REPORTS_DIR.glob("report_*"):
+        f.unlink()
 
 
-def test_run_against_existing_stored_dataset_without_new_upload():
-    import shutil
-    raw_dir = storage.get_raw_data_dir()
-    shutil.rmtree(raw_dir, ignore_errors=True)
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        storage.store_csv_bytes(_make_bigger_csv(3), "stored.csv")
-        client = app.test_client()
-        data = {
-            "existing_dataset": "stored.csv",
-            "strategy_mode": "manual", "sma_fast": "5", "sma_slow": "15", "sl_pips": "20", "tp_pips": "40",
-            "account_size": "100000", "profit_target": "8", "daily_loss": "5", "max_dd": "10",
-            "dd_type": "trailing", "consistency": "30", "min_days": "5", "payout_freq": "14",
-            "payout_threshold": "0", "buffer": "0", "payout_cap": "",
-            "initial_balance": "100000", "risk_mode": "percent", "risk_value": "1.0",
-            "max_trades_day": "10", "commission": "0", "slippage_pips": "0.5",
-            "spread_pips": "1.0", "pip_size": "0.0001",
-            "n_sims": "50", "mc_method": "bootstrap",
-        }
-        r = client.post("/run", data=data, content_type="multipart/form-data")
-        assert r.status_code == 200
-        assert "stored.csv" in r.get_data(as_text=True)
-    finally:
-        shutil.rmtree(raw_dir, ignore_errors=True)
-        for f in REPORTS_DIR.glob("report_*"):
-            f.unlink()
+def test_run_against_existing_stored_dataset_without_new_upload(tmp_path, monkeypatch):
+    # See the CRITICAL note in test_multi_file_upload_stores_all_and_uses_last_as_active
+    # -- same real-data-loss hazard, same fix.
+    monkeypatch.setattr(storage, "get_app_base_dir", lambda: tmp_path)
+    storage.store_csv_bytes(_make_bigger_csv(3), "stored.csv")
+    client = app.test_client()
+    data = {
+        "existing_dataset": "stored.csv",
+        "strategy_mode": "manual", "sma_fast": "5", "sma_slow": "15", "sl_pips": "20", "tp_pips": "40",
+        "account_size": "100000", "profit_target": "8", "daily_loss": "5", "max_dd": "10",
+        "dd_type": "trailing", "consistency": "30", "min_days": "5", "payout_freq": "14",
+        "payout_threshold": "0", "buffer": "0", "payout_cap": "",
+        "initial_balance": "100000", "risk_mode": "percent", "risk_value": "1.0",
+        "max_trades_day": "10", "commission": "0", "slippage_pips": "0.5",
+        "spread_pips": "1.0", "pip_size": "0.0001",
+        "n_sims": "50", "mc_method": "bootstrap",
+    }
+    r = client.post("/run", data=data, content_type="multipart/form-data")
+    assert r.status_code == 200
+    assert "stored.csv" in r.get_data(as_text=True)
+    for f in REPORTS_DIR.glob("report_*"):
+        f.unlink()
 
 
 _LEAKY_PYTHON_STRATEGY = '''

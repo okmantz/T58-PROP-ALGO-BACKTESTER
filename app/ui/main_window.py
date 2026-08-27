@@ -38,6 +38,10 @@ from app.search.batch_runner import SearchStageConfig, promote_champion, run_sea
 from app.search.search_report import generate_search_report
 from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
 from app.strategy.base import StrategyError
+from app.strategy.library import (
+    STRATEGY_TYPES, delete_saved_strategy, get_strategy_library_dir,
+    list_saved_strategies, save_strategy_path,
+)
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
 from app.strategy.mql5 import MQL5Strategy
@@ -888,6 +892,75 @@ class MainWindow:
         self.strategy_file_status.pack(anchor="w", padx=18, pady=(0, 14))
 
         # ------------------------------------------------------------
+        # Strategy library — save/load strategies inside the app itself
+        # ------------------------------------------------------------
+        library_section = self._section(
+            f,
+            "Strategy library",
+            "Strategies live here inside the app instead of only on your computer. "
+            "Importing a file above automatically saves a copy into the library; "
+            "you can also load or delete a previously saved one below.",
+        )
+
+        lib_list_frame = Frame(library_section, bg=PANEL)
+        lib_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 10))
+
+        self.strategy_library_listbox = Listbox(
+            lib_list_frame,
+            height=6,
+            selectmode=SINGLE,
+            exportselection=False,
+            bg=PANEL_3,
+            fg=TEXT,
+            selectbackground=BORDER_LIGHT,
+            selectforeground=METAL_BRIGHT,
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            font=(MONO, 9),
+        )
+        self.strategy_library_listbox.pack(side="left", fill="both", expand=True)
+
+        lib_scrollbar = ttk.Scrollbar(
+            lib_list_frame,
+            orient="vertical",
+            command=self.strategy_library_listbox.yview,
+            style="T58.Vertical.TScrollbar",
+        )
+        lib_scrollbar.pack(side="right", fill="y")
+        self.strategy_library_listbox.config(yscrollcommand=lib_scrollbar.set)
+        self.strategy_library_listbox.bind(
+            "<Double-Button-1>", lambda _e: self._load_selected_library_strategy()
+        )
+
+        lib_btn_row = Frame(library_section, bg=PANEL)
+        lib_btn_row.pack(anchor="w", padx=18, pady=(0, 6))
+
+        self._button(
+            lib_btn_row, "LOAD SELECTED", self._load_selected_library_strategy, primary=True
+        ).pack(side="left")
+        self._button(
+            lib_btn_row, "DELETE SELECTED", self._delete_selected_library_strategy
+        ).pack(side="left", padx=8)
+        self._button(
+            lib_btn_row, "REFRESH LIBRARY", self._refresh_strategy_library
+        ).pack(side="left")
+
+        self.strategy_library_status = Label(
+            library_section,
+            text="",
+            bg=PANEL,
+            fg=TEXT_DIM,
+            font=_safe_font(8),
+        )
+        self.strategy_library_status.pack(anchor="w", padx=18, pady=(0, 14))
+
+        self._strategy_library_items: list = []
+        self._refresh_strategy_library()
+
+        # ------------------------------------------------------------
         # 24.1  Strategy information
         # ------------------------------------------------------------
         info = self._section(
@@ -1039,24 +1112,115 @@ class MainWindow:
         self.strategy_mode_label.config(
             text=f"SELECTED  •  {display}"
         )
+        if hasattr(self, "strategy_library_listbox"):
+            self._refresh_strategy_library()
 
     def _browse_strategy_file(self):
+        mode = self.strategy_mode.get()
         ext = {
             "python": "*.py",
             "pinescript": "*.pine",
             "mql5": "*.mq5",
-        }.get(self.strategy_mode.get(), "*.*")
+        }.get(mode, "*.*")
 
         path = filedialog.askopenfilename(
             filetypes=[("Strategy file", ext)]
         )
 
-        if path:
+        if not path:
+            return
+
+        if mode in STRATEGY_TYPES:
+            try:
+                stored_path = save_strategy_path(path, mode)
+            except OSError as exc:
+                messagebox.showwarning(
+                    "Saved locally only",
+                    f"Selected the file, but couldn't copy it into the strategy "
+                    f"library ({exc}). It will still work for this run.",
+                )
+                stored_path = Path(path)
+            self.strategy_py_path = str(stored_path)
+            self.strategy_file_status.config(
+                text=f"Selected: {stored_path.name}  (saved to library)",
+                fg=GREEN,
+            )
+            self._refresh_strategy_library()
+        else:
             self.strategy_py_path = path
             self.strategy_file_status.config(
                 text=f"Selected: {os.path.basename(path)}",
                 fg=GREEN,
             )
+
+    def _refresh_strategy_library(self):
+        mode = self.strategy_mode.get()
+        self.strategy_library_listbox.delete(0, END)
+        self._strategy_library_items = []
+
+        if mode not in STRATEGY_TYPES:
+            self.strategy_library_status.config(
+                text="Manual strategies aren't files — nothing to show here.",
+                fg=TEXT_DIM,
+            )
+            return
+
+        self._strategy_library_items = list_saved_strategies(mode)
+        for item in self._strategy_library_items:
+            kb = item.size_bytes / 1024
+            self.strategy_library_listbox.insert(END, f"  {item.name}  ({kb:.1f} KB)")
+
+        d = get_strategy_library_dir(mode)
+        if self._strategy_library_items:
+            self.strategy_library_status.config(
+                text=f"{len(self._strategy_library_items)} saved {mode} strategy(ies)  •  {d}",
+                fg=TEXT_DIM,
+            )
+        else:
+            self.strategy_library_status.config(
+                text=f"No saved {mode} strategies yet. Import one above, or drop a file "
+                f"directly in {d} and press REFRESH LIBRARY.",
+                fg=TEXT_DIM,
+            )
+
+    def _load_selected_library_strategy(self):
+        mode = self.strategy_mode.get()
+        if mode not in STRATEGY_TYPES:
+            return
+        sel = self.strategy_library_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            return
+        item = self._strategy_library_items[sel[0]]
+        self.strategy_py_path = str(item.path)
+        self.strategy_file_status.config(
+            text=f"Loaded from library: {item.name}",
+            fg=GREEN,
+        )
+
+    def _delete_selected_library_strategy(self):
+        mode = self.strategy_mode.get()
+        if mode not in STRATEGY_TYPES:
+            return
+        sel = self.strategy_library_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            return
+        item = self._strategy_library_items[sel[0]]
+        if not messagebox.askyesno(
+            "Delete saved strategy",
+            f"Permanently delete '{item.name}' from the strategy library? "
+            "This cannot be undone.",
+        ):
+            return
+        delete_saved_strategy(mode, item.name)
+        if self.strategy_py_path == str(item.path):
+            self.strategy_py_path = None
+            self.strategy_file_status.config(
+                text="Only needed for Python / PineScript / MQL5 modes.",
+                fg=TEXT_DIM,
+            )
+        self._refresh_strategy_library()
 
     def _stop_target_block(self, type_widget, value_widget, atr_period_widget) -> tuple[str, float | None, int]:
         label = type_widget.get_str()

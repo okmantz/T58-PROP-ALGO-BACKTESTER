@@ -23,13 +23,16 @@ phone (as opposed to browsing to one) is out of scope for this MVP.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
 
-from flask import Flask, jsonify, redirect, render_template, request, send_from_directory, url_for
+from flask import (
+    Flask, Response, jsonify, redirect, render_template, request, send_from_directory, url_for,
+)
 
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
@@ -44,6 +47,10 @@ from app.search.strategy_space import (
     StrategySpaceError, family_description, generate_search_space, list_families,
 )
 from app.strategy.base import StrategyError
+from app.strategy.library import (
+    STRATEGY_TYPES, delete_saved_strategy, load_strategy_text,
+    list_saved_strategies, save_strategy_bytes, save_strategy_text,
+)
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
 from app.strategy.mql5 import MQL5Strategy
@@ -84,8 +91,29 @@ def _build_strategy(mode: str, form, files):
         return ManualStrategy(cfg)
 
     code = (form.get("strategy_code") or "").strip()
+    existing_choice = (form.get(f"existing_strategy_{mode}") or "").strip()
+    uploaded = files.get("strategy_file")
+    save_name = (form.get("strategy_save_name") or "").strip()
+
+    # Precedence: a freshly uploaded file wins over pasted text (the page's
+    # JS also mirrors an upload into the textarea, so this only matters if
+    # JS didn't run), and pasted/uploaded text wins over a saved-library
+    # pick -- matches _resolve_dataset's "most recent upload wins" pattern.
+    if uploaded and uploaded.filename:
+        code = uploaded.read().decode("utf-8", errors="replace")
+        if not save_name:
+            save_name = uploaded.filename
+
+    if not code and existing_choice:
+        code = load_strategy_text(mode, existing_choice)
+
     if not code:
-        raise StrategyError(f"Paste your {mode} strategy code into the strategy code box.")
+        raise StrategyError(
+            f"Paste your {mode} strategy code, upload a file, or choose a saved strategy from the library."
+        )
+
+    if form.get("strategy_save_to_library"):
+        save_strategy_text(code, save_name or "strategy", mode)
 
     if mode == "python":
         tmp = Path(tempfile.mkdtemp()) / f"strategy_{uuid.uuid4().hex}.py"
@@ -151,9 +179,43 @@ def _resolve_dataset(form, files):
 
 
 
+def _saved_strategies_json() -> str:
+    """{"python": ["a.py", ...], "pinescript": [...], "mql5": [...]} for the
+    page's JS to build the "load from library" dropdowns per strategy mode."""
+    return json.dumps({
+        t: [s.name for s in list_saved_strategies(t)] for t in STRATEGY_TYPES
+    })
+
+
 @app.route("/")
 def index():
-    return render_template("index.html", stored_datasets=list_stored_datasets())
+    return render_template(
+        "index.html",
+        stored_datasets=list_stored_datasets(),
+        saved_strategies_json=_saved_strategies_json(),
+    )
+
+
+@app.route("/strategies/<strategy_type>/<path:filename>")
+def get_saved_strategy(strategy_type, filename):
+    """Raw source text of one saved strategy, for the page's JS to pull into
+    the strategy_code textarea when the person picks it from the library."""
+    try:
+        text = load_strategy_text(strategy_type, filename)
+    except (ValueError, FileNotFoundError) as exc:
+        return Response(str(exc), status=404, mimetype="text/plain")
+    return Response(text, mimetype="text/plain")
+
+
+@app.route("/strategies/delete", methods=["POST"])
+def delete_saved_strategy_route():
+    strategy_type = request.form.get("strategy_type", "")
+    filename = request.form.get("filename", "")
+    try:
+        delete_saved_strategy(strategy_type, filename)
+    except (ValueError, FileNotFoundError):
+        pass
+    return redirect(url_for("index"))
 
 
 @app.route("/manifest.json")
@@ -166,7 +228,7 @@ def run_pipeline():
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(request.form, request.files)
         if dataset_error:
-            return render_template("index.html", error=dataset_error, stored_datasets=list_stored_datasets()), 400
+            return render_template("index.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
 
         form = request.form
         strategy = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
@@ -223,7 +285,7 @@ def run_pipeline():
                 "This usually means the strategy's entry conditions never "
                 "fired for this data/date range rather than an app problem."
             )
-            return render_template("index.html", error=msg, stored_datasets=list_stored_datasets()), 400
+            return render_template("index.html", error=msg, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
 
         n_sims = int(form.get("n_sims", 5000))
         mc_cfg = MonteCarloConfig(n_simulations=min(n_sims, 50_000), method=form.get("mc_method", "bootstrap"))
@@ -277,9 +339,9 @@ def run_pipeline():
             },
         )
     except StrategyError as exc:
-        return render_template("index.html", error=str(exc), stored_datasets=list_stored_datasets()), 400
+        return render_template("index.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
     except Exception as exc:  # noqa: BLE001
-        return render_template("index.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets()), 500
+        return render_template("index.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 500
 
 
 @app.route("/reports/<path:filename>")
@@ -354,6 +416,7 @@ def search_form():
         "search.html",
         stored_datasets=list_stored_datasets(),
         families=[{"name": n, "description": family_description(n)} for n in list_families()],
+        saved_strategies_json=_saved_strategies_json(),
     )
 
 
@@ -366,6 +429,7 @@ def search_start():
             return render_template(
                 "search.html", error=dataset_error, stored_datasets=list_stored_datasets(),
                 families=[{"name": n, "description": family_description(n)} for n in list_families()],
+                saved_strategies_json=_saved_strategies_json(),
             ), 400
 
         mode_key = form.get("search_mode", "family_named")
@@ -427,16 +491,19 @@ def search_start():
         return render_template(
             "search.html", error=str(exc), stored_datasets=list_stored_datasets(),
             families=[{"name": n, "description": family_description(n)} for n in list_families()],
+            saved_strategies_json=_saved_strategies_json(),
         ), 400
     except StrategyError as exc:
         return render_template(
             "search.html", error=str(exc), stored_datasets=list_stored_datasets(),
             families=[{"name": n, "description": family_description(n)} for n in list_families()],
+            saved_strategies_json=_saved_strategies_json(),
         ), 400
     except Exception as exc:  # noqa: BLE001
         return render_template(
             "search.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(),
             families=[{"name": n, "description": family_description(n)} for n in list_families()],
+            saved_strategies_json=_saved_strategies_json(),
         ), 500
 
 

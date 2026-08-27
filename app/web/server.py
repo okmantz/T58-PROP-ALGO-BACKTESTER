@@ -41,6 +41,7 @@ from app.data.storage import get_app_base_dir, get_raw_data_dir, list_stored_dat
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
+from app.reports import run_history
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
 from app.search.search_report import generate_search_report
 from app.search.strategy_space import (
@@ -278,6 +279,18 @@ def index():
         strategy_notice=request.args.get("strategy_notice"),
         strategy_statuses=STRATEGY_STATUSES,
     )
+
+
+@app.route("/dashboard")
+def dashboard():
+    return render_template("dashboard.html", data=run_history.dashboard_data())
+
+
+@app.route("/api/dashboard-data")
+def api_dashboard_data():
+    """JSON feed the dashboard page polls to refresh live, without a full
+    page reload, whenever a run finishes (desktop, web, or CLI)."""
+    return jsonify(run_history.dashboard_data())
 
 
 @app.route("/strategies/<strategy_type>/<path:filename>")

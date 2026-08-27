@@ -48,9 +48,11 @@ from app.search.strategy_space import (
 )
 from app.strategy.base import StrategyError
 from app.strategy.library import (
-    STRATEGY_TYPES, StrategyAlreadyExists, delete_saved_strategy, export_library_zip_bytes,
-    list_saved_strategies, load_strategy_text, rename_saved_strategy, save_strategy_bytes,
-    save_strategy_metadata, save_strategy_text,
+    STRATEGY_STATUSES, STRATEGY_TYPES, StrategyAlreadyExists, delete_many,
+    delete_saved_strategy, export_library_zip_bytes, list_all_markets, list_all_tags,
+    list_saved_strategies, load_strategy_text, record_backtest_result, record_lookahead_result,
+    record_search_result, rename_saved_strategy, save_strategy_bytes, save_strategy_metadata,
+    save_strategy_text, set_strategy_status, set_strategy_tags,
 )
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
@@ -74,7 +76,97 @@ SEARCH_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
 
+def resolve_strategy_source(mode: str, form, files) -> tuple[str, str]:
+    """Single source of truth for "where did this strategy's code come
+    from" -- an uploaded file, a saved-library pick, or pasted text.
+    Returns (code, suggested_save_name). Any future entry point that needs
+    a strategy's source text (not just /run and /search/start) should call
+    this instead of re-implementing the precedence rules.
+
+    Precedence: a freshly uploaded file wins over pasted text (the page's
+    JS also mirrors an upload into the textarea, so this only matters if
+    JS didn't run), and pasted/uploaded text wins over a saved-library pick
+    -- matches _resolve_dataset's "most recent upload wins" pattern."""
+    code = (form.get("strategy_code") or "").strip()
+    existing_choice = (form.get(f"existing_strategy_{mode}") or "").strip()
+    uploaded = files.get("strategy_file")
+    save_name = (form.get("strategy_save_name") or "").strip()
+
+    if uploaded and uploaded.filename:
+        code = uploaded.read().decode("utf-8", errors="replace")
+        if not save_name:
+            save_name = uploaded.filename
+
+    library_ref = None
+    if not code and existing_choice:
+        code = load_strategy_text(mode, existing_choice)
+        library_ref = existing_choice
+
+    if not code:
+        raise StrategyError(
+            f"Paste your {mode} strategy code, upload a file, or choose a saved strategy from the library."
+        )
+    return code, (save_name or library_ref or "strategy")
+
+
+def maybe_save_strategy_to_library(mode: str, code: str, save_name: str, form) -> str | None:
+    """Single source of truth for "save this strategy's code to the
+    library", including the overwrite-vs-duplicate prompt and optional
+    description/market/tags. Returns the saved filename, or None if the
+    "save to library" checkbox wasn't checked. Any future entry point that
+    wants to offer a save-to-library option should call this instead of
+    re-implementing it."""
+    if not form.get("strategy_save_to_library"):
+        return None
+
+    overwrite = bool(form.get("strategy_overwrite"))
+    try:
+        saved_path = save_strategy_text(code, save_name, mode, overwrite=overwrite)
+    except StrategyAlreadyExists as exc:
+        raise StrategyError(
+            f"'{exc.filename}' is already in the {mode} strategy library. "
+            'Check "Overwrite existing" and run again to replace it, or change "Save as" to a new name.'
+        ) from exc
+
+    description = (form.get("strategy_save_description") or "").strip()
+    market = (form.get("strategy_save_market") or "").strip()
+    tags_raw = (form.get("strategy_save_tags") or "").strip()
+    meta_update = {}
+    if description:
+        meta_update["description"] = description
+    if market:
+        meta_update["market"] = market
+    if meta_update:
+        save_strategy_metadata(mode, saved_path.name, meta_update)
+    if tags_raw:
+        set_strategy_tags(mode, saved_path.name, [t.strip() for t in tags_raw.split(",")])
+    return saved_path.name
+
+
+def build_strategy_from_code(mode: str, code: str):
+    """Single source of truth for turning resolved source text into a
+    Strategy object, once code is known (see resolve_strategy_source)."""
+    if mode == "python":
+        tmp = Path(tempfile.mkdtemp()) / f"strategy_{uuid.uuid4().hex}.py"
+        tmp.write_text(code, encoding="utf-8")
+        return PythonStrategy(tmp)
+    if mode == "pinescript":
+        return PineScriptStrategy(code)
+    if mode == "mql5":
+        return MQL5Strategy(code)
+    raise StrategyError(f"Unknown strategy mode: {mode}")
+
+
 def _build_strategy(mode: str, form, files):
+    """Thin orchestrator over resolve_strategy_source / build_strategy_from_code
+    / maybe_save_strategy_to_library -- kept as the one call /run and
+    /search/start both use, but each piece is independently reusable (see
+    their own docstrings) so a future entry point isn't stuck copy-pasting
+    this. Returns (strategy, library_ref) where library_ref is
+    (mode, filename) if the strategy is tied to a saved library entry
+    (loaded from it, or just saved to it) -- used to stamp lookahead/search
+    results back onto that entry's metadata -- or None for manual/one-off
+    pasted strategies with no library tie."""
     if mode == "manual":
         cfg = {
             "name": "Manual Strategy (web)",
@@ -89,55 +181,15 @@ def _build_strategy(mode: str, form, files):
             "stop_loss_pips": float(form.get("sl_pips", 20)),
             "take_profit_pips": float(form.get("tp_pips", 40)),
         }
-        return ManualStrategy(cfg)
+        return ManualStrategy(cfg), None
 
-    code = (form.get("strategy_code") or "").strip()
+    code, save_name = resolve_strategy_source(mode, form, files)
     existing_choice = (form.get(f"existing_strategy_{mode}") or "").strip()
-    uploaded = files.get("strategy_file")
-    save_name = (form.get("strategy_save_name") or "").strip()
 
-    # Precedence: a freshly uploaded file wins over pasted text (the page's
-    # JS also mirrors an upload into the textarea, so this only matters if
-    # JS didn't run), and pasted/uploaded text wins over a saved-library
-    # pick -- matches _resolve_dataset's "most recent upload wins" pattern.
-    if uploaded and uploaded.filename:
-        code = uploaded.read().decode("utf-8", errors="replace")
-        if not save_name:
-            save_name = uploaded.filename
+    saved_name = maybe_save_strategy_to_library(mode, code, save_name, form)
+    library_ref = (mode, saved_name) if saved_name else ((mode, existing_choice) if existing_choice else None)
 
-    if not code and existing_choice:
-        code = load_strategy_text(mode, existing_choice)
-
-    if not code:
-        raise StrategyError(
-            f"Paste your {mode} strategy code, upload a file, or choose a saved strategy from the library."
-        )
-
-    if form.get("strategy_save_to_library"):
-        overwrite = bool(form.get("strategy_overwrite"))
-        try:
-            saved_path = save_strategy_text(code, save_name or "strategy", mode, overwrite=overwrite)
-        except StrategyAlreadyExists as exc:
-            raise StrategyError(
-                f"'{exc.filename}' is already in the {mode} strategy library. "
-                'Check "Overwrite existing" and run again to replace it, or change "Save as" to a new name.'
-            ) from exc
-        description = (form.get("strategy_save_description") or "").strip()
-        market = (form.get("strategy_save_market") or "").strip()
-        if description or market:
-            save_strategy_metadata(mode, saved_path.name, {
-                "description": description, "market": market,
-            })
-
-    if mode == "python":
-        tmp = Path(tempfile.mkdtemp()) / f"strategy_{uuid.uuid4().hex}.py"
-        tmp.write_text(code, encoding="utf-8")
-        return PythonStrategy(tmp)
-    if mode == "pinescript":
-        return PineScriptStrategy(code)
-    if mode == "mql5":
-        return MQL5Strategy(code)
-    raise StrategyError(f"Unknown strategy mode: {mode}")
+    return build_strategy_from_code(mode, code), library_ref
 
 
 def _resolve_dataset(form, files):
@@ -194,17 +246,22 @@ def _resolve_dataset(form, files):
 
 
 def _saved_strategies_json() -> str:
-    """{"python": [{"name", "description", "market"}, ...], "pinescript": [...],
+    """{"python": [{"name", "description", "market", "tags", "status",
+    "last_run", "lookahead", "last_search"}, ...], "pinescript": [...],
     "mql5": [...]} for the page's JS to build the "load from library"
-    dropdowns, the client-side search filter, and to prefill the
-    description/market fields when a saved strategy is picked."""
+    dropdowns, the client-side search/tag/market/status filters, and to
+    prefill fields when a saved strategy is picked."""
     return json.dumps({
         t: [
             {
                 "name": s.name,
                 "description": s.metadata.get("description", ""),
                 "market": s.metadata.get("market", ""),
+                "tags": s.tags,
+                "status": s.status,
                 "last_run": s.metadata.get("last_run"),
+                "lookahead": s.metadata.get("lookahead"),
+                "last_search": s.metadata.get("last_search"),
             }
             for s in list_saved_strategies(t)
         ]
@@ -219,6 +276,7 @@ def index():
         stored_datasets=list_stored_datasets(),
         saved_strategies_json=_saved_strategies_json(),
         strategy_notice=request.args.get("strategy_notice"),
+        strategy_statuses=STRATEGY_STATUSES,
     )
 
 
@@ -247,6 +305,52 @@ def delete_saved_strategy_route():
     except (ValueError, FileNotFoundError) as exc:
         notice = str(exc)
     return redirect(url_for(_redirect_target(request.form), strategy_notice=notice))
+
+
+@app.route("/strategies/bulk-delete", methods=["POST"])
+def bulk_delete_saved_strategies_route():
+    """Delete every "type::filename" item checked in the library's bulk-
+    manage panel in one request, instead of one delete round-trip each."""
+    items = _parse_bulk_items(request.form.getlist("items"))
+    target = _redirect_target(request.form)
+    if not items:
+        return redirect(url_for(target, strategy_notice="No strategies were selected to delete."))
+    deleted, failed = delete_many(items)
+    notice = f"Deleted {len(deleted)} strategy(ies)."
+    if failed:
+        notice += f" {len(failed)} failed: " + "; ".join(failed)
+    return redirect(url_for(target, strategy_notice=notice))
+
+
+def _parse_bulk_items(raw_items: list[str]) -> list[tuple[str, str]]:
+    """Bulk checkboxes post as "type::filename" strings (see the
+    bulk-manage checkboxes in index.html/search.html) -- parse and drop
+    anything malformed rather than letting one bad value 500 the request."""
+    items = []
+    for raw in raw_items:
+        parts = raw.split("::", 1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            items.append((parts[0], parts[1]))
+    return items
+
+
+@app.route("/strategies/bulk-export")
+def bulk_export_saved_strategies_route():
+    """Download only the checked "type::filename" items as a zip (bulk
+    export a subset), via query string (?items=python::a.py&items=...) so
+    it can be a plain link like the full-library export."""
+    items = _parse_bulk_items(request.args.getlist("items"))
+    if not items:
+        return Response("No strategies were selected to export.", status=400, mimetype="text/plain")
+    try:
+        data = export_library_zip_bytes(selection=items)
+    except FileNotFoundError as exc:
+        return Response(str(exc), status=404, mimetype="text/plain")
+    return Response(
+        data,
+        mimetype="application/zip",
+        headers={"Content-Disposition": "attachment; filename=t58_strategy_library_selection.zip"},
+    )
 
 
 @app.route("/strategies/rename", methods=["POST"])
@@ -278,10 +382,26 @@ def save_strategy_metadata_route():
     filename = request.form.get("filename", "")
     description = (request.form.get("description") or "").strip()
     market = (request.form.get("market") or "").strip()
+    tags_raw = (request.form.get("tags") or "").strip()
     target = _redirect_target(request.form)
     try:
         save_strategy_metadata(strategy_type, filename, {"description": description, "market": market})
+        set_strategy_tags(strategy_type, filename, [t.strip() for t in tags_raw.split(",")] if tags_raw else [])
         notice = f"Saved info for '{filename}'."
+    except ValueError as exc:
+        notice = str(exc)
+    return redirect(url_for(target, strategy_notice=notice))
+
+
+@app.route("/strategies/status", methods=["POST"])
+def set_strategy_status_route():
+    strategy_type = request.form.get("strategy_type", "")
+    filename = request.form.get("filename", "")
+    status = request.form.get("status", "")
+    target = _redirect_target(request.form)
+    try:
+        set_strategy_status(strategy_type, filename, status)
+        notice = f"'{filename}' marked {status}."
     except ValueError as exc:
         notice = str(exc)
     return redirect(url_for(target, strategy_notice=notice))
@@ -315,7 +435,7 @@ def run_pipeline():
             return render_template("index.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
 
         form = request.form
-        strategy = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
 
         risk = RiskConfig(
             initial_balance=float(form.get("initial_balance", 100000)),
@@ -352,6 +472,11 @@ def run_pipeline():
                 lookahead_result = check_for_lookahead(strategy, df, max_signal_checkpoints=8)
                 if lookahead_result.bug_detected:
                     lookahead_warning = lookahead_result.summary()
+                if library_ref:
+                    record_lookahead_result(*library_ref, {
+                        "clean": not lookahead_result.bug_detected,
+                        "summary": lookahead_result.summary(),
+                    })
             except Exception:
                 # Best-effort audit -- never let it block a run that would
                 # otherwise succeed.
@@ -399,9 +524,23 @@ def run_pipeline():
             price_df=df,
         )
 
+        if library_ref:
+            try:
+                record_backtest_result(*library_ref, {
+                    "trades": len(bt_result.trades),
+                    "net_profit": round(bt_result.statistics.net_profit, 2),
+                    "win_rate": round(bt_result.statistics.win_rate, 1),
+                    "max_dd": round(bt_result.statistics.max_drawdown_pct, 2),
+                    "passed_evaluation": single_run.passed_evaluation,
+                    "report_html": f"/reports/{paths['html'].name}",
+                })
+            except (FileNotFoundError, ValueError):
+                pass  # strategy was renamed/deleted mid-run -- not worth failing the response over
+
         return render_template(
             "index.html",
             stored_datasets=list_stored_datasets(),
+            saved_strategies_json=_saved_strategies_json(),
             result={
                 "active_dataset": active_label,
                 "import_note": import_note,
@@ -465,7 +604,7 @@ def _job_log(job_id: str, msg: str) -> None:
 
 def _run_search_job(
     job_id: str, df, risk: RiskConfig, rules: PropRules, space, stage_cfg: SearchStageConfig,
-    instrument: str, db_path: str,
+    instrument: str, db_path: str, library_ref: tuple[str, str] | None = None,
 ) -> None:
     try:
         summary = run_search(
@@ -477,6 +616,16 @@ def _run_search_job(
             output_dir=str(SEARCH_DIR), summary=summary, space=space,
             instrument=instrument, timeframe="unknown",
         )
+        if library_ref and summary.leaderboard:
+            try:
+                record_search_result(*library_ref, {
+                    "candidates_tested": summary.total_candidates,
+                    "best_fitness": round(summary.leaderboard[0].get("fitness", 0), 4),
+                    "fitness_metric": stage_cfg.fitness_metric,
+                    "report_html": f"/search_reports/{report_paths['html'].name}",
+                })
+            except (FileNotFoundError, ValueError):
+                pass  # base strategy was renamed/deleted mid-search -- don't fail the job over it
         with _SEARCH_JOBS_LOCK:
             job = _SEARCH_JOBS[job_id]
             job["done"] = True
@@ -502,6 +651,7 @@ def search_form():
         families=[{"name": n, "description": family_description(n)} for n in list_families()],
         saved_strategies_json=_saved_strategies_json(),
         strategy_notice=request.args.get("strategy_notice"),
+        strategy_statuses=STRATEGY_STATUSES,
     )
 
 
@@ -520,12 +670,13 @@ def search_start():
         mode_key = form.get("search_mode", "family_named")
         seed = int(form.get("seed", 42) or 42)
         max_candidates = int(form.get("max_candidates", 200) or 200)
+        library_ref = None
 
         if mode_key == "single":
-            strategy = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+            strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
             space = generate_search_space(mode="single", strategy=strategy)
         elif mode_key == "family_grid":
-            strategy = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+            strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
             space = generate_search_space(
                 mode="family", strategy=strategy,
                 grid_points_per_gene=int(form.get("grid_points", 3) or 3),
@@ -566,7 +717,7 @@ def search_start():
             }
         thread = threading.Thread(
             target=_run_search_job,
-            args=(job_id, df, risk, rules, space, stage_cfg, active_label, db_path),
+            args=(job_id, df, risk, rules, space, stage_cfg, active_label, db_path, library_ref),
             daemon=True,
         )
         thread.start()

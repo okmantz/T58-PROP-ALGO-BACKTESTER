@@ -1,0 +1,139 @@
+/* T58 shared theme -- dark, soft neon glow, used by every page.
+   Kept deliberately restrained: glow lives on data (numbers, lines, active
+   nav state), not on every border, so it still reads as a serious trading
+   tool rather than a game UI. */
+
+:root {
+  --bg: #05070a;
+  --panel: #0d1017;
+  --panel-2: #10141c;
+  --panel-3: #151a24;
+  --border: #1c2230;
+  --border-light: #2a3242;
+  --text: #e7ebf2;
+  --text-muted: #8a93a6;
+  --text-dim: #5b6478;
+  --teal: #35e0b0;
+  --teal-dim: #0f6e56;
+  --violet: #8b7cff;
+  --violet-dim: #3c3489;
+  --coral: #ff6f6f;
+  --coral-dim: #712b13;
+  --amber: #f0b429;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+.t58-shell { display: flex; min-height: 100vh; }
+
+/* ---- Sidebar ---- */
+.t58-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 10px;
+  gap: 3px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+.t58-brand {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px 16px;
+}
+.t58-brand .mark {
+  width: 26px; height: 26px; border-radius: 7px;
+  background: linear-gradient(135deg, var(--teal), var(--violet));
+  color: #04120e; font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.t58-brand .name { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.t58-brand .sub { font-size: 10px; color: var(--text-dim); }
+
+.t58-nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px; border-radius: 8px;
+  color: var(--text-muted); text-decoration: none; font-size: 13px;
+  border: 1px solid transparent;
+}
+.t58-nav-item:hover { background: var(--panel-2); color: var(--text); }
+.t58-nav-item.active {
+  background: rgba(53, 224, 176, 0.08);
+  border-color: rgba(53, 224, 176, 0.35);
+  color: var(--teal);
+  text-shadow: 0 0 10px rgba(53, 224, 176, 0.35);
+}
+.t58-nav-divider { height: 1px; background: var(--border); margin: 10px 6px; }
+.t58-nav-spacer { flex: 1; }
+.t58-nav-icon { width: 16px; text-align: center; font-size: 13px; }
+
+/* ---- Main content ---- */
+.t58-main { flex: 1; min-width: 0; padding: 16px; max-width: 1200px; }
+.t58-page-header { margin-bottom: 14px; }
+.t58-page-header h1 { font-size: 18px; margin: 0; }
+.t58-page-header p { margin: 4px 0 0; font-size: 12px; color: var(--text-muted); }
+
+/* ---- Shared card / stat primitives (reused by dashboard + forms) ---- */
+.t58-card {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+.t58-card h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-muted); margin: 0 0 10px;
+}
+.t58-grid { display: grid; gap: 12px; }
+.t58-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.t58-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.t58-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+.t58-stat { background: var(--panel-3); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.t58-stat .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+.t58-stat .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+.t58-glow-teal   { color: var(--teal);   text-shadow: 0 0 12px rgba(53,224,176,.45); }
+.t58-glow-violet { color: var(--violet); text-shadow: 0 0 12px rgba(139,124,255,.45); }
+.t58-glow-coral  { color: var(--coral);  text-shadow: 0 0 12px rgba(255,111,111,.45); }
+.t58-glow-amber  { color: var(--amber);  text-shadow: 0 0 12px rgba(240,180,41,.4); }
+
+.t58-pill { display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+.t58-pill.pass { background: rgba(53,224,176,0.12); color: var(--teal); border: 1px solid rgba(53,224,176,0.35); }
+.t58-pill.fail { background: rgba(255,111,111,0.12); color: var(--coral); border: 1px solid rgba(255,111,111,0.35); }
+
+.t58-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.t58-table th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.t58-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); }
+.t58-table tr:hover td { background: var(--panel-3); }
+.t58-table a { color: var(--teal); text-decoration: none; }
+
+.t58-empty { color: var(--text-dim); font-size: 13px; padding: 18px 4px; text-align: center; }
+
+/* Mobile: collapse the sidebar into a top bar */
+@media (max-width: 760px) {
+  .t58-shell { flex-direction: column; }
+  .t58-sidebar {
+    width: 100%; height: auto; position: relative;
+    flex-direction: row; overflow-x: auto; overflow-y: hidden;
+    padding: 8px; align-items: center; gap: 4px;
+  }
+  .t58-brand { padding: 0 8px 0 0; }
+  .t58-nav-divider { display: none; }
+  .t58-nav-spacer { display: none; }
+  .t58-nav-item span.label { display: none; }
+  .t58-nav-item { padding: 8px 10px; }
+  .t58-main { max-width: 100%; }
+  .t58-grid.cols-4, .t58-grid.cols-3 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+}

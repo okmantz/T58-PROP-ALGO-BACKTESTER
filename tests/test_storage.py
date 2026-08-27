@@ -66,3 +66,48 @@ def test_store_csv_path_is_idempotent_for_already_stored_file():
 
 def test_list_stored_datasets_empty_when_no_files():
     assert storage.list_stored_datasets() == []
+
+
+def test_list_stored_datasets_finds_files_in_instrument_subfolders():
+    raw_dir = storage.get_raw_data_dir()
+    (raw_dir / "EURUSD").mkdir()
+    (raw_dir / "EURUSD" / "EURUSD5.csv").write_text("a,b\n1,2\n")
+    (raw_dir / "GBPUSD").mkdir()
+    (raw_dir / "GBPUSD" / "GBPUSD5.csv").write_text("a,b\n3,4\n")
+    storage.store_csv_bytes(b"a,b\n5,6\n", "flat_at_top_level.csv")  # still found alongside subfolders
+
+    names = sorted(ds.name for ds in storage.list_stored_datasets())
+    assert names == ["EURUSD/EURUSD5.csv", "GBPUSD/GBPUSD5.csv", "flat_at_top_level.csv"]
+
+
+def test_stored_dataset_subfolder_name_resolves_back_to_its_real_path():
+    raw_dir = storage.get_raw_data_dir()
+    (raw_dir / "XAUUSD").mkdir()
+    nested = raw_dir / "XAUUSD" / "XAUUSD15.csv"
+    nested.write_text("a,b\n1,2\n")
+
+    datasets = storage.list_stored_datasets()
+    assert len(datasets) == 1
+    ds = datasets[0]
+    assert ds.name == "XAUUSD/XAUUSD15.csv"
+    # This is exactly how app/web/server.py's _resolve_dataset() and the
+    # desktop app's stored-dataset picker turn the selected name back into
+    # a real path -- must round-trip correctly on every OS, including
+    # Windows where Path() still accepts "/" separators.
+    assert raw_dir / ds.name == nested
+    assert (raw_dir / ds.name).exists()
+
+
+def test_list_stored_datasets_sorts_newest_first_across_subfolders(tmp_path):
+    import time
+
+    raw_dir = storage.get_raw_data_dir()
+    (raw_dir / "A").mkdir()
+    older = raw_dir / "A" / "older.csv"
+    older.write_text("a,b\n1,2\n")
+    time.sleep(0.02)
+    newer = storage.store_csv_bytes(b"a,b\n3,4\n", "newer_at_top.csv")
+
+    datasets = storage.list_stored_datasets()
+    assert datasets[0].path == newer
+    assert datasets[-1].path == older

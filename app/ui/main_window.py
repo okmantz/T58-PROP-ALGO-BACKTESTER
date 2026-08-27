@@ -33,6 +33,7 @@ from app.optimize.parameter_space import RefinementError
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
+from app.reports import run_history
 from app.reports.refinement_report import generate_refinement_report
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
 from app.search.search_report import generate_search_report
@@ -253,33 +254,54 @@ class MainWindow:
 
         self._build_header(shell)
 
-        self.nb = ttk.Notebook(shell, style="T58.TNotebook")
-        self.nb.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        # ---------------------------------------------------------------
+        # Sidebar navigation + page switcher (replaces the old top-tab
+        # ttk.Notebook). Each page is a plain Frame; only one is gridded
+        # into the content area at a time via _show_page(). This gives us
+        # full control over the nav's look (icons, active glow, grouping)
+        # that ttk.Notebook can't offer, especially for vertical tabs.
+        # ---------------------------------------------------------------
+        body = Frame(shell, bg=BG)
+        body.pack(fill="both", expand=True, padx=18, pady=(0, 18))
 
-        self.tab_data = Frame(self.nb, bg=BG)
-        self.tab_strategy = Frame(self.nb, bg=BG)
-        self.tab_prop = Frame(self.nb, bg=BG)
-        self.tab_risk = Frame(self.nb, bg=BG)
-        self.tab_run = Frame(self.nb, bg=BG)
-        self.tab_refine = Frame(self.nb, bg=BG)
-        self.tab_search = Frame(self.nb, bg=BG)
+        self.sidebar = Frame(body, bg=PANEL, width=196)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
 
-        self.nb.add(self.tab_data, text="  01 ▤  DATA  ")
-        self.nb.add(self.tab_strategy, text="  02 ⚙  STRATEGY  ")
-        self.nb.add(self.tab_prop, text="  03 ⚖  PROP RULES  ")
-        self.nb.add(self.tab_risk, text="  04 ◈  RISK  ")
-        self.nb.add(self.tab_run, text="  05 ▶  RUN & REPORT  ")
-        self.nb.add(self.tab_refine, text="  06 ↻  REFINEMENT  ")
-        self.nb.add(self.tab_search, text="  07 ▦  SEARCH LAB  ")
+        self.content = Frame(body, bg=BG)
+        self.content.pack(side="left", fill="both", expand=True, padx=(14, 0))
 
-        # Thin accent underline that tracks whichever tab is active, giving
-        # the tab strip a focal point beyond the stock ttk selected-color
-        # swap. Positioned with place() against the notebook's own
-        # coordinate space so it lines up exactly with the live tab bbox.
-        self.tab_indicator = Frame(self.nb, bg=ACCENT, height=3, bd=0, highlightthickness=0)
-        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._update_tab_indicator())
-        self.root.bind("<Configure>", lambda _e: self._update_tab_indicator())
+        self.tab_dashboard = Frame(self.content, bg=BG)
+        self.tab_data = Frame(self.content, bg=BG)
+        self.tab_strategy = Frame(self.content, bg=BG)
+        self.tab_prop = Frame(self.content, bg=BG)
+        self.tab_risk = Frame(self.content, bg=BG)
+        self.tab_run = Frame(self.content, bg=BG)
+        self.tab_refine = Frame(self.content, bg=BG)
+        self.tab_search = Frame(self.content, bg=BG)
 
+        for f in (
+            self.tab_dashboard, self.tab_data, self.tab_strategy, self.tab_prop,
+            self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
+        ):
+            f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
+
+        self._nav_items = [
+            ("dashboard", "\u25A3", "DASHBOARD", self.tab_dashboard),
+            (None, None, None, None),  # divider
+            ("data", "\u25A4", "01  DATA", self.tab_data),
+            ("strategy", "\u2699", "02  STRATEGY", self.tab_strategy),
+            ("prop", "\u2696", "03  PROP RULES", self.tab_prop),
+            ("risk", "\u25C8", "04  RISK", self.tab_risk),
+            ("run", "\u25B6", "05  RUN & REPORT", self.tab_run),
+            ("refine", "\u21BB", "06  REFINEMENT", self.tab_refine),
+            ("search", "\u25A6", "07  SEARCH LAB", self.tab_search),
+        ]
+        self._nav_buttons: dict[str, Label] = {}
+        self._build_sidebar_nav()
+        self.active_page = "dashboard"
+
+        self._build_dashboard_tab()
         self._build_data_tab()
         self._build_strategy_tab()
         self._build_prop_tab()
@@ -288,30 +310,50 @@ class MainWindow:
         self._build_refine_tab()
         self._build_search_tab()
 
-        for delay in (50, 150, 400):
-            self.root.after(delay, self._update_tab_indicator)
+        self._show_page("dashboard")
 
-    def _update_tab_indicator(self):
-        # bbox() can legitimately return an empty/zero box for one frame
-        # right after the window is first realized (before the tab strip
-        # has been laid out) — hide the bar rather than leave it stuck at a
-        # stale position, and let the next <Configure>/tab-change re-place it.
-        try:
-            bbox = self.nb.bbox(self.nb.select())
-        except Exception:
-            bbox = None
+    def _build_sidebar_nav(self):
+        for key, icon, label, frame in self._nav_items:
+            if key is None:
+                Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
+                continue
+            row = Frame(self.sidebar, bg=PANEL, cursor="hand2")
+            row.pack(fill="x", padx=8, pady=2)
+            accent_bar = Frame(row, bg=PANEL, width=3)
+            accent_bar.pack(side="left", fill="y")
+            lbl = Label(
+                row, text=f"  {icon}   {label}", bg=PANEL, fg=TEXT_MUTED,
+                font=_safe_font(9, "bold"), anchor="w", padx=6, pady=9,
+            )
+            lbl.pack(side="left", fill="x", expand=True)
+            for widget in (row, accent_bar, lbl):
+                widget.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
+                widget.bind("<Enter>", lambda _e, k=key: self._on_nav_hover(k, True))
+                widget.bind("<Leave>", lambda _e, k=key: self._on_nav_hover(k, False))
+            self._nav_buttons[key] = (row, accent_bar, lbl)
 
-        if not bbox or bbox[2] == 0:
-            self.tab_indicator.place_forget()
+    def _on_nav_hover(self, key, entering):
+        if key == self.active_page:
             return
+        row, accent_bar, lbl = self._nav_buttons[key]
+        bg = PANEL_3 if entering else PANEL
+        row.configure(bg=bg)
+        accent_bar.configure(bg=bg)
+        lbl.configure(bg=bg, fg=TEXT if entering else TEXT_MUTED)
 
-        bx, by, bw, bh = bbox
-        self.tab_indicator.place(in_=self.nb, x=bx, y=by + bh - 3, width=bw, height=3)
-        self.tab_indicator.lift()
-
-    # -----------------------------------------------------------------------
-    # Styling / shell
-    # -----------------------------------------------------------------------
+    def _show_page(self, key: str):
+        self.active_page = key
+        for k, (row, accent_bar, lbl) in self._nav_buttons.items():
+            active = k == key
+            bg = PANEL_2 if active else PANEL
+            row.configure(bg=bg)
+            accent_bar.configure(bg=ACCENT if active else PANEL)
+            lbl.configure(bg=bg, fg=ACCENT_HOVER if active else TEXT_MUTED)
+        for k, _icon, _label, frame in self._nav_items:
+            if k == key:
+                frame.lift()
+        if key == "dashboard":
+            self._refresh_dashboard()
 
     def _configure_styles(self):
         style = ttk.Style(self.root)
@@ -644,6 +686,288 @@ class MainWindow:
             ).pack(anchor="w", padx=18, pady=(0, 8))
 
         return box
+
+    # -----------------------------------------------------------------------
+    # Dashboard — live stats across every strategy run through the app
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _blend(color_hex: str, toward_hex: str, t: float) -> str:
+        """Blend color_hex toward toward_hex by fraction t (0=color, 1=toward).
+        Tkinter's Canvas has no real alpha compositing, so this is how the
+        glow halos fake a soft falloff against the known dark background."""
+        c = color_hex.lstrip("#")
+        b = toward_hex.lstrip("#")
+        cr, cg, cb = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+        br, bg_, bb = int(b[0:2], 16), int(b[2:4], 16), int(b[4:6], 16)
+        r = round(cr + (br - cr) * t)
+        g = round(cg + (bg_ - cg) * t)
+        bl = round(cb + (bb - cb) * t)
+        return f"#{r:02x}{g:02x}{bl:02x}"
+
+    def _glow_line(self, canvas: Canvas, points, color, width=2):
+        if len(points) < 4:
+            return
+        for halo_width, t in ((7, 0.75), (5, 0.55), (3.2, 0.3)):
+            canvas.create_line(*points, fill=self._blend(color, PANEL_2, t), width=halo_width, smooth=True)
+        canvas.create_line(*points, fill=color, width=width, smooth=True)
+
+    def _glow_dot(self, canvas: Canvas, x, y, r, color, ring_color=None):
+        for dr, t in ((r * 2.2, 0.8), (r * 1.6, 0.55)):
+            blended = self._blend(color, PANEL_2, t)
+            canvas.create_oval(x - dr, y - dr, x + dr, y + dr, fill=blended, outline="")
+        canvas.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=ring_color or color, width=1.5)
+
+    def _stat_card(self, parent, label, value, color=ACCENT_HOVER):
+        card = Frame(parent, bg=PANEL_2, highlightthickness=1, highlightbackground=BORDER)
+        Label(card, text=label.upper(), bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 2)
+        )
+        Label(card, text=value, bg=PANEL_2, fg=color, font=_safe_font(20, "bold")).pack(
+            anchor="w", padx=12, pady=(0, 10)
+        )
+        return card
+
+    def _build_dashboard_tab(self):
+        f = self.tab_dashboard
+        self._page_header(
+            f, "OVERVIEW", "Dashboard",
+            "Live stats across every strategy that has been run through the app -- "
+            "desktop, mobile web, and Search Lab all feed this automatically.",
+        )
+
+        outer = Frame(f, bg=BG)
+        outer.pack(fill="both", expand=True)
+        canvas = Canvas(outer, bg=BG, highlightthickness=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview, style="T58.Vertical.TScrollbar")
+        scroll_frame = Frame(canvas, bg=BG)
+        scroll_frame.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+
+        self._dash_stats_row = Frame(scroll_frame, bg=BG)
+        self._dash_stats_row.pack(fill="x", padx=24, pady=(4, 14))
+
+        universe_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        universe_wrap.pack(fill="x", padx=24, pady=(0, 14))
+        Label(universe_wrap, text="STRATEGY UNIVERSE", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=14, pady=(10, 4)
+        )
+        self._dash_universe_canvas = Canvas(universe_wrap, bg=PANEL, height=220, highlightthickness=0)
+        self._dash_universe_canvas.pack(fill="x", padx=14, pady=(0, 14))
+
+        charts_row = Frame(scroll_frame, bg=BG)
+        charts_row.pack(fill="x", padx=24, pady=(0, 14))
+
+        equity_wrap = Frame(charts_row, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        equity_wrap.pack(side="left", fill="both", expand=True, padx=(0, 7))
+        Label(equity_wrap, text="EQUITY CURVES — TOP STRATEGIES", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=14, pady=(10, 4)
+        )
+        self._dash_equity_canvas = Canvas(equity_wrap, bg=PANEL, height=180, highlightthickness=0)
+        self._dash_equity_canvas.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        heatmap_wrap = Frame(charts_row, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        heatmap_wrap.pack(side="left", fill="both", expand=True, padx=(7, 0))
+        Label(heatmap_wrap, text="WEEKDAY x HOUR PNL (ALL RUNS)", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=14, pady=(10, 4)
+        )
+        self._dash_heatmap_canvas = Canvas(heatmap_wrap, bg=PANEL, height=180, highlightthickness=0)
+        self._dash_heatmap_canvas.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        table_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        table_wrap.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        Label(table_wrap, text="STRATEGY SCORECARD", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=14, pady=(10, 6)
+        )
+
+        style = ttk.Style(self.root)
+        style.configure(
+            "T58.Treeview", background=PANEL_2, fieldbackground=PANEL_2, foreground=TEXT,
+            rowheight=24, borderwidth=0, font=_safe_font(9),
+        )
+        style.configure("T58.Treeview.Heading", background=PANEL_3, foreground=TEXT_MUTED, font=_safe_font(8, "bold"))
+        style.map("T58.Treeview", background=[("selected", PANEL_3)])
+
+        columns = ("strategy", "instrument", "trades", "net", "win", "sharpe", "dd", "runs", "result")
+        self._dash_tree = ttk.Treeview(table_wrap, columns=columns, show="headings", style="T58.Treeview", height=8)
+        headings = {
+            "strategy": "Strategy", "instrument": "Instrument", "trades": "Trades", "net": "Net P/L",
+            "win": "Win %", "sharpe": "Sharpe", "dd": "Max DD", "runs": "Runs", "result": "Result",
+        }
+        for col, text in headings.items():
+            self._dash_tree.heading(col, text=text)
+            self._dash_tree.column(col, width=100, anchor="w")
+        self._dash_tree.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        self._refresh_dashboard()
+
+    def _refresh_dashboard(self):
+        """Reloads run_history and repaints every dashboard widget. Called
+        when the tab is opened, and right after any run/search completes."""
+        try:
+            data = run_history.dashboard_data()
+        except Exception:
+            data = {
+                "total_strategies": 0, "total_runs": 0, "pass_rate": 0.0, "best": None,
+                "strategies": [], "graph": {"nodes": [], "edges": [], "instruments": []},
+                "heatmap": [[0.0] * 24 for _ in range(7)], "equity_series": [],
+            }
+
+        for child in self._dash_stats_row.winfo_children():
+            child.destroy()
+        best = data.get("best")
+        cards = [
+            ("Strategies tested", str(data["total_strategies"]), METAL_BRIGHT),
+            ("Eval pass rate", f"{data['pass_rate']:.0f}%", GREEN if data["pass_rate"] >= 50 else RED),
+            ("Best Sharpe", f"{best['sharpe_ratio']:.2f}" if best else "--", ACCENT_HOVER),
+            ("Leader", best["strategy_name"] if best else "--", METAL_BRIGHT),
+        ]
+        for label, value, color in cards:
+            card = self._stat_card(self._dash_stats_row, label, value, color)
+            card.pack(side="left", fill="both", expand=True, padx=6)
+
+        self.root.after(30, lambda: self._paint_universe(data["graph"]))
+        self.root.after(30, lambda: self._paint_equity(data["equity_series"]))
+        self.root.after(30, lambda: self._paint_heatmap(data["heatmap"]))
+
+        for row_id in self._dash_tree.get_children():
+            self._dash_tree.delete(row_id)
+        for s in data["strategies"]:
+            self._dash_tree.insert("", "end", values=(
+                s["strategy_name"], s["instrument"], s["trades"],
+                f"${s['net_profit']:,.0f}", f"{s['win_rate']:.1f}%",
+                f"{s['sharpe_ratio']:.2f}", f"{s['max_drawdown_pct']:.1f}%",
+                s["run_count"], "PASS" if s["single_run_passed"] else "FAIL",
+            ))
+
+    def _paint_universe(self, graph):
+        c = self._dash_universe_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 400)
+        h = max(c.winfo_height(), 200)
+        nodes = graph.get("nodes", [])
+        if not nodes:
+            c.create_text(w / 2, h / 2, text="No strategies run yet.", fill=TEXT_DIM, font=_safe_font(9))
+            return
+
+        instruments = graph.get("instruments", [])
+        n_clusters = max(len(instruments), 1)
+        palette = [GREEN, ACCENT, RED, AMBER, BLUE]
+        import math
+        centers = []
+        for i in range(n_clusters):
+            angle = (i / n_clusters) * 2 * math.pi
+            r = min(w, h) * 0.28 if n_clusters > 1 else 0
+            centers.append((w / 2 + r * math.cos(angle), h / 2 + r * math.sin(angle)))
+
+        pos = []
+        for i, n in enumerate(nodes):
+            cx, cy = centers[n["cluster"]] if n["cluster"] < len(centers) else (w / 2, h / 2)
+            angle = (i / max(len(nodes), 1)) * 2 * math.pi
+            pos.append([cx + 24 * math.cos(angle), cy + 24 * math.sin(angle)])
+
+        edges = graph.get("edges", [])
+        for _ in range(50):
+            forces = [[0.0, 0.0] for _ in nodes]
+            for i in range(len(nodes)):
+                for j in range(len(nodes)):
+                    if i == j:
+                        continue
+                    dx, dy = pos[i][0] - pos[j][0], pos[i][1] - pos[j][1]
+                    d2 = max(dx * dx + dy * dy, 20)
+                    forces[i][0] += dx / d2 * 300
+                    forces[i][1] += dy / d2 * 300
+                cx, cy = centers[nodes[i]["cluster"]] if nodes[i]["cluster"] < len(centers) else (w / 2, h / 2)
+                forces[i][0] += (cx - pos[i][0]) * 0.02
+                forces[i][1] += (cy - pos[i][1]) * 0.02
+            for e in edges:
+                a, b = e["source"], e["target"]
+                dx, dy = pos[b][0] - pos[a][0], pos[b][1] - pos[a][1]
+                pull = e["weight"] * 0.02
+                forces[a][0] += dx * pull
+                forces[a][1] += dy * pull
+                forces[b][0] -= dx * pull
+                forces[b][1] -= dy * pull
+            for i in range(len(nodes)):
+                pos[i][0] = min(w - 16, max(16, pos[i][0] + forces[i][0] * 0.3))
+                pos[i][1] = min(h - 16, max(16, pos[i][1] + forces[i][1] * 0.3))
+
+        for e in edges:
+            a, b = pos[e["source"]], pos[e["target"]]
+            width = 0.5 + e["weight"] * 2
+            c.create_line(a[0], a[1], b[0], b[1], fill=self._blend(ACCENT, PANEL, 0.35), width=width)
+
+        for i, n in enumerate(nodes):
+            color = palette[n["cluster"] % len(palette)]
+            r = 5 + min(max(n["sharpe"], 0), 3) * 2
+            ring = GREEN if n["passed"] else RED
+            self._glow_dot(c, pos[i][0], pos[i][1], r, color, ring_color=ring)
+
+        legend_x = 10
+        for i, name in enumerate(instruments):
+            color = palette[i % len(palette)]
+            c.create_oval(legend_x, h - 16, legend_x + 8, h - 8, fill=color, outline="")
+            c.create_text(legend_x + 14, h - 12, text=name, fill=TEXT_MUTED, font=_safe_font(7), anchor="w")
+            legend_x += 14 + len(name) * 6 + 14
+
+    def _paint_equity(self, series):
+        c = self._dash_equity_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 300)
+        h = max(c.winfo_height(), 140)
+        pad = 16
+        if not series:
+            c.create_text(w / 2, h / 2, text="No completed runs yet.", fill=TEXT_DIM, font=_safe_font(9))
+            return
+
+        lo = min(v for s in series for v in s["values"]) if series else 0
+        hi = max(v for s in series for v in s["values"]) if series else 1
+        rng = (hi - lo) or 1
+        max_len = max(len(s["values"]) for s in series)
+
+        c.create_line(pad, h - pad, w - pad, h - pad, fill=BORDER)
+        for s in series:
+            color = GREEN if s["passed"] else RED
+            n = len(s["values"])
+            if n < 2:
+                continue
+            points = []
+            for i, v in enumerate(s["values"]):
+                x = pad + (i / max(max_len - 1, 1)) * (w - 2 * pad)
+                y = h - pad - ((v - lo) / rng) * (h - 2 * pad)
+                points.extend([x, y])
+            self._glow_line(c, points, color, width=1.6)
+
+        legend_y = 6
+        for s in series:
+            color = GREEN if s["passed"] else RED
+            c.create_oval(6, legend_y, 12, legend_y + 6, fill=color, outline="")
+            c.create_text(18, legend_y + 3, text=s["name"], fill=TEXT_MUTED, font=_safe_font(7), anchor="w")
+            legend_y += 13
+
+    def _paint_heatmap(self, grid):
+        c = self._dash_heatmap_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 300)
+        h = max(c.winfo_height(), 140)
+        left_pad = 26
+        cell_w = (w - left_pad - 4) / 24
+        cell_h = (h - 4) / 7
+        max_abs = max((abs(v) for row in grid for v in row), default=0.0001) or 0.0001
+        days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        for d, row in enumerate(grid):
+            c.create_text(4, 2 + d * cell_h + cell_h / 2, text=days[d], fill=TEXT_DIM, font=_safe_font(6), anchor="w")
+            for hr, v in enumerate(row):
+                intensity = min(abs(v) / max_abs, 1)
+                base = GREEN if v >= 0 else RED
+                color = self._blend(base, PANEL, 1 - (0.15 + intensity * 0.8))
+                x0 = left_pad + hr * cell_w
+                y0 = 2 + d * cell_h
+                c.create_rectangle(x0, y0, x0 + cell_w - 1, y0 + cell_h - 1, fill=color, outline="")
 
     # -----------------------------------------------------------------------
     # Tab 1 — Market Data
@@ -2374,6 +2698,10 @@ class MainWindow:
 
             self._last_html_path = paths["html"]
             self.open_report_btn.config(state="normal")
+            try:
+                self._refresh_dashboard()
+            except Exception:
+                pass
 
             active_lib_strategy = getattr(self, "_active_library_strategy", None)
             if active_lib_strategy:
@@ -2700,6 +3028,10 @@ class MainWindow:
 
             self._last_search_summary = summary
             self._last_search_space = space
+            try:
+                self._refresh_dashboard()
+            except Exception:
+                pass
             self._last_search_html_path = report_paths["html"]
             self._last_search_db_path = db_path
             self._last_search_df = df

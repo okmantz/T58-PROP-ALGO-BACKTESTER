@@ -3,32 +3,50 @@ Strategy Space Generator (Search Lab -- Stage 0).
 
 Feeds the batch runner's Stage 1 cheap filter. Two modes:
 
-  "single" -- wrap ONE user-supplied Manual Strategy config as a size-1
-              space, so the exact same Stage 1-5 pipeline (filter -> GA
-              refine -> validation gate -> leaderboard -> promote) can be
-              used to rigorously re-validate a single hand-built strategy,
-              not just to search a family.
+  "single" -- wrap ONE user-supplied strategy (Manual config, or a built
+              Python/PineScript/MQL5 Strategy instance) as a size-1 space,
+              so the exact same Stage 1-5 pipeline (filter -> GA refine ->
+              validation gate -> leaderboard -> promote) can be used to
+              rigorously re-validate a single hand-built strategy of ANY
+              supported source type, not just to search a family.
 
-  "family" -- combinatorially expand a named strategy family (a economic
-              hypothesis + a grid of parameter values) into many concrete
-              Manual Strategy configs.
+  "family" -- combinatorially expand a search space into many concrete
+              candidates. Two distinct ways to do this:
 
-Deliberately NOT random indicator soup. Pure brute-force combinatorics
-over arbitrary indicators mostly finds noise faster than signal, especially
-at the win-rate/RR targets this app is built around (see
-/areas/prop-firm-falsification-kit.md's own findings: nine instrument/signal
-combinations tested by hand, one validated edge). Each family below encodes
-a specific, named trading hypothesis; the grid only varies ITS parameters.
-Adding a new hypothesis means adding one function + one grid here -- nothing
-elsewhere in the app needs to change.
+                1. Named hypothesis family (Manual strategies only): a
+                   named economic hypothesis + a grid of parameter values
+                   (see the FAMILIES registry below).
+                2. Grid around one given strategy (`strategy=` argument,
+                   any source type -- Manual, Python, PineScript, MQL5):
+                   discovers that strategy's own tunable numeric
+                   parameters (the same discovery Step 6's Iterative
+                   Refinement GA already uses) and grid-searches a
+                   discretized range around each one.
 
-Every generated config is a plain, JSON-serializable dict in exactly the
-format app.strategy.manual.ManualStrategy already accepts (the same format
-the visual builder produces), so:
-  - app.optimize.parameter_space.extract_genome() already works on it
-  - app.optimize.refinement.run_iterative_refinement() already works on it
-  - the normal report pipeline (app.reports.generator) already works on it
-Nothing about ManualStrategy itself needs to change for any of this.
+Every candidate produced by either mode is represented uniformly as a
+"candidate spec" dict so the rest of the Search Lab (batch_runner,
+robustness, results_db) never has to care how a candidate was generated:
+
+    {"source_type": "manual", "config": {...}}
+    {"source_type": "python", "code_text": "...", "code_extension": ".py"}
+    {"source_type": "pinescript", "code_text": "...", "code_extension": ".pine"}
+    {"source_type": "mql5", "code_text": "...", "code_extension": ".mq5"}
+
+`build_strategy_from_spec()` turns any of these back into a live Strategy
+instance ready to run through app.backtest.engine.run_backtest. This is
+the ONE place that dispatch happens; batch_runner.py and robustness.py
+both import and use it rather than special-casing source types themselves.
+
+Deliberately NOT random indicator soup for the named-family path. Pure
+brute-force combinatorics over arbitrary indicators mostly finds noise
+faster than signal, especially at the win-rate/RR targets this app is
+built around (see /areas/prop-firm-falsification-kit.md's own findings:
+nine instrument/signal combinations tested by hand, one validated edge).
+Each named family encodes a specific, named trading hypothesis; the grid
+only varies ITS parameters. The "grid around a given strategy" path
+sidesteps this concern differently: it only ever varies parameters of a
+hypothesis the user themselves already wrote (a Manual config, or a real
+Python/PineScript/MQL5 file), never invents new logic.
 """
 from __future__ import annotations
 
@@ -37,8 +55,26 @@ import hashlib
 import itertools
 import json
 import random
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
+
+import numpy as np
+
+from app.optimize.code_parameter_space import (
+    CodeGene, apply_code_genome, discover_code_genes,
+)
+from app.optimize.parameter_space import GeneMeta, apply_genome, extract_genome
+from app.strategy.base import Strategy
+from app.strategy.manual import ManualStrategy
+from app.strategy.mql5 import MQL5Strategy
+from app.strategy.pinescript import PineScriptStrategy
+from app.strategy.python import PythonStrategy
+
+CANDIDATE_SOURCE_TYPES = {"manual", "python", "pinescript", "mql5"}
+_CODE_SOURCE_TYPES = {"python", "pinescript", "mql5"}
+_CODE_EXTENSIONS = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}
 
 
 class StrategySpaceError(Exception):
@@ -52,16 +88,70 @@ class StrategySpaceError(Exception):
 @dataclass
 class SearchSpace:
     mode: str                        # "single" | "family"
-    family: str | None                # family name, "all", or None for single mode
-    candidates: dict[str, dict]       # candidate_id -> Manual Strategy config dict
+    family: str | None                # family name, "all", "<source_type>_grid", or None for single mode
+    candidates: dict[str, dict]       # candidate_id -> candidate spec dict (see module docstring)
     meta: dict[str, dict]             # candidate_id -> {"family": str, "params": dict}
     total_generated: int              # size of the full grid before any sampling cap
     sampled: bool                     # True if total_generated > requested max_candidates
 
 
 # ---------------------------------------------------------------------------
-# Skeleton family definition
+# Candidate spec <-> live Strategy instance (the one place source_type is
+# dispatched on for building a runnable strategy)
 # ---------------------------------------------------------------------------
+
+def _source_text_for_strategy(strategy: Strategy) -> str:
+    """The exact, unmodified source text for a code-based strategy instance."""
+    if strategy.source_type == "python":
+        return Path(strategy.file_path).read_text(encoding="utf-8", errors="ignore")
+    return strategy.code  # PineScriptStrategy / MQL5Strategy already hold this in memory
+
+
+def spec_from_strategy(strategy: Strategy) -> dict:
+    """Builds a uniform candidate spec dict from any already-built Strategy instance."""
+    st = strategy.source_type
+    if st == "manual":
+        return {"source_type": "manual", "config": copy.deepcopy(strategy.config)}
+    if st in _CODE_SOURCE_TYPES:
+        return {
+            "source_type": st,
+            "code_text": _source_text_for_strategy(strategy),
+            "code_extension": _CODE_EXTENSIONS[st],
+        }
+    raise StrategySpaceError(f"Unsupported strategy source type '{st}'.")
+
+
+def build_strategy_from_spec(spec: dict, tmp_dir: str | Path | None = None) -> Strategy:
+    """
+    The single dispatch point that turns a candidate spec dict back into a
+    live, runnable Strategy instance. `tmp_dir` is only required for
+    Python candidates (PythonStrategy only accepts a file path) -- a fresh
+    uniquely-named temp file is written there per call; PineScript/MQL5
+    build directly from in-memory text, and Manual builds directly from
+    the config dict, so `tmp_dir` is unused for those.
+    """
+    st = spec.get("source_type", "manual")
+    if st == "manual":
+        return ManualStrategy(spec["config"])
+    if st == "python":
+        if tmp_dir is None:
+            raise StrategySpaceError(
+                "Building a Python strategy candidate requires a writable tmp_dir "
+                "(PythonStrategy only accepts a file path)."
+            )
+        tmp_dir = Path(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        path = tmp_dir / f"candidate_{uuid.uuid4().hex}.py"
+        path.write_text(spec["code_text"], encoding="utf-8")
+        return PythonStrategy(path)
+    if st == "pinescript":
+        return PineScriptStrategy(spec["code_text"])
+    if st == "mql5":
+        return MQL5Strategy(spec["code_text"])
+    raise StrategySpaceError(f"Unknown source_type '{st}' in candidate spec.")
+
+
+
 
 @dataclass(frozen=True)
 class SkeletonSpec:
@@ -312,6 +402,111 @@ def family_grid_size(name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Grid-around-a-given-strategy (Manual, Python, PineScript, or MQL5)
+#
+# Reuses the exact same parameter-discovery machinery Step 6's Iterative
+# Refinement GA already uses (app.optimize.parameter_space for Manual,
+# app.optimize.code_parameter_space for the three code sources) -- both
+# gene types expose the same .lo / .hi / .is_int / .base_value / .label
+# shape, so the discretization and Cartesian-product logic below is
+# entirely source-type-agnostic; only the final "apply a genome" and
+# "what does a candidate look like" steps differ.
+# ---------------------------------------------------------------------------
+
+def _genes_for_strategy(strategy: Strategy) -> list:
+    if strategy.source_type == "manual":
+        return extract_genome(strategy.config)
+    if strategy.source_type in _CODE_SOURCE_TYPES:
+        return discover_code_genes(strategy)
+    raise StrategySpaceError(f"Unsupported strategy source type '{strategy.source_type}'.")
+
+
+def _discretize_gene(gene, n_points: int) -> list[float]:
+    """n_points evenly-spaced values across [gene.lo, gene.hi], rounded for
+    integer genes and de-duplicated (rounding can collapse points for a
+    narrow integer range, e.g. a period whose search range is only 2-4)."""
+    n_points = max(int(n_points), 1)
+    lo, hi = gene.lo, gene.hi
+    if n_points == 1 or hi <= lo:
+        raw = [gene.base_value]
+    else:
+        raw = list(np.linspace(lo, hi, n_points))
+    values = [float(round(v)) if gene.is_int else float(v) for v in raw]
+
+    seen: set[float] = set()
+    out: list[float] = []
+    for v in values:
+        key = round(v, 8)
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out or [float(gene.base_value)]
+
+
+def _grid_combinations(genes: list, n_points: int) -> list[list[float]]:
+    per_gene_values = [_discretize_gene(g, n_points) for g in genes]
+    return [list(combo) for combo in itertools.product(*per_gene_values)]
+
+
+def _apply_generic_genome(source_type: str, base: Any, genes: list, genome: list[float]) -> Any:
+    """Returns a new Manual config dict (manual) or patched source text
+    (python/pinescript/mql5) with `genome` written into `base` at the
+    positions `genes` describes."""
+    if source_type == "manual":
+        return apply_genome(base, genes, genome)
+    return apply_code_genome(base, genes, genome)
+
+
+def _grid_space_around_strategy(
+    strategy: Strategy, grid_points_per_gene: int, max_candidates: int, seed: int,
+) -> SearchSpace:
+    genes = _genes_for_strategy(strategy)
+    if not genes:
+        raise StrategySpaceError(
+            f"No tunable numeric parameters were found on this {strategy.source_type} strategy to "
+            "grid-search. Manual needs at least one indicator period or a Fixed/ATR stop-loss/"
+            "take-profit value; Python needs a top-level SCREAMING_SNAKE_CASE numeric constant; "
+            "PineScript needs an input.int()/input.float() value; MQL5 needs an iMA()/iRSI() period "
+            "or a T58_SL_PIPS/T58_TP_PIPS directive."
+        )
+
+    base = strategy.config if strategy.source_type == "manual" else _source_text_for_strategy(strategy)
+    combos = _grid_combinations(genes, grid_points_per_gene)
+
+    total_generated = len(combos)
+    sampled = False
+    if total_generated > max_candidates:
+        rng = random.Random(seed)
+        combos = rng.sample(combos, max_candidates)
+        sampled = True
+
+    family_label = f"{strategy.source_type}_grid"
+    candidates: dict[str, dict] = {}
+    meta: dict[str, dict] = {}
+    for genome in combos:
+        applied = _apply_generic_genome(strategy.source_type, base, genes, genome)
+        if strategy.source_type == "manual":
+            spec = {"source_type": "manual", "config": applied}
+            digest_source = json.dumps(applied, sort_keys=True, default=str)
+        else:
+            spec = {
+                "source_type": strategy.source_type, "code_text": applied,
+                "code_extension": _CODE_EXTENSIONS[strategy.source_type],
+            }
+            digest_source = applied
+        digest = hashlib.sha1(digest_source.encode()).hexdigest()[:10]
+        cid = f"{family_label}-{digest}"
+        candidates[cid] = spec
+        meta[cid] = {"family": family_label, "params": {g.label: v for g, v in zip(genes, genome)}}
+
+    return SearchSpace(
+        mode="family", family=family_label,
+        candidates=candidates, meta=meta,
+        total_generated=total_generated, sampled=sampled,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -319,35 +514,64 @@ def generate_search_space(
     mode: str,
     family: str | None = None,
     single_config: dict | None = None,
+    strategy: Strategy | None = None,
     max_candidates: int = 2000,
     seed: int = 42,
+    grid_points_per_gene: int = 3,
 ) -> SearchSpace:
     """
-    mode="single": wraps `single_config` (a Manual Strategy config dict,
-    e.g. whatever the Strategy tab / CLI already built) as a size-1 space.
+    mode="single":
+        strategy=<a built Strategy instance> -- wraps it (Manual, Python,
+            PineScript, or MQL5 alike) as a size-1 space. Preferred over
+            single_config for anything that isn't Manual.
+        single_config=<dict> -- legacy path: wraps a Manual Strategy
+            config dict directly, without needing a live Strategy
+            instance. Kept for backward compatibility (e.g. --cli's
+            DEFAULT_MANUAL_STRATEGY). Ignored if `strategy` is given.
 
-    mode="family": expands one named family (or every family, if
-    family is None or "all") into its full parameter grid. If the full
-    grid exceeds `max_candidates`, a random (seeded, reproducible) sample
-    of exactly `max_candidates` combinations is taken instead of just the
-    first N in itertools.product order -- an arbitrary "first N" slice
-    systematically favors whatever the first grid dimension happens to be,
-    which biases the search before it even starts.
+    mode="family":
+        strategy=<a built Strategy instance> -- grid-searches THAT
+            strategy's own tunable numeric parameters (any source type).
+            `family` is ignored when `strategy` is given.
+        family=<name> or "all" or None -- (Manual only) expands one named
+            hypothesis family, or every family, into its full parameter
+            grid. Used only when `strategy` is not given.
+
+    In both family paths, if the full grid exceeds `max_candidates`, a
+    random (seeded, reproducible) sample of exactly `max_candidates`
+    combinations is taken instead of just the first N in itertools.product
+    order -- an arbitrary "first N" slice systematically favors whatever
+    the first grid dimension happens to be, which biases the search before
+    it even starts.
     """
     if mode == "single":
-        if not single_config or not isinstance(single_config, dict):
-            raise StrategySpaceError("mode='single' requires single_config (a Manual Strategy config dict).")
+        if strategy is not None:
+            spec = spec_from_strategy(strategy)
+        elif single_config is not None:
+            if not isinstance(single_config, dict):
+                raise StrategySpaceError(
+                    "single_config must be a Manual Strategy config dict (or pass `strategy` instead "
+                    "for a non-Manual strategy)."
+                )
+            spec = {"source_type": "manual", "config": copy.deepcopy(single_config)}
+        else:
+            raise StrategySpaceError(
+                "mode='single' requires either `strategy` (a built Strategy instance of any "
+                "supported source type) or single_config (a Manual Strategy config dict)."
+            )
         cid = "single-00000"
-        cfg = copy.deepcopy(single_config)
         return SearchSpace(
             mode="single", family=None,
-            candidates={cid: cfg},
+            candidates={cid: spec},
             meta={cid: {"family": "single", "params": {}}},
             total_generated=1, sampled=False,
         )
 
     if mode != "family":
         raise StrategySpaceError(f"Unknown search mode '{mode}' (expected 'single' or 'family').")
+
+    if strategy is not None:
+        return _grid_space_around_strategy(strategy, grid_points_per_gene, max_candidates, seed)
 
     families_to_run = list(FAMILIES.keys()) if family in (None, "all") else [family]
     for fam in families_to_run:
@@ -383,7 +607,7 @@ def generate_search_space(
         # (see app/search/results_db.py's module docstring).
         digest = hashlib.sha1(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:10]
         cid = f"{fam}-{digest}"
-        candidates[cid] = FAMILIES[fam].build(params)
+        candidates[cid] = {"source_type": "manual", "config": FAMILIES[fam].build(params)}
         meta[cid] = {"family": fam, "params": params}
 
     return SearchSpace(

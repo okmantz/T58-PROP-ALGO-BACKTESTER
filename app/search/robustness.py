@@ -307,7 +307,7 @@ class RobustnessResult:
 
 
 def parameter_neighborhood_robustness(
-    base_config: dict,
+    candidate_spec: dict,
     df: pd.DataFrame,
     risk,
     prop_rules,
@@ -317,41 +317,55 @@ def parameter_neighborhood_robustness(
     n_neighbors: int = 6,
     seed: int = 42,
     stability_threshold: float = 0.4,
+    tmp_dir=None,
 ):
     """
-    Perturbs every tunable numeric parameter in `base_config` by up to
-    +/- perturbation_frac of that parameter's normal search range (the same
-    ranges app.optimize.parameter_space already derives for the GA) and
+    Perturbs every tunable numeric parameter in `candidate_spec` by up to
+    +/- perturbation_frac of that parameter's normal search range and
     re-evaluates `n_neighbors` such perturbed neighbors. A real edge lives
     in a plateau -- nearby parameter values should perform similarly. A
     candidate whose score collapses a few percent off its exact winning
     parameters is very likely fit to noise in this specific historical
     window, not to a real, tradeable effect.
 
-    Works uniformly whether `base_config` came out of Stage 2's GA or is a
-    hand-written config that skipped it entirely, because
-    app.optimize.parameter_space.extract_genome() walks ANY Manual Strategy
-    config dict, not just GA-produced ones.
+    `candidate_spec` is the same uniform candidate-spec dict used
+    throughout the Search Lab (see app.search.strategy_space):
+        {"source_type": "manual", "config": {...}}
+        {"source_type": "python"/"pinescript"/"mql5", "code_text": "...", "code_extension": "..."}
+    Manual parameters are discovered/applied via app.optimize.parameter_space
+    (extract_genome/apply_genome); Python/PineScript/MQL5 parameters via
+    app.optimize.code_parameter_space (discover_code_genes/
+    materialize_code_strategy) -- the exact same machinery Step 6's
+    Iterative Refinement GA already uses for each source type. `tmp_dir` is
+    required when `candidate_spec` is a Python candidate (PythonStrategy
+    only accepts a file path).
 
-    Returns None (not a failure) if the config has no tunable numeric
+    Returns None (not a failure) if the strategy has no tunable numeric
     parameters to perturb -- callers should treat that as "unknown", not
     "unstable".
     """
     from app.backtest.engine import run_backtest
     from app.monte_carlo.engine import run_monte_carlo
+    from app.optimize.code_parameter_space import discover_code_genes, materialize_code_strategy
     from app.optimize.parameter_space import apply_genome, extract_genome
     from app.optimize.refinement import compute_fitness
     from app.prop.simulator import simulate_account, summarize_single_run
+    from app.search.strategy_space import build_strategy_from_spec
     from app.strategy.manual import ManualStrategy
 
-    genes = extract_genome(base_config)
+    source_type = candidate_spec.get("source_type", "manual")
+    base_strategy = build_strategy_from_spec(candidate_spec, tmp_dir)
+
+    if source_type == "manual":
+        genes = extract_genome(candidate_spec["config"])
+    else:
+        genes = discover_code_genes(base_strategy)
     if not genes:
         return None
 
     rng = _random.Random(seed)
 
-    def _fitness_for(config: dict) -> float:
-        strategy = ManualStrategy(config)
+    def _fitness_for(strategy) -> float:
         bt = run_backtest(df, strategy, risk)
         if not bt.trades:
             return float("-inf")
@@ -363,7 +377,7 @@ def parameter_neighborhood_robustness(
         fitness = compute_fitness(bt.statistics.to_dict(), prop_summary, mc, fitness_metric)
         return fitness if math.isfinite(fitness) else float("-inf")
 
-    baseline_fitness = _fitness_for(base_config)
+    baseline_fitness = _fitness_for(build_strategy_from_spec(candidate_spec, tmp_dir))
 
     neighbor_fitnesses: list[float] = []
     for _ in range(n_neighbors):
@@ -373,8 +387,12 @@ def parameter_neighborhood_robustness(
             delta = rng.uniform(-perturbation_frac, perturbation_frac) * span
             v = min(max(g.base_value + delta, g.lo), g.hi)
             perturbed_genome.append(float(round(v)) if g.is_int else float(v))
-        neighbor_cfg = apply_genome(base_config, genes, perturbed_genome)
-        neighbor_fitnesses.append(_fitness_for(neighbor_cfg))
+
+        if source_type == "manual":
+            neighbor_strategy = ManualStrategy(apply_genome(candidate_spec["config"], genes, perturbed_genome))
+        else:
+            neighbor_strategy = materialize_code_strategy(base_strategy, genes, perturbed_genome, tmp_dir)
+        neighbor_fitnesses.append(_fitness_for(neighbor_strategy))
 
     finite_neighbors = [f for f in neighbor_fitnesses if math.isfinite(f)]
     if not finite_neighbors or not math.isfinite(baseline_fitness) or baseline_fitness <= 0:

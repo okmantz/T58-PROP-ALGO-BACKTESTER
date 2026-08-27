@@ -72,11 +72,34 @@ from app.search.results_db import ResultsDB
 from app.search.robustness import (
     deflated_sharpe_ratio, parameter_neighborhood_robustness, run_walk_forward,
 )
-from app.search.strategy_space import SearchSpace
+from app.search.strategy_space import SearchSpace, build_strategy_from_spec
 from app.strategy.lookahead_check import check_for_lookahead
-from app.strategy.manual import ManualStrategy
 
 ProgressCallback = Callable[[str], None]
+
+
+def _record_fields_from_spec(spec: dict) -> dict:
+    """The subset of a candidate spec that gets persisted to / propagated
+    through the results DB record for a given stage's output -- separated
+    out so every stage task builds this the same way regardless of source
+    type, rather than each one hand-rolling which of config/code_text/
+    code_extension applies."""
+    source_type = spec.get("source_type", "manual")
+    if source_type == "manual":
+        return {"source_type": "manual", "config": spec.get("config")}
+    return {
+        "source_type": source_type,
+        "code_text": spec.get("code_text"),
+        "code_extension": spec.get("code_extension"),
+    }
+
+
+def _spec_from_record(record: dict) -> dict:
+    """Reconstructs a candidate spec dict from a stage's output record (or
+    a row read back from ResultsDB) -- the inverse of
+    _record_fields_from_spec, used to feed one stage's survivors into the
+    next stage's task, and to rebuild a strategy for champion promotion."""
+    return _record_fields_from_spec(record)
 
 
 # ---------------------------------------------------------------------------
@@ -145,27 +168,31 @@ class SearchSummary:
 _WORKER: dict = {}
 
 
-def _init_worker(df_pickle_path: str, risk_kwargs: dict, prop_kwargs: dict) -> None:
+def _init_worker(df_pickle_path: str, risk_kwargs: dict, prop_kwargs: dict, tmp_dir_path: str) -> None:
     global _WORKER
     _WORKER["df"] = pd.read_pickle(df_pickle_path)
     _WORKER["risk"] = RiskConfig(**risk_kwargs)
     _WORKER["prop_rules"] = PropRules(**prop_kwargs)
+    # Shared scratch directory for materializing Python-strategy candidates
+    # to disk (PythonStrategy only accepts a file path). Every write uses a
+    # uuid4 filename, so concurrent workers sharing this directory is safe.
+    _WORKER["tmp_dir"] = Path(tmp_dir_path)
 
 
-def _stage1_task(candidate_id: str, config: dict, filters: dict) -> dict:
+def _stage1_task(candidate_id: str, spec: dict, filters: dict) -> dict:
     """Stage 1: one fast backtest, no Monte Carlo. Runs in a worker process."""
     df, risk, prop_rules = _WORKER["df"], _WORKER["risk"], _WORKER["prop_rules"]
+    tmp_dir = _WORKER.get("tmp_dir")
+    base = {"candidate_id": candidate_id, **_record_fields_from_spec(spec)}
     try:
-        bt = run_backtest(df, ManualStrategy(config), risk)
+        strategy = build_strategy_from_spec(spec, tmp_dir)
+        bt = run_backtest(df, strategy, risk)
     except Exception as exc:  # noqa: BLE001 -- a bad generated config must not kill the whole search
-        return {"candidate_id": candidate_id, "config": config, "error": str(exc), "passed_stage1": False}
+        return {**base, "error": str(exc), "passed_stage1": False}
 
     stats = bt.statistics.to_dict()
     if not bt.trades:
-        return {
-            "candidate_id": candidate_id, "config": config, "statistics": stats,
-            "error": "no trades generated on this data", "passed_stage1": False,
-        }
+        return {**base, "statistics": stats, "error": "no trades generated on this data", "passed_stage1": False}
 
     pf = stats.get("profit_factor", 0.0)
     pf_val = 10.0 if pf == float("inf") else float(pf or 0.0)
@@ -185,18 +212,19 @@ def _stage1_task(candidate_id: str, config: dict, filters: dict) -> dict:
     quick_score = pf_val * math.log(n_trades + 1)
 
     return {
-        "candidate_id": candidate_id, "config": config, "statistics": stats,
+        **base, "statistics": stats,
         "quick_score": quick_score, "sharpe": sharpe, "passed_stage1": bool(passed),
     }
 
 
 def _stage2_task(
-    candidate_id: str, config: dict, refine_kwargs: dict, mc_search_sims: int,
+    candidate_id: str, spec: dict, refine_kwargs: dict, mc_search_sims: int,
     fitness_metric: str, seed: int,
 ) -> dict:
     """Stage 2: the app's existing GA refinement, run on one Stage 1 survivor."""
     df, risk, prop_rules = _WORKER["df"], _WORKER["risk"], _WORKER["prop_rules"]
-    strategy = ManualStrategy(config)
+    tmp_dir = _WORKER.get("tmp_dir")
+    strategy = build_strategy_from_spec(spec, tmp_dir)
     mc_cfg = MonteCarloConfig(n_simulations=mc_search_sims, random_seed=seed)
     refine_cfg = RefinementConfig(
         fitness_metric=fitness_metric,
@@ -209,13 +237,14 @@ def _stage2_task(
         result = run_iterative_refinement(df, strategy, risk, prop_rules, mc_cfg, refine_cfg, progress_cb=None)
     except RefinementError as exc:
         # No tunable numeric parameters (rare for a generated skeleton;
-        # possible for a hand-written single_config in "single" mode) --
-        # fall through with a plain backtest so it can still reach Stage 3
-        # rather than being silently dropped.
+        # possible for a hand-written single_config/strategy in "single"
+        # mode) -- fall through with a plain backtest so it can still reach
+        # Stage 3 rather than being silently dropped.
+        base = {"candidate_id": candidate_id, **_record_fields_from_spec(spec)}
         bt = run_backtest(df, strategy, risk)
         stats = bt.statistics.to_dict()
         if not bt.trades:
-            return {"candidate_id": candidate_id, "config": config, "error": str(exc), "passed_stage2": False}
+            return {**base, "error": str(exc), "passed_stage2": False}
         pnls = [t.pnl for t in bt.trades]
         dates = [t.entry_time for t in bt.trades]
         single_run = simulate_account(pnls, dates, prop_rules)
@@ -223,15 +252,20 @@ def _stage2_task(
         prop_summary = summarize_single_run(single_run)
         fitness = compute_fitness(stats, prop_summary, mc, fitness_metric)
         return {
-            "candidate_id": candidate_id, "config": config, "statistics": stats,
+            **base, "statistics": stats,
             "prop_summary": prop_summary, "fitness": fitness,
             "passed_stage2": math.isfinite(fitness), "ga_skipped_reason": str(exc),
         }
 
     best = result.best
+    out_spec_fields = {"source_type": best.source_type}
+    if best.source_type == "manual":
+        out_spec_fields["config"] = best.config if best.config is not None else spec.get("config")
+    else:
+        out_spec_fields["code_text"] = best.code_text
+        out_spec_fields["code_extension"] = best.code_extension
     return {
-        "candidate_id": candidate_id,
-        "config": best.config if best.config is not None else config,
+        "candidate_id": candidate_id, **out_spec_fields,
         "statistics": best.statistics,
         "prop_summary": best.prop_summary,
         "mc_summary": best.mc_summary,
@@ -242,20 +276,23 @@ def _stage2_task(
     }
 
 
-def _stage3_task(candidate_id: str, config: dict, cfg: dict) -> dict:
+def _stage3_task(candidate_id: str, spec: dict, cfg: dict) -> dict:
     """Stage 3: the strict validation gate. Runs in a worker process."""
     df, risk, prop_rules = _WORKER["df"], _WORKER["risk"], _WORKER["prop_rules"]
+    tmp_dir = _WORKER.get("tmp_dir")
+    base = {"candidate_id": candidate_id, **_record_fields_from_spec(spec)}
     notes: list[str] = []
 
     try:
-        bt = run_backtest(df, ManualStrategy(config), risk)
+        strategy = build_strategy_from_spec(spec, tmp_dir)
+        bt = run_backtest(df, strategy, risk)
     except Exception as exc:  # noqa: BLE001
-        return {"candidate_id": candidate_id, "config": config, "error": str(exc), "passed_stage3_gate": False}
+        return {**base, "error": str(exc), "passed_stage3_gate": False}
 
     stats = bt.statistics.to_dict()
     if not bt.trades:
         return {
-            "candidate_id": candidate_id, "config": config, "statistics": stats,
+            **base, "statistics": stats,
             "error": "no trades on full dataset", "passed_stage3_gate": False,
         }
 
@@ -278,7 +315,12 @@ def _stage3_task(candidate_id: str, config: dict, cfg: dict) -> dict:
 
     cost_ladder = compute_cost_ladder(bt.trades)
 
-    lookahead = check_for_lookahead(ManualStrategy(config), df)
+    # A fresh strategy instance for the lookahead check, walk-forward, and
+    # robustness passes below -- consistent with this app's existing
+    # "always build fresh per use" convention for strategy instances (see
+    # app.search.robustness.run_walk_forward's own docstring) rather than
+    # reusing the one already run above.
+    lookahead = check_for_lookahead(build_strategy_from_spec(spec, tmp_dir), df)
     lookahead_dict = {
         "checked": lookahead.checked, "bug_detected": lookahead.bug_detected,
         "skip_reason": lookahead.skip_reason,
@@ -290,7 +332,7 @@ def _stage3_task(candidate_id: str, config: dict, cfg: dict) -> dict:
     wf_dict = None
     if cfg["walk_forward_folds"] >= 2:
         wf_result = run_walk_forward(
-            df, lambda: ManualStrategy(config), risk,
+            df, lambda: build_strategy_from_spec(spec, tmp_dir), risk,
             n_folds=cfg["walk_forward_folds"], metric=cfg["walk_forward_metric"],
             stability_threshold=cfg["walk_forward_min_efficiency"],
         )
@@ -314,12 +356,13 @@ def _stage3_task(candidate_id: str, config: dict, cfg: dict) -> dict:
     robustness_dict = None
     if cfg["robustness_neighbors"] > 0:
         robustness = parameter_neighborhood_robustness(
-            config, df, risk, prop_rules, mc_cfg,
+            spec, df, risk, prop_rules, mc_cfg,
             fitness_metric=cfg["fitness_metric"],
             perturbation_frac=cfg["robustness_perturbation_frac"],
             n_neighbors=cfg["robustness_neighbors"],
             seed=cfg["random_seed"],
             stability_threshold=cfg["robustness_min_stability"],
+            tmp_dir=tmp_dir,
         )
         if robustness is not None:
             robustness_dict = {
@@ -343,7 +386,7 @@ def _stage3_task(candidate_id: str, config: dict, cfg: dict) -> dict:
     )
 
     return {
-        "candidate_id": candidate_id, "config": config, "statistics": stats,
+        **base, "statistics": stats,
         "prop_summary": prop_summary, "mc_summary": mc_summary, "fitness": fitness,
         "sharpe": stats.get("sharpe_ratio", 0.0), "cost_ladder": cost_ladder,
         "lookahead": lookahead_dict, "walk_forward": wf_dict, "robustness": robustness_dict,
@@ -404,13 +447,14 @@ def run_search(
 
     try:
         with ProcessPoolExecutor(
-            max_workers=workers, initializer=_init_worker, initargs=(str(df_path), risk_kwargs, prop_kwargs),
+            max_workers=workers, initializer=_init_worker,
+            initargs=(str(df_path), risk_kwargs, prop_kwargs, str(tmp_dir)),
         ) as pool:
             # ---------------- Stage 1: cheap filter ----------------
             log(f"Stage 1/5: cheap filter across {len(space.candidates)} candidate(s) on {workers} worker(s)...")
             futures = {
-                pool.submit(_stage1_task, cid, cfg, filters): cid
-                for cid, cfg in space.candidates.items()
+                pool.submit(_stage1_task, cid, spec, filters): cid
+                for cid, spec in space.candidates.items()
             }
             done = 0
             log_every = max(1, len(futures) // 10)
@@ -448,7 +492,7 @@ def run_search(
             refine_kwargs = {"population": stage_cfg.ga_population, "generations": stage_cfg.ga_generations}
             futures = {
                 pool.submit(
-                    _stage2_task, r["candidate_id"], r["config"], refine_kwargs,
+                    _stage2_task, r["candidate_id"], _spec_from_record(r), refine_kwargs,
                     stage_cfg.ga_search_sims, stage_cfg.fitness_metric, stage_cfg.random_seed,
                 ): r["candidate_id"]
                 for r in survivors1
@@ -491,7 +535,7 @@ def run_search(
                 "robustness_min_stability": stage_cfg.robustness_min_stability,
             }
             futures = {
-                pool.submit(_stage3_task, r["candidate_id"], r["config"], stage3_cfg): r["candidate_id"]
+                pool.submit(_stage3_task, r["candidate_id"], _spec_from_record(r), stage3_cfg): r["candidate_id"]
                 for r in survivors2
             }
             done = 0
@@ -583,36 +627,54 @@ def promote_champion(
         record = db.get_candidate(candidate_id, run_id=run_id, stage="stage3")
     if record is None:
         raise ValueError(f"Candidate '{candidate_id}' not found in run '{run_id}' at stage3.")
-    config = record.get("config")
-    if not config:
+
+    spec = _spec_from_record(record)
+    source_type = spec.get("source_type", "manual")
+    if source_type == "manual" and not spec.get("config"):
         raise ValueError(f"Candidate '{candidate_id}' has no stored configuration to promote.")
+    if source_type != "manual" and not spec.get("code_text"):
+        raise ValueError(f"Candidate '{candidate_id}' has no stored source code to promote.")
 
-    strategy = ManualStrategy(config)
-    bt_result = run_backtest(df, strategy, risk)
-    trade_pnls = [t.pnl for t in bt_result.trades]
-    trade_dates = [t.entry_time for t in bt_result.trades]
-    single_run = simulate_account(trade_pnls, trade_dates, prop_rules)
-    mc_cfg = MonteCarloConfig(n_simulations=mc_sims)
-    mc_result = run_monte_carlo(bt_result.trades, prop_rules, mc_cfg)
+    promote_tmp_dir = Path(tempfile.mkdtemp(prefix="t58_promote_"))
     try:
-        holdout = run_holdout_comparison(df, strategy, risk, holdout_frac=0.2)
-    except Exception:  # noqa: BLE001 -- a holdout that can't run isn't a reason to block promotion
-        holdout = None
+        strategy = build_strategy_from_spec(spec, promote_tmp_dir)
+        bt_result = run_backtest(df, strategy, risk)
+        trade_pnls = [t.pnl for t in bt_result.trades]
+        trade_dates = [t.entry_time for t in bt_result.trades]
+        single_run = simulate_account(trade_pnls, trade_dates, prop_rules)
+        mc_cfg = MonteCarloConfig(n_simulations=mc_sims)
+        mc_result = run_monte_carlo(bt_result.trades, prop_rules, mc_cfg)
+        try:
+            holdout = run_holdout_comparison(
+                df, build_strategy_from_spec(spec, promote_tmp_dir), risk, holdout_frac=0.2,
+            )
+        except Exception:  # noqa: BLE001 -- a holdout that can't run isn't a reason to block promotion
+            holdout = None
 
-    period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
-    paths = generate_full_report(
-        output_dir=output_dir,
-        strategy_name=config.get("name", f"Search Champion {candidate_id}"),
-        strategy_source_type="manual",
-        instrument="search-lab",
-        timeframe="unknown",
-        backtest_period=period,
-        backtest_result=bt_result,
-        prop_rules=prop_rules,
-        prop_single_run=single_run,
-        monte_carlo_result=mc_result,
-        holdout_comparison=holdout,
-        risk_config=risk,
-        price_df=df,
-    )
-    return {"candidate_id": candidate_id, "config": config, "report_paths": paths}
+        if source_type == "manual":
+            strategy_name = spec["config"].get("name", f"Search Champion {candidate_id}")
+        else:
+            strategy_name = f"Search Champion {candidate_id} ({source_type})"
+
+        period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
+        paths = generate_full_report(
+            output_dir=output_dir,
+            strategy_name=strategy_name,
+            strategy_source_type=source_type,
+            instrument="search-lab",
+            timeframe="unknown",
+            backtest_period=period,
+            backtest_result=bt_result,
+            prop_rules=prop_rules,
+            prop_single_run=single_run,
+            monte_carlo_result=mc_result,
+            holdout_comparison=holdout,
+            risk_config=risk,
+            price_df=df,
+        )
+        return {
+            "candidate_id": candidate_id, "spec": spec, "config": spec.get("config"),
+            "report_paths": paths,
+        }
+    finally:
+        shutil.rmtree(promote_tmp_dir, ignore_errors=True)

@@ -41,6 +41,7 @@ def _row_html(row: dict, rank: int) -> str:
     <tr class="{status_class}">
       <td>{rank}</td>
       <td>{row.get('candidate_id', '')}</td>
+      <td>{row.get('source_type', 'manual')}</td>
       <td>{row.get('family', '')}</td>
       <td>{_fmt(row.get('composite_score'))}</td>
       <td>{_fmt(dsr.get('probabilistic_sharpe'))}</td>
@@ -98,7 +99,7 @@ _TEMPLATE = """<!DOCTYPE html>
   <table>
     <thead>
       <tr>
-        <th>#</th><th>Candidate</th><th>Family</th><th>Composite</th><th>PSR</th>
+        <th>#</th><th>Candidate</th><th>Type</th><th>Family</th><th>Composite</th><th>PSR</th>
         <th>Net Profit</th><th>PF</th><th>Win %</th><th>Trades</th>
         <th>Eval Pass %</th><th>1st Payout %</th><th>Risk of Ruin %</th><th>Gate</th><th>Notes</th>
       </tr>
@@ -151,7 +152,7 @@ def generate_search_report(
 
     rows_html = "\n".join(
         _row_html(row, i + 1) for i, row in enumerate(summary.leaderboard)
-    ) or '<tr><td colspan="14" style="text-align:center; color:#5A5F66;">No candidates reached Stage 3.</td></tr>'
+    ) or '<tr><td colspan="15" style="text-align:center; color:#5A5F66;">No candidates reached Stage 3.</td></tr>'
 
     html = _TEMPLATE.format(
         run_id=summary.run_id, mode=summary.mode, family=summary.family or "single",

@@ -137,7 +137,31 @@
 
       <div id="code-fields" style="display:none;">
         <label>Search the library (name / description / market)</label>
-        <input type="text" id="strategy_search_input" placeholder="e.g. fvg, XAUUSD..." oninput="populateLibrarySelect(modeInput.value)">
+        <input type="text" id="strategy_search_input" placeholder="e.g. fvg, XAUUSD..." oninput="onLibraryFiltersChanged()">
+
+        <div class="row">
+          <div>
+            <label>Browse market</label>
+            <select id="strategy_filter_market" onchange="onLibraryFiltersChanged()">
+              <option value="">All markets</option>
+            </select>
+          </div>
+          <div>
+            <label>Browse tag</label>
+            <select id="strategy_filter_tag" onchange="onLibraryFiltersChanged()">
+              <option value="">All tags</option>
+            </select>
+          </div>
+          <div>
+            <label>Browse status</label>
+            <select id="strategy_filter_status" onchange="onLibraryFiltersChanged()">
+              <option value="">All statuses</option>
+              {% for s in strategy_statuses|default([]) %}
+              <option value="{{ s }}">{{ s }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
 
         <label>Load a saved strategy from the library</label>
         <select id="existing_strategy_select" onchange="loadFromLibrary()">
@@ -147,7 +171,20 @@
 
         <div id="library-manage-panel" style="display:none;border:1px solid #262626;border-radius:8px;padding:10px;margin-top:8px;">
           <p style="font-size:12px;color:#999;margin:0 0 8px;">Managing: <b id="library-manage-name"></b></p>
-          <p style="font-size:12px;color:#9ecbff;margin:0 0 8px;" id="library-manage-last-run"></p>
+          <p style="font-size:12px;color:#9ecbff;margin:0 0 8px;white-space:pre-line;" id="library-manage-last-run"></p>
+
+          <form method="post" action="/strategies/status" style="margin-bottom:8px;">
+            <input type="hidden" name="strategy_type" id="status_strategy_type">
+            <input type="hidden" name="filename" id="status_filename">
+            <input type="hidden" name="return_to" value="search">
+            <label>Status</label>
+            <select name="status" id="status_select">
+              {% for s in strategy_statuses|default(['draft', 'validated', 'live']) %}
+              <option value="{{ s }}">{{ s }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit" class="submit-btn" style="margin-top:8px;padding:10px;font-size:13px;">Set Status</button>
+          </form>
 
           <form method="post" action="/strategies/metadata" style="margin-bottom:8px;">
             <input type="hidden" name="strategy_type" id="meta_strategy_type">
@@ -157,6 +194,8 @@
             <input type="text" name="description" id="meta_description" placeholder="What this strategy does">
             <label>Market / timeframe</label>
             <input type="text" name="market" id="meta_market" placeholder="e.g. XAUUSD 15m">
+            <label>Tags (comma-separated)</label>
+            <input type="text" name="tags" id="meta_tags" placeholder="e.g. fvg, mean-reversion">
             <button type="submit" class="submit-btn" style="margin-top:8px;padding:10px;font-size:13px;">Save Info</button>
           </form>
 
@@ -177,6 +216,18 @@
             <button type="submit" class="submit-btn" style="padding:10px;font-size:13px;background:#3a1616;color:#ffb4b4;">Delete From Library</button>
           </form>
         </div>
+
+        <details style="margin-top:10px;">
+          <summary>Bulk manage saved strategies</summary>
+          <form method="post" action="/strategies/bulk-delete" onsubmit="return confirm('Permanently delete every checked strategy?');">
+            <input type="hidden" name="return_to" value="search">
+            <div id="bulk-checklist" style="margin:8px 0;font-size:13px;"></div>
+            <div class="row">
+              <button type="submit" class="submit-btn" style="padding:10px;font-size:13px;background:#3a1616;color:#ffb4b4;">Delete Checked</button>
+              <button type="button" class="submit-btn" style="padding:10px;font-size:13px;" onclick="exportChecked()">Export Checked</button>
+            </div>
+          </form>
+        </details>
 
         <label style="margin-top:14px;">Or upload a strategy file (from this computer or your phone)</label>
         <input type="file" id="strategy_file_input" name="strategy_file" accept=".py,.pine,.mq5">
@@ -206,6 +257,12 @@
           <div>
             <label>Market / timeframe (optional)</label>
             <input type="text" name="strategy_save_market" placeholder="e.g. XAUUSD 15m">
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Tags (optional, comma-separated)</label>
+            <input type="text" name="strategy_save_tags" placeholder="e.g. fvg, mean-reversion">
           </div>
         </div>
         <p style="font-size:12px;margin-top:10px;"><a href="/strategies/export">&darr; Download entire strategy library as a zip (backup)</a></p>
@@ -298,34 +355,92 @@
   const manualFields = document.getElementById('manual-fields');
   const codeFields = document.getElementById('code-fields');
 
-  // {"python": [{"name","description","market","last_run"}, ...], "pinescript": [...], "mql5": [...]}
+  // {"python": [{"name","description","market","tags","status","last_run","lookahead","last_search"}, ...], "pinescript": [...], "mql5": [...]}
   const SAVED_STRATEGIES = {{ saved_strategies_json | safe }};
 
+  function filteredLibraryItems(mode) {
+    const query = (document.getElementById('strategy_search_input').value || '').toLowerCase().trim();
+    const market = document.getElementById('strategy_filter_market').value;
+    const tag = document.getElementById('strategy_filter_tag').value;
+    const status = document.getElementById('strategy_filter_status').value;
+    const all = SAVED_STRATEGIES[mode] || [];
+    return all.filter(s => {
+      if (query && !(s.name + ' ' + s.description + ' ' + s.market + ' ' + (s.tags || []).join(' ')).toLowerCase().includes(query)) return false;
+      if (market && s.market !== market) return false;
+      if (tag && !(s.tags || []).map(t => t.toLowerCase()).includes(tag.toLowerCase())) return false;
+      if (status && s.status !== status) return false;
+      return true;
+    });
+  }
+
+  function populateFilterOptions(mode) {
+    const all = SAVED_STRATEGIES[mode] || [];
+    const markets = [...new Set(all.map(s => s.market).filter(Boolean))].sort();
+    const tags = [...new Set(all.flatMap(s => s.tags || []))].sort((a, b) => a.localeCompare(b));
+
+    const marketSelect = document.getElementById('strategy_filter_market');
+    const keepMarket = marketSelect.value;
+    marketSelect.innerHTML = '<option value="">All markets</option>' +
+      markets.map(m => `<option value="${m}">${m}</option>`).join('');
+    if (markets.includes(keepMarket)) marketSelect.value = keepMarket;
+
+    const tagSelect = document.getElementById('strategy_filter_tag');
+    const keepTag = tagSelect.value;
+    tagSelect.innerHTML = '<option value="">All tags</option>' +
+      tags.map(t => `<option value="${t}">${t}</option>`).join('');
+    if (tags.includes(keepTag)) tagSelect.value = keepTag;
+  }
+
   function populateLibrarySelect(mode) {
+    populateFilterOptions(mode);
     const select = document.getElementById('existing_strategy_select');
     const note = document.getElementById('library-count-note');
-    const query = (document.getElementById('strategy_search_input').value || '').toLowerCase().trim();
-    select.innerHTML = '<option value="">— none, paste or upload below —</option>';
     const all = SAVED_STRATEGIES[mode] || [];
-    const items = query
-      ? all.filter(s => (s.name + ' ' + s.description + ' ' + s.market).toLowerCase().includes(query))
-      : all;
+    const items = filteredLibraryItems(mode);
+    select.innerHTML = '<option value="">— none, paste or upload below —</option>';
     items.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.name;
-      opt.textContent = s.description ? `${s.name} — ${s.description}` : s.name;
+      const label = s.description ? `${s.name} — ${s.description}` : s.name;
+      opt.textContent = `[${s.status}] ${label}`;
       select.appendChild(opt);
     });
     document.getElementById('library-manage-panel').style.display = 'none';
     if (!all.length) {
       note.textContent = `No saved ${mode} strategies yet — upload or paste one, then check "Save to strategy library".`;
-    } else if (query && !items.length) {
-      note.textContent = `No saved ${mode} strategies match "${query}".`;
+    } else if (!items.length) {
+      note.textContent = `No saved ${mode} strategies match the current search/filters.`;
     } else {
-      note.textContent = query
-        ? `${items.length} of ${all.length} saved ${mode} strategy(ies) shown.`
-        : `${all.length} saved ${mode} strategy(ies) in the library.`;
+      note.textContent = items.length === all.length
+        ? `${all.length} saved ${mode} strategy(ies) in the library.`
+        : `${items.length} of ${all.length} saved ${mode} strategy(ies) shown.`;
     }
+    populateBulkChecklist(mode, items);
+  }
+
+  function onLibraryFiltersChanged() {
+    populateLibrarySelect(modeInput.value);
+  }
+
+  function populateBulkChecklist(mode, items) {
+    const container = document.getElementById('bulk-checklist');
+    if (!items.length) {
+      container.innerHTML = '<p style="color:#888;font-size:12px;">No strategies to show for the current filters.</p>';
+      return;
+    }
+    container.innerHTML = items.map(s => `
+      <label style="display:flex;align-items:center;gap:8px;margin:4px 0;">
+        <input type="checkbox" name="items" value="${mode}::${s.name}" style="width:auto;">
+        <span>[${s.status}] ${s.name}${s.description ? ' — ' + s.description : ''}</span>
+      </label>
+    `).join('');
+  }
+
+  function exportChecked() {
+    const checked = Array.from(document.querySelectorAll('#bulk-checklist input[type=checkbox]:checked')).map(c => c.value);
+    if (!checked.length) { alert('Check at least one strategy first.'); return; }
+    const params = checked.map(v => `items=${encodeURIComponent(v)}`).join('&');
+    window.location = `/strategies/bulk-export?${params}`;
   }
 
   function loadFromLibrary() {
@@ -345,6 +460,10 @@
     document.getElementById('meta_filename').value = name;
     document.getElementById('meta_description').value = item ? item.description : '';
     document.getElementById('meta_market').value = item ? item.market : '';
+    document.getElementById('meta_tags').value = item ? (item.tags || []).join(', ') : '';
+    document.getElementById('status_strategy_type').value = mode;
+    document.getElementById('status_filename').value = name;
+    document.getElementById('status_select').value = item ? item.status : 'draft';
     document.getElementById('rename_strategy_type').value = mode;
     document.getElementById('rename_old_filename').value = name;
     document.getElementById('rename_new_filename').value = name;
@@ -352,12 +471,17 @@
     document.getElementById('delete_filename').value = name;
 
     const lastRunNote = document.getElementById('library-manage-last-run');
+    const lines = [];
     if (item && item.last_run) {
-      const parts = Object.entries(item.last_run).map(([k, v]) => `${k}: ${v}`);
-      lastRunNote.textContent = 'Last run — ' + parts.join('  •  ');
-    } else {
-      lastRunNote.textContent = 'No backtest recorded for this strategy yet.';
+      lines.push('Last run — ' + Object.entries(item.last_run).map(([k, v]) => `${k}: ${v}`).join('  •  '));
     }
+    if (item && item.lookahead) {
+      lines.push(`Lookahead — ${item.lookahead.clean ? 'clean' : 'FAILED'}: ${item.lookahead.summary || ''}`);
+    }
+    if (item && item.last_search) {
+      lines.push('Last search — ' + Object.entries(item.last_search).map(([k, v]) => `${k}: ${v}`).join('  •  '));
+    }
+    lastRunNote.textContent = lines.length ? lines.join('\n') : 'No backtest, lookahead check, or search recorded yet.';
     panel.style.display = 'block';
   }
 

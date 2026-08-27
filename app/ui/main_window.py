@@ -1927,8 +1927,9 @@ class MainWindow:
     # -----------------------------------------------------------------------
 
     _SEARCH_MODE_LABELS = {
-        "Family (search a grid of many strategy variations)": "family",
-        "Single (re-validate the current Strategy tab config through the full funnel)": "single",
+        "Family -- named hypothesis grid (Manual strategies only)": "family_named",
+        "Family -- grid around my current Strategy tab config (any strategy type)": "family_grid",
+        "Single -- re-validate my current Strategy tab config exactly as configured": "single",
     }
 
     def _build_search_tab(self):
@@ -1944,21 +1945,26 @@ class MainWindow:
             "candidate, and a strict validation gate (walk-forward, lookahead check, "
             "parameter-neighborhood robustness, a deflated Sharpe ratio that corrects "
             "for how many candidates were tried) decides what actually survives. "
+            "Works with Manual, Python, PineScript, and MQL5 strategies alike. "
             "Completely separate from the normal Run & Report pipeline and from Step 6 "
             "-- nothing here changes unless you click Run below.",
         )
 
         mode_section = self._section(
             f, "What to search",
-            "Family mode generates a combinatorial grid of a named strategy hypothesis. "
-            "Single mode instead takes whatever is currently configured on the Strategy "
-            "tab (Step 2) and puts that ONE strategy through the exact same 5-stage "
-            "funnel, as an independent stress test -- useful for re-validating a "
-            "hand-built strategy rather than searching a family.",
+            "\u2022 Named hypothesis grid expands one of this app's built-in trading hypotheses "
+            "(Manual strategies only).\n"
+            "\u2022 Grid around my current Strategy tab config discovers whatever's currently "
+            "configured on Step 2's own tunable numeric parameters (indicator periods, stop/target "
+            "values, or -- for Python/PineScript/MQL5 -- SCREAMING_SNAKE_CASE constants, "
+            "input.int()/input.float() values, or iMA()/iRSI() periods) and grid-searches around "
+            "them. Works for any of the 4 strategy types.\n"
+            "\u2022 Single re-validates that one exact strategy through the same 5-stage funnel, "
+            "with no parameter search at all -- an independent stress test.",
         )
         self.search_mode = LabeledCombo(
             mode_section, "Mode", list(self._SEARCH_MODE_LABELS.keys()),
-            "Family (search a grid of many strategy variations)",
+            "Family -- named hypothesis grid (Manual strategies only)",
         )
         self.search_mode.combo.bind("<<ComboboxSelected>>", lambda _e: self._on_search_mode_changed())
 
@@ -1969,7 +1975,10 @@ class MainWindow:
         for name, label in list_families().items():
             self._search_family_label_to_key[f"{label} [{name}]"] = name
         self.search_family = LabeledCombo(
-            mode_section, "Strategy family (Family mode only)", family_labels, family_labels[0],
+            mode_section, "Named hypothesis family (Manual-only mode above)", family_labels, family_labels[0],
+        )
+        self.search_grid_points = LabeledEntry(
+            mode_section, "Grid points per parameter (grid-around-config mode above)", 3,
         )
 
         space_section = self._section(
@@ -2139,19 +2148,19 @@ class MainWindow:
             risk = self._build_risk_config()
             rules = self._build_prop_rules()
 
-            mode = self._SEARCH_MODE_LABELS.get(self.search_mode.get_str(), "family")
-            if mode == "single":
-                if self.strategy_mode.get() != "manual":
-                    self._log_search(
-                        "\nSingle mode requires a Manual Strategy Builder configuration on the "
-                        "Strategy tab (Step 2) -- Search Lab only runs Manual Strategy configs "
-                        "through its funnel. Switch Step 2 to Manual mode, or use Family mode "
-                        "instead."
-                    )
-                    return
+            mode_key = self._SEARCH_MODE_LABELS.get(self.search_mode.get_str(), "family_named")
+            if mode_key == "single":
+                strategy = self._build_strategy()  # any of the 4 types, whatever's configured
+                space = generate_search_space(mode="single", strategy=strategy)
+            elif mode_key == "family_grid":
                 strategy = self._build_strategy()
-                space = generate_search_space(mode="single", single_config=strategy.config)
-            else:
+                space = generate_search_space(
+                    mode="family", strategy=strategy,
+                    grid_points_per_gene=self.search_grid_points.get_int(3),
+                    max_candidates=self.search_max_candidates.get_int(500),
+                    seed=self.search_seed.get_int(42),
+                )
+            else:  # family_named
                 family_label = self.search_family.get_str()
                 family_key = self._search_family_label_to_key.get(family_label, "all")
                 space = generate_search_space(

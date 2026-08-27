@@ -178,6 +178,8 @@ def run_search_cli(
     output_dir: str,
     mode: str = "family",
     family: str | None = "all",
+    strategy_file: str | None = None,
+    grid_points: int = 3,
     max_candidates: int = 500,
     workers: int | None = None,
     min_trades: int = 20,
@@ -195,17 +197,29 @@ def run_search_cli(
     promote: bool = True,
 ) -> None:
     """
-    Search Lab: Stages 1-5. Generates a candidate pool (mode="single" wraps
-    the same DEFAULT_MANUAL_STRATEGY the rest of --cli uses; mode="family"
-    combinatorially expands a named strategy family, or every family if
-    `family` is None/"all"), runs it through the cheap filter -> GA
-    refinement -> validation gate -> leaderboard funnel, and (by default)
-    promotes the champion, if any, through the normal single-strategy
-    report pipeline.
+    Search Lab: Stages 1-5. Generates a candidate pool, runs it through the
+    cheap filter -> GA refinement -> validation gate -> leaderboard funnel,
+    and (by default) promotes the champion, if any, through the normal
+    single-strategy report pipeline.
+
+    Without --search-strategy-file (Manual Strategy Builder path, as
+    before): mode="single" wraps the built-in DEFAULT_MANUAL_STRATEGY;
+    mode="family" combinatorially expands a named strategy family (or
+    every family, if `family` is None/"all").
+
+    With --search-strategy-file <path.py|.pine|.mq5> (Python, PineScript,
+    or MQL5 -- source type is inferred from the extension): mode="single"
+    re-validates that exact file through the funnel; mode="family" instead
+    grid-searches THAT FILE's own tunable numeric parameters (`family` is
+    ignored in this case -- the named-hypothesis-family registry is
+    Manual-only).
     """
     from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
     from app.search.search_report import generate_search_report
     from app.search.strategy_space import generate_search_space, list_families
+    from app.strategy.mql5 import MQL5Strategy
+    from app.strategy.pinescript import PineScriptStrategy
+    from app.strategy.python import PythonStrategy
 
     if csv_path is None:
         csv_path = _resolve_default_csv()
@@ -221,17 +235,46 @@ def run_search_cli(
     df = import_result.dataframe
     print(f"Loaded {len(df)} bars from {csv_path}")
 
-    if mode == "family" and family not in (None, "all") and family not in list_families():
+    built_strategy = None
+    if strategy_file:
+        ext = Path(strategy_file).suffix.lower()
+        try:
+            if ext == ".py":
+                built_strategy = PythonStrategy(strategy_file)
+            elif ext == ".pine":
+                built_strategy = PineScriptStrategy(Path(strategy_file).read_text(encoding="utf-8"))
+            elif ext == ".mq5":
+                built_strategy = MQL5Strategy(Path(strategy_file).read_text(encoding="utf-8"))
+            else:
+                print(f"Unsupported --search-strategy-file extension '{ext}' (expected .py, .pine, or .mq5).")
+                sys.exit(1)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not load strategy file '{strategy_file}': {exc}")
+            sys.exit(1)
+        print(f"Loaded {built_strategy.source_type} strategy from {strategy_file}")
+
+    if built_strategy is None and mode == "family" and family not in (None, "all") and family not in list_families():
         print(f"Unknown family '{family}'. Known families: {list(list_families())}")
         sys.exit(1)
 
-    space = generate_search_space(
-        mode=mode,
-        family=family,
-        single_config=DEFAULT_MANUAL_STRATEGY if mode == "single" else None,
-        max_candidates=max_candidates,
-        seed=seed,
-    )
+    if mode == "single":
+        space = generate_search_space(
+            mode="single",
+            strategy=built_strategy,
+            single_config=DEFAULT_MANUAL_STRATEGY if built_strategy is None else None,
+            max_candidates=max_candidates,
+            seed=seed,
+        )
+    else:
+        if built_strategy is not None:
+            space = generate_search_space(
+                mode="family", strategy=built_strategy,
+                grid_points_per_gene=grid_points, max_candidates=max_candidates, seed=seed,
+            )
+        else:
+            space = generate_search_space(
+                mode="family", family=family, max_candidates=max_candidates, seed=seed,
+            )
 
     stage_cfg = SearchStageConfig(
         min_trades=min_trades, min_profit_factor=min_profit_factor,
@@ -309,7 +352,22 @@ def main():
     parser.add_argument(
         "--search-family", default="all",
         help="strategy family to search (see app.search.strategy_space.list_families()), or 'all' "
-             "to search every family together (default). Ignored when --search-mode=single.",
+             "to search every family together (default). Ignored when --search-mode=single, or "
+             "when --search-strategy-file is given.",
+    )
+    parser.add_argument(
+        "--search-strategy-file", default=None,
+        help="path to a .py, .pine, or .mq5 strategy file (source type inferred from extension). "
+             "If given: --search-mode single re-validates that exact file through the Stage 1-5 "
+             "funnel; --search-mode family grid-searches ITS OWN tunable numeric parameters "
+             "instead of the named-hypothesis family registry (--search-family is ignored). Omit "
+             "to use the built-in Manual Strategy Builder default (DEFAULT_MANUAL_STRATEGY for "
+             "single mode, the named-family registry for family mode).",
+    )
+    parser.add_argument(
+        "--search-grid-points", type=int, default=3,
+        help="grid points per tunable parameter when --search-strategy-file is used with "
+             "--search-mode family (default 3).",
     )
     parser.add_argument("--search-max-candidates", type=int, default=500,
                          help="cap on how many generated candidates Stage 1 evaluates (random sample if the "
@@ -349,6 +407,7 @@ def main():
         run_search_cli(
             args.csv, args.output,
             mode=args.search_mode, family=args.search_family,
+            strategy_file=args.search_strategy_file, grid_points=args.search_grid_points,
             max_candidates=args.search_max_candidates, workers=args.search_workers,
             min_trades=args.search_min_trades, min_profit_factor=args.search_min_profit_factor,
             stage1_top_n=args.search_stage1_top_n, stage2_top_n=args.search_stage2_top_n,

@@ -131,8 +131,26 @@
       </div>
 
       <div id="code-fields" style="display:none;">
-        <label>Paste strategy source</label>
-        <textarea name="strategy_code" placeholder="Paste your Python / PineScript / MQL5 strategy here"></textarea>
+        <label>Load a saved strategy from the library</label>
+        <select id="existing_strategy_select" onchange="loadFromLibrary()">
+          <option value="">— none, paste or upload below —</option>
+        </select>
+
+        <label>Or upload a strategy file (from this computer or your phone)</label>
+        <input type="file" id="strategy_file_input" name="strategy_file" accept=".py,.pine,.mq5">
+
+        <label>Or paste strategy source</label>
+        <textarea name="strategy_code" id="strategy_code" placeholder="Paste your Python / PineScript / MQL5 strategy here"></textarea>
+
+        <div class="row">
+          <div>
+            <label><input type="checkbox" name="strategy_save_to_library" value="1"> Save to strategy library</label>
+          </div>
+          <div>
+            <label>Save as</label>
+            <input type="text" name="strategy_save_name" id="strategy_save_name" placeholder="e.g. my_strategy.py">
+          </div>
+        </div>
       </div>
 
       <div id="grid-points-field" style="display:none;">
@@ -221,6 +239,41 @@
   const modeInput = document.getElementById('strategy_mode');
   const manualFields = document.getElementById('manual-fields');
   const codeFields = document.getElementById('code-fields');
+
+  // {"python": ["a.py", ...], "pinescript": [...], "mql5": [...]}
+  const SAVED_STRATEGIES = {{ saved_strategies_json | safe }};
+
+  function populateLibrarySelect(mode) {
+    const select = document.getElementById('existing_strategy_select');
+    select.innerHTML = '<option value="">— none, paste or upload below —</option>';
+    (SAVED_STRATEGIES[mode] || []).forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      select.appendChild(opt);
+    });
+  }
+
+  function loadFromLibrary() {
+    const mode = modeInput.value;
+    const name = document.getElementById('existing_strategy_select').value;
+    if (!name) return;
+    fetch(`/strategies/${encodeURIComponent(mode)}/${encodeURIComponent(name)}`)
+      .then(r => r.ok ? r.text() : Promise.reject())
+      .then(text => { document.getElementById('strategy_code').value = text; })
+      .catch(() => alert('Could not load that saved strategy.'));
+  }
+
+  document.getElementById('strategy_file_input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { document.getElementById('strategy_code').value = reader.result; };
+    reader.readAsText(file);
+    const saveName = document.getElementById('strategy_save_name');
+    if (!saveName.value) saveName.value = file.name;
+  });
+
   tabs.forEach(btn => btn.addEventListener('click', () => {
     tabs.forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
@@ -231,6 +284,7 @@
     } else {
       manualFields.style.display = 'none';
       codeFields.style.display = 'block';
+      populateLibrarySelect(btn.dataset.mode);
     }
   }));
 

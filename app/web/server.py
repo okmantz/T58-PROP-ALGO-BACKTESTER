@@ -48,8 +48,9 @@ from app.search.strategy_space import (
 )
 from app.strategy.base import StrategyError
 from app.strategy.library import (
-    STRATEGY_TYPES, delete_saved_strategy, load_strategy_text,
-    list_saved_strategies, save_strategy_bytes, save_strategy_text,
+    STRATEGY_TYPES, StrategyAlreadyExists, delete_saved_strategy, export_library_zip_bytes,
+    list_saved_strategies, load_strategy_text, rename_saved_strategy, save_strategy_bytes,
+    save_strategy_metadata, save_strategy_text,
 )
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
@@ -113,7 +114,20 @@ def _build_strategy(mode: str, form, files):
         )
 
     if form.get("strategy_save_to_library"):
-        save_strategy_text(code, save_name or "strategy", mode)
+        overwrite = bool(form.get("strategy_overwrite"))
+        try:
+            saved_path = save_strategy_text(code, save_name or "strategy", mode, overwrite=overwrite)
+        except StrategyAlreadyExists as exc:
+            raise StrategyError(
+                f"'{exc.filename}' is already in the {mode} strategy library. "
+                'Check "Overwrite existing" and run again to replace it, or change "Save as" to a new name.'
+            ) from exc
+        description = (form.get("strategy_save_description") or "").strip()
+        market = (form.get("strategy_save_market") or "").strip()
+        if description or market:
+            save_strategy_metadata(mode, saved_path.name, {
+                "description": description, "market": market,
+            })
 
     if mode == "python":
         tmp = Path(tempfile.mkdtemp()) / f"strategy_{uuid.uuid4().hex}.py"
@@ -180,10 +194,21 @@ def _resolve_dataset(form, files):
 
 
 def _saved_strategies_json() -> str:
-    """{"python": ["a.py", ...], "pinescript": [...], "mql5": [...]} for the
-    page's JS to build the "load from library" dropdowns per strategy mode."""
+    """{"python": [{"name", "description", "market"}, ...], "pinescript": [...],
+    "mql5": [...]} for the page's JS to build the "load from library"
+    dropdowns, the client-side search filter, and to prefill the
+    description/market fields when a saved strategy is picked."""
     return json.dumps({
-        t: [s.name for s in list_saved_strategies(t)] for t in STRATEGY_TYPES
+        t: [
+            {
+                "name": s.name,
+                "description": s.metadata.get("description", ""),
+                "market": s.metadata.get("market", ""),
+                "last_run": s.metadata.get("last_run"),
+            }
+            for s in list_saved_strategies(t)
+        ]
+        for t in STRATEGY_TYPES
     })
 
 
@@ -193,6 +218,7 @@ def index():
         "index.html",
         stored_datasets=list_stored_datasets(),
         saved_strategies_json=_saved_strategies_json(),
+        strategy_notice=request.args.get("strategy_notice"),
     )
 
 
@@ -207,15 +233,73 @@ def get_saved_strategy(strategy_type, filename):
     return Response(text, mimetype="text/plain")
 
 
+def _redirect_target(form) -> str:
+    return "search_form" if form.get("return_to") == "search" else "index"
+
+
 @app.route("/strategies/delete", methods=["POST"])
 def delete_saved_strategy_route():
     strategy_type = request.form.get("strategy_type", "")
     filename = request.form.get("filename", "")
+    notice = f"Deleted '{filename}' from the {strategy_type} library."
     try:
         delete_saved_strategy(strategy_type, filename)
-    except (ValueError, FileNotFoundError):
-        pass
-    return redirect(url_for("index"))
+    except (ValueError, FileNotFoundError) as exc:
+        notice = str(exc)
+    return redirect(url_for(_redirect_target(request.form), strategy_notice=notice))
+
+
+@app.route("/strategies/rename", methods=["POST"])
+def rename_saved_strategy_route():
+    strategy_type = request.form.get("strategy_type", "")
+    old_filename = request.form.get("old_filename", "")
+    new_filename = (request.form.get("new_filename") or "").strip()
+    overwrite = bool(request.form.get("overwrite"))
+    target = _redirect_target(request.form)
+
+    if not new_filename:
+        return redirect(url_for(target, strategy_notice="Enter a new filename to rename to."))
+    try:
+        new_path = rename_saved_strategy(strategy_type, old_filename, new_filename, overwrite=overwrite)
+        notice = f"Renamed '{old_filename}' to '{new_path.name}'."
+    except StrategyAlreadyExists as exc:
+        notice = (
+            f"'{exc.filename}' already exists in the {strategy_type} library. "
+            'Check "Overwrite" and rename again to replace it.'
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        notice = str(exc)
+    return redirect(url_for(target, strategy_notice=notice))
+
+
+@app.route("/strategies/metadata", methods=["POST"])
+def save_strategy_metadata_route():
+    strategy_type = request.form.get("strategy_type", "")
+    filename = request.form.get("filename", "")
+    description = (request.form.get("description") or "").strip()
+    market = (request.form.get("market") or "").strip()
+    target = _redirect_target(request.form)
+    try:
+        save_strategy_metadata(strategy_type, filename, {"description": description, "market": market})
+        notice = f"Saved info for '{filename}'."
+    except ValueError as exc:
+        notice = str(exc)
+    return redirect(url_for(target, strategy_notice=notice))
+
+
+@app.route("/strategies/export")
+def export_strategy_library_route():
+    """Download every saved strategy (all three languages, plus their
+    metadata sidecars) as one zip -- the backup button, and also how a
+    packaged .exe's library (which lives next to the .exe, not in the git
+    repo) gets synced back into the repo: download, unzip into
+    strategies/, commit."""
+    data = export_library_zip_bytes()
+    return Response(
+        data,
+        mimetype="application/zip",
+        headers={"Content-Disposition": "attachment; filename=t58_strategy_library_backup.zip"},
+    )
 
 
 @app.route("/manifest.json")
@@ -417,6 +501,7 @@ def search_form():
         stored_datasets=list_stored_datasets(),
         families=[{"name": n, "description": family_description(n)} for n in list_families()],
         saved_strategies_json=_saved_strategies_json(),
+        strategy_notice=request.args.get("strategy_notice"),
     )
 
 

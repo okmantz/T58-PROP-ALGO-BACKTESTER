@@ -26,6 +26,7 @@ from app.monte_carlo.engine import MonteCarloResult
 from app.prop.simulator import AccountSimResult, PropRules, summarize_single_run
 from app.reports.charts import svg_histogram, svg_line_chart
 from app.reports.trade_chart import build_trade_chart_html
+from app.reports import run_history
 
 
 def build_report(
@@ -525,4 +526,7 @@ def generate_full_report(
         "trades_csv": export_trades_csv(backtest_result, output_dir / f"{basename}_trades.csv"),
         "html": export_html(report, output_dir / f"{basename}.html", backtest_result=backtest_result, price_df=price_df),
     }
+    # Best-effort: powers the Dashboard tab (desktop + web). Never allowed
+    # to turn a successful report into a failed run.
+    run_history.record_run(report, paths, backtest_result=backtest_result)
     return paths

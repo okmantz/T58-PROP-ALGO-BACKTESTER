@@ -19,7 +19,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import (
     Tk, Frame, Label, Button, Entry, StringVar, Text, END,
-    filedialog, messagebox, ttk, Listbox, SINGLE, EXTENDED, BooleanVar, Canvas,
+    filedialog, messagebox, simpledialog, ttk, Listbox, SINGLE, EXTENDED, BooleanVar, Canvas,
     Checkbutton, PhotoImage,
 )
 
@@ -39,8 +39,9 @@ from app.search.search_report import generate_search_report
 from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
 from app.strategy.base import StrategyError
 from app.strategy.library import (
-    STRATEGY_TYPES, delete_saved_strategy, get_strategy_library_dir,
-    list_saved_strategies, save_strategy_path,
+    STRATEGY_TYPES, StrategyAlreadyExists, delete_saved_strategy, export_library_zip,
+    get_strategy_library_dir, list_saved_strategies, record_backtest_result,
+    rename_saved_strategy, save_strategy_bytes, save_strategy_metadata, save_strategy_path,
 )
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
@@ -238,6 +239,7 @@ class MainWindow:
         self.csv_path: str | None = None
         self.csv_paths: list[str] = []
         self.strategy_py_path: str | None = None
+        self._active_library_strategy: tuple[str, str] | None = None
         self.strategy_mode = StringVar(value="manual")
 
         self._configure_styles()
@@ -899,11 +901,17 @@ class MainWindow:
             "Strategy library",
             "Strategies live here inside the app instead of only on your computer. "
             "Importing a file above automatically saves a copy into the library; "
-            "you can also load or delete a previously saved one below.",
+            "you can also load, rename, or delete a previously saved one below. "
+            "Note: a packaged .exe's library lives next to the .exe, not in your "
+            "git repo — use EXPORT LIBRARY AS ZIP below and unzip it into the "
+            "repo's strategies/ folder to keep them in sync.",
         )
 
+        self.strategy_search = LabeledEntry(library_section, "Search (name / market / tags)", "")
+        self.strategy_search.entry.bind("<KeyRelease>", lambda _e: self._refresh_strategy_library())
+
         lib_list_frame = Frame(library_section, bg=PANEL)
-        lib_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 10))
+        lib_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 8))
 
         self.strategy_library_listbox = Listbox(
             lib_list_frame,
@@ -934,6 +942,9 @@ class MainWindow:
         self.strategy_library_listbox.bind(
             "<Double-Button-1>", lambda _e: self._load_selected_library_strategy()
         )
+        self.strategy_library_listbox.bind(
+            "<<ListboxSelect>>", lambda _e: self._on_library_selection_changed()
+        )
 
         lib_btn_row = Frame(library_section, bg=PANEL)
         lib_btn_row.pack(anchor="w", padx=18, pady=(0, 6))
@@ -942,11 +953,45 @@ class MainWindow:
             lib_btn_row, "LOAD SELECTED", self._load_selected_library_strategy, primary=True
         ).pack(side="left")
         self._button(
-            lib_btn_row, "DELETE SELECTED", self._delete_selected_library_strategy
+            lib_btn_row, "RENAME SELECTED", self._rename_selected_library_strategy
         ).pack(side="left", padx=8)
         self._button(
-            lib_btn_row, "REFRESH LIBRARY", self._refresh_strategy_library
+            lib_btn_row, "DELETE SELECTED", self._delete_selected_library_strategy
         ).pack(side="left")
+        self._button(
+            lib_btn_row, "REFRESH LIBRARY", self._refresh_strategy_library
+        ).pack(side="left", padx=8)
+
+        lib_btn_row_2 = Frame(library_section, bg=PANEL)
+        lib_btn_row_2.pack(anchor="w", padx=18, pady=(0, 10))
+
+        self._button(
+            lib_btn_row_2, "OPEN LIBRARY FOLDER", self._open_strategy_library_folder
+        ).pack(side="left")
+        self._button(
+            lib_btn_row_2, "EXPORT LIBRARY AS ZIP", self._export_strategy_library
+        ).pack(side="left", padx=8)
+
+        # ---- Metadata for the selected saved strategy -------------
+        meta_frame = Frame(library_section, bg=PANEL)
+        meta_frame.pack(fill="x", padx=0, pady=(0, 4))
+
+        self.strategy_meta_description = LabeledEntry(meta_frame, "Description", "")
+        self.strategy_meta_market = LabeledEntry(meta_frame, "Market / timeframe", "")
+
+        self._button(
+            meta_frame, "SAVE INFO TO SELECTED", self._save_selected_library_metadata
+        ).pack(anchor="w", padx=18, pady=(2, 4))
+
+        self.strategy_meta_last_run = Label(
+            library_section,
+            text="",
+            bg=PANEL,
+            fg=TEXT_DIM,
+            font=_safe_font(8),
+            justify="left",
+        )
+        self.strategy_meta_last_run.pack(anchor="w", padx=18, pady=(0, 8))
 
         self.strategy_library_status = Label(
             library_section,
@@ -1131,16 +1176,14 @@ class MainWindow:
             return
 
         if mode in STRATEGY_TYPES:
-            try:
-                stored_path = save_strategy_path(path, mode)
-            except OSError as exc:
-                messagebox.showwarning(
-                    "Saved locally only",
-                    f"Selected the file, but couldn't copy it into the strategy "
-                    f"library ({exc}). It will still work for this run.",
-                )
-                stored_path = Path(path)
+            stored_path = self._save_to_library_with_overwrite_prompt(
+                lambda overwrite: save_strategy_path(path, mode, overwrite=overwrite),
+                fallback_path=Path(path),
+            )
+            if stored_path is None:
+                return  # user cancelled the overwrite/rename prompt
             self.strategy_py_path = str(stored_path)
+            self._active_library_strategy = (mode, stored_path.name)
             self.strategy_file_status.config(
                 text=f"Selected: {stored_path.name}  (saved to library)",
                 fg=GREEN,
@@ -1148,10 +1191,60 @@ class MainWindow:
             self._refresh_strategy_library()
         else:
             self.strategy_py_path = path
+            self._active_library_strategy = None
             self.strategy_file_status.config(
                 text=f"Selected: {os.path.basename(path)}",
                 fg=GREEN,
             )
+
+    def _save_to_library_with_overwrite_prompt(self, save_fn, fallback_path: Path):
+        """Try `save_fn(overwrite=False)`. On a name collision, ask the user
+        whether to overwrite the existing saved strategy or save this one as
+        a new, separately-named copy; on OSError, fall back to using the
+        file in place (still usable for this run, just not library-backed).
+        Returns the stored Path, or None if the user cancelled."""
+        try:
+            return save_fn(overwrite=False)
+        except StrategyAlreadyExists as exc:
+            choice = messagebox.askyesnocancel(
+                "Strategy already saved",
+                f"'{exc.filename}' is already in the strategy library.\n\n"
+                "Yes = overwrite the saved copy with this one\n"
+                "No = save this as a new, separately-named copy\n"
+                "Cancel = don't save to the library",
+            )
+            if choice is None:
+                return None
+            if choice:
+                return save_fn(overwrite=True)
+            new_name = simpledialog.askstring(
+                "Save as new copy",
+                "New filename for this copy:",
+                initialvalue=exc.filename,
+            )
+            if not new_name:
+                return None
+            try:
+                return self._save_strategy_copy_as(fallback_path, exc.strategy_type, new_name)
+            except StrategyAlreadyExists:
+                messagebox.showerror(
+                    "Name taken", f"'{new_name}' is also already saved. Try again with a different name."
+                )
+                return None
+        except OSError as exc:
+            messagebox.showwarning(
+                "Saved locally only",
+                f"Selected the file, but couldn't copy it into the strategy "
+                f"library ({exc}). It will still work for this run.",
+            )
+            return fallback_path
+
+    def _save_strategy_copy_as(self, source_path: Path, strategy_type: str, new_name: str) -> Path:
+        """Copy source_path's bytes into the library under a caller-chosen
+        filename (save_strategy_path always keeps the source's own
+        filename, so a rename-on-save needs this instead)."""
+        content = Path(source_path).read_bytes()
+        return save_strategy_bytes(content, new_name, strategy_type, overwrite=False)
 
     def _refresh_strategy_library(self):
         mode = self.strategy_mode.get()
@@ -1165,16 +1258,25 @@ class MainWindow:
             )
             return
 
-        self._strategy_library_items = list_saved_strategies(mode)
+        query = self.strategy_search.get_str().strip() if hasattr(self, "strategy_search") else ""
+        self._strategy_library_items = list_saved_strategies(mode, query=query)
         for item in self._strategy_library_items:
             kb = item.size_bytes / 1024
-            self.strategy_library_listbox.insert(END, f"  {item.name}  ({kb:.1f} KB)")
+            desc = item.metadata.get("description", "")
+            suffix = f"  —  {desc}" if desc else ""
+            self.strategy_library_listbox.insert(END, f"  {item.name}  ({kb:.1f} KB){suffix}")
 
         d = get_strategy_library_dir(mode)
+        total = len(list_saved_strategies(mode))
         if self._strategy_library_items:
+            shown = (
+                f"{len(self._strategy_library_items)} of {total} saved {mode} strategy(ies)"
+                if query else f"{total} saved {mode} strategy(ies)"
+            )
+            self.strategy_library_status.config(text=f"{shown}  •  {d}", fg=TEXT_DIM)
+        elif total and query:
             self.strategy_library_status.config(
-                text=f"{len(self._strategy_library_items)} saved {mode} strategy(ies)  •  {d}",
-                fg=TEXT_DIM,
+                text=f"No saved {mode} strategies match '{query}'.", fg=TEXT_DIM,
             )
         else:
             self.strategy_library_status.config(
@@ -1182,31 +1284,93 @@ class MainWindow:
                 f"directly in {d} and press REFRESH LIBRARY.",
                 fg=TEXT_DIM,
             )
+        self._clear_strategy_metadata_panel()
+
+    def _selected_library_item(self):
+        mode = self.strategy_mode.get()
+        if mode not in STRATEGY_TYPES:
+            return None
+        sel = self.strategy_library_listbox.curselection()
+        if not sel:
+            return None
+        return self._strategy_library_items[sel[0]]
+
+    def _clear_strategy_metadata_panel(self):
+        if hasattr(self, "strategy_meta_description"):
+            self.strategy_meta_description.var.set("")
+            self.strategy_meta_market.var.set("")
+            self.strategy_meta_last_run.config(text="")
+
+    def _on_library_selection_changed(self):
+        item = self._selected_library_item()
+        if item is None:
+            self._clear_strategy_metadata_panel()
+            return
+        self.strategy_meta_description.var.set(item.metadata.get("description", ""))
+        self.strategy_meta_market.var.set(item.metadata.get("market", ""))
+        last_run = item.metadata.get("last_run")
+        if last_run:
+            parts = [f"{k}: {v}" for k, v in last_run.items()]
+            self.strategy_meta_last_run.config(text="Last run — " + "  •  ".join(parts))
+        else:
+            self.strategy_meta_last_run.config(text="No backtest recorded for this strategy yet.")
+
+    def _save_selected_library_metadata(self):
+        mode = self.strategy_mode.get()
+        item = self._selected_library_item()
+        if item is None:
+            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            return
+        save_strategy_metadata(mode, item.name, {
+            "description": self.strategy_meta_description.get_str().strip(),
+            "market": self.strategy_meta_market.get_str().strip(),
+        })
+        self._refresh_strategy_library()
 
     def _load_selected_library_strategy(self):
         mode = self.strategy_mode.get()
-        if mode not in STRATEGY_TYPES:
-            return
-        sel = self.strategy_library_listbox.curselection()
-        if not sel:
+        item = self._selected_library_item()
+        if item is None:
             messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
             return
-        item = self._strategy_library_items[sel[0]]
         self.strategy_py_path = str(item.path)
+        self._active_library_strategy = (mode, item.name)
         self.strategy_file_status.config(
             text=f"Loaded from library: {item.name}",
             fg=GREEN,
         )
 
-    def _delete_selected_library_strategy(self):
+    def _rename_selected_library_strategy(self):
         mode = self.strategy_mode.get()
-        if mode not in STRATEGY_TYPES:
-            return
-        sel = self.strategy_library_listbox.curselection()
-        if not sel:
+        item = self._selected_library_item()
+        if item is None:
             messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
             return
-        item = self._strategy_library_items[sel[0]]
+        new_name = simpledialog.askstring(
+            "Rename saved strategy", "New filename:", initialvalue=item.name
+        )
+        if not new_name or new_name == item.name:
+            return
+        try:
+            new_path = rename_saved_strategy(mode, item.name, new_name, overwrite=False)
+        except StrategyAlreadyExists:
+            if not messagebox.askyesno(
+                "Name already taken",
+                f"'{new_name}' is already a saved {mode} strategy. Overwrite it?",
+            ):
+                return
+            new_path = rename_saved_strategy(mode, item.name, new_name, overwrite=True)
+        if self.strategy_py_path == str(item.path):
+            self.strategy_py_path = str(new_path)
+            self._active_library_strategy = (mode, new_path.name)
+        self._refresh_strategy_library()
+
+    def _delete_selected_library_strategy(self):
+        mode = self.strategy_mode.get()
+        item = self._selected_library_item()
+        if item is None:
+            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            return
         if not messagebox.askyesno(
             "Delete saved strategy",
             f"Permanently delete '{item.name}' from the strategy library? "
@@ -1216,11 +1380,48 @@ class MainWindow:
         delete_saved_strategy(mode, item.name)
         if self.strategy_py_path == str(item.path):
             self.strategy_py_path = None
+            self._active_library_strategy = None
             self.strategy_file_status.config(
                 text="Only needed for Python / PineScript / MQL5 modes.",
                 fg=TEXT_DIM,
             )
         self._refresh_strategy_library()
+
+    def _open_strategy_library_folder(self):
+        d = get_strategy_library_dir(self.strategy_mode.get()) \
+            if self.strategy_mode.get() in STRATEGY_TYPES else get_strategy_library_dir()
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(d)  # noqa: S606 -- opening a known local folder, not user input
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", str(d)])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(d)])
+        except OSError as exc:
+            messagebox.showinfo("Strategy library folder", f"{d}\n\n(Couldn't open it automatically: {exc})")
+
+    def _export_strategy_library(self):
+        dest = filedialog.asksaveasfilename(
+            title="Export strategy library",
+            defaultextension=".zip",
+            initialfile="t58_strategy_library_backup.zip",
+            filetypes=[("Zip archive", "*.zip")],
+        )
+        if not dest:
+            return
+        try:
+            export_library_zip(dest)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        messagebox.showinfo(
+            "Export complete",
+            f"Exported the full strategy library to:\n{dest}\n\n"
+            "Unzip it into your repo's strategies/ folder to keep a packaged "
+            ".exe's saved strategies in sync with GitHub.",
+        )
 
     def _stop_target_block(self, type_widget, value_widget, atr_period_widget) -> tuple[str, float | None, int]:
         label = type_widget.get_str()
@@ -2055,6 +2256,21 @@ class MainWindow:
 
             self._last_html_path = paths["html"]
             self.open_report_btn.config(state="normal")
+
+            active_lib_strategy = getattr(self, "_active_library_strategy", None)
+            if active_lib_strategy:
+                lib_mode, lib_filename = active_lib_strategy
+                try:
+                    record_backtest_result(lib_mode, lib_filename, {
+                        "trades": len(bt_result.trades),
+                        "net_profit": round(bt_result.statistics.net_profit, 2),
+                        "win_rate": round(bt_result.statistics.win_rate, 1),
+                        "max_dd": round(bt_result.statistics.max_drawdown_pct, 2),
+                        "passed_evaluation": single_run.passed_evaluation,
+                        "report_html": str(paths["html"]),
+                    })
+                except (FileNotFoundError, ValueError):
+                    pass  # strategy was renamed/deleted mid-run -- not worth failing the run over
 
             self._log("\nDone. Report written to:")
 

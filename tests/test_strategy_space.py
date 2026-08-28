@@ -7,8 +7,9 @@ import pytest
 
 from app.backtest.engine import run_backtest
 from app.backtest.risk import RiskConfig
+from app.data.pairs import merge_pair_series
 from app.search.strategy_space import (
-    FAMILIES, StrategySpaceError, build_strategy_from_spec, family_description,
+    FAMILIES, FAMILIES_REQUIRING_PAIR_DATA, StrategySpaceError, build_strategy_from_spec, family_description,
     family_grid_size, generate_search_space, list_families, spec_from_strategy,
 )
 from app.strategy.manual import ManualStrategy
@@ -144,10 +145,35 @@ def test_family_mode_samples_reproducibly_when_over_cap():
 
 def test_family_all_combines_every_family():
     space = generate_search_space("family", family="all", max_candidates=100_000, seed=1)
+    # "all" without has_pair_data=True silently skips families that require a
+    # second instrument merged in first (see FAMILIES_REQUIRING_PAIR_DATA) --
+    # every other family still contributes its full grid.
+    plain_families = [name for name in FAMILIES if name not in FAMILIES_REQUIRING_PAIR_DATA]
+    expected_total = sum(family_grid_size(name) for name in plain_families)
+    assert space.total_generated == expected_total
+    seen_families = {meta["family"] for meta in space.meta.values()}
+    assert seen_families == set(plain_families)
+
+
+def test_family_all_with_pair_data_includes_pair_families():
+    df = _synthetic_df()
+    pair_df = _synthetic_df(seed=1)
+    merged = merge_pair_series(df, pair_df)
+    space = generate_search_space("family", family="all", max_candidates=100_000, seed=1, has_pair_data=True)
     expected_total = sum(family_grid_size(name) for name in FAMILIES)
     assert space.total_generated == expected_total
     seen_families = {meta["family"] for meta in space.meta.values()}
     assert seen_families == set(FAMILIES)
+    # spot-check one stat_pairs candidate actually runs on data with pair_close merged in
+    pair_cid = next(cid for cid, meta in space.meta.items() if meta["family"] == "stat_pairs")
+    strategy = build_strategy_from_spec(space.candidates[pair_cid])
+    result = run_backtest(merged, strategy, RiskConfig())
+    assert result.statistics is not None
+
+
+def test_family_stat_pairs_without_pair_data_raises():
+    with pytest.raises(StrategySpaceError, match="pair_close|pair data|merge_pair_series"):
+        generate_search_space("family", family="stat_pairs", max_candidates=10, seed=1)
 
 
 @pytest.mark.parametrize("family_name", list(FAMILIES))
@@ -161,7 +187,10 @@ def test_every_family_produces_valid_runnable_configs(family_name):
     """
     df = _synthetic_df()
     risk = RiskConfig()
-    space = generate_search_space("family", family=family_name, max_candidates=6, seed=3)
+    has_pair_data = family_name in FAMILIES_REQUIRING_PAIR_DATA
+    if has_pair_data:
+        df = merge_pair_series(df, _synthetic_df(seed=1))
+    space = generate_search_space("family", family=family_name, max_candidates=6, seed=3, has_pair_data=has_pair_data)
     assert len(space.candidates) > 0
     any_trades = False
     for cid, spec in space.candidates.items():

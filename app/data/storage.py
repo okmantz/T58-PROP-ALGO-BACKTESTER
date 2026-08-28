@@ -83,6 +83,55 @@ def list_stored_datasets() -> list[StoredDataset]:
     ]
 
 
+# A CSV under this many bytes cannot contain a header plus even one data
+# row -- it's a placeholder/failed-export artifact, not real market data.
+EMPTY_DATASET_BYTES = 32
+
+
+def _quick_row_count(path: Path) -> int:
+    """Cheap line count (minus header), without loading the file through
+    pandas -- this runs once per file every time the dashboard loads, so it
+    needs to stay fast even for multi-megabyte CSVs."""
+    try:
+        with open(path, "rb") as f:
+            count = sum(1 for _ in f)
+        return max(count - 1, 0)
+    except OSError:
+        return 0
+
+
+def list_datasets_by_instrument() -> list[dict]:
+    """Groups list_stored_datasets() by its top-level data/raw/ subfolder
+    (the instrument), for the Dashboard's "Market Data Library" card --
+    this is what actually makes the data Owen already has on disk visible
+    in the app, independent of whether any backtest has been run yet."""
+    raw_dir = get_raw_data_dir()
+    groups: dict[str, list[dict]] = {}
+    for ds in list_stored_datasets():
+        parts = ds.name.split("/")
+        instrument = parts[0] if len(parts) > 1 else "(ungrouped)"
+        rows = _quick_row_count(ds.path)
+        groups.setdefault(instrument, []).append({
+            "name": parts[-1],
+            "full_name": ds.name,
+            "size_bytes": ds.size_bytes,
+            "rows": rows,
+            "empty": ds.size_bytes <= EMPTY_DATASET_BYTES or rows == 0,
+        })
+
+    result = []
+    for instrument in sorted(groups.keys()):
+        files = sorted(groups[instrument], key=lambda x: x["name"])
+        result.append({
+            "instrument": instrument,
+            "files": files,
+            "file_count": len(files),
+            "empty_count": sum(1 for f in files if f["empty"]),
+            "total_rows": sum(f["rows"] for f in files),
+        })
+    return result
+
+
 def _unique_destination(raw_dir: Path, filename: str) -> Path:
     dest = raw_dir / filename
     if not dest.exists():

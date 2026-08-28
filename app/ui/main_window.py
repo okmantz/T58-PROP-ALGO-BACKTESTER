@@ -21,9 +21,10 @@ from pathlib import Path
 from tkinter import (
     Tk, Frame, Label, Button, Entry, StringVar, Text, END,
     filedialog, messagebox, simpledialog, ttk, Listbox, SINGLE, EXTENDED, BooleanVar, Canvas,
-    Checkbutton, PhotoImage,
+    Checkbutton, PhotoImage, Toplevel,
 )
 
+from app.backtest.adaptive_risk import AdaptiveRiskConfig, AdaptiveRiskError, AdaptiveRiskRule
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data import alpaca_credentials
@@ -33,7 +34,9 @@ from app.data.alpaca_source import (
 )
 from app.data.importer import import_csv
 from app.data.multi_timeframe import merge_multi_timeframe
+from app.data.pairs import PairDataError, merge_pair_series
 from app.data.storage import EMPTY_DATASET_BYTES, list_datasets_by_instrument, list_stored_datasets, store_csv_path
+from app.ensemble.ensemble import EnsembleError, EnsembleVoteConfig, run_ensemble_blend, run_ensemble_vote
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.parameter_space import RefinementError, apply_genome, extract_genome
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
@@ -249,6 +252,96 @@ class LabeledCheckbox(Frame):
         return bool(self.var.get())
 
 
+_ADAPTIVE_RISK_TRIGGERS = [
+    "consecutive_losses", "daily_loss_pct", "daily_profit_pct", "progress_to_target_pct",
+]
+_ADAPTIVE_RISK_TRIGGER_HELP = {
+    "consecutive_losses": "threshold = number of losing trades in a row (today)",
+    "daily_loss_pct": "threshold = % of initial balance realized-lost so far today",
+    "daily_profit_pct": "threshold = % of initial balance realized-gained so far today",
+    "progress_to_target_pct": "threshold = % of the way from 0 to the profit target, all-time",
+}
+
+
+class _AdaptiveRuleDialog(Toplevel):
+    """Small modal for adding one AdaptiveRiskRule -- a trigger type, a
+    threshold, and a size multiplier. Used from the Risk & Execution tab's
+    Adaptive Risk section; see app.backtest.adaptive_risk for the trigger
+    semantics."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Add adaptive risk rule")
+        self.configure(bg=PANEL)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.result: AdaptiveRiskRule | None = None
+
+        self.trigger_var = StringVar(value=_ADAPTIVE_RISK_TRIGGERS[0])
+        self.threshold_var = StringVar(value="2")
+        self.multiplier_var = StringVar(value="0.5")
+
+        pad = dict(padx=14, pady=(10, 2))
+        Label(self, text="Trigger", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9), anchor="w").pack(fill="x", **pad)
+        trigger_combo = ttk.Combobox(
+            self, textvariable=self.trigger_var, values=_ADAPTIVE_RISK_TRIGGERS,
+            state="readonly", width=28, font=_safe_font(9), style="T58.TCombobox",
+        )
+        trigger_combo.pack(fill="x", padx=14)
+        trigger_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_help())
+
+        self.help_label = Label(
+            self, text=_ADAPTIVE_RISK_TRIGGER_HELP[self.trigger_var.get()],
+            bg=PANEL, fg=AMBER, font=_safe_font(8), wraplength=280, justify="left", anchor="w",
+        )
+        self.help_label.pack(fill="x", padx=14, pady=(4, 6))
+
+        Label(self, text="Threshold", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9), anchor="w").pack(fill="x", **pad)
+        Entry(
+            self, textvariable=self.threshold_var, bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            relief="flat", highlightthickness=1, highlightbackground=BORDER, font=_safe_font(10),
+        ).pack(fill="x", padx=14, ipady=4)
+
+        Label(self, text="Risk multiplier (e.g. 0.5 = half size)", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9), anchor="w").pack(fill="x", **pad)
+        Entry(
+            self, textvariable=self.multiplier_var, bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            relief="flat", highlightthickness=1, highlightbackground=BORDER, font=_safe_font(10),
+        ).pack(fill="x", padx=14, ipady=4)
+
+        btn_row = Frame(self, bg=PANEL)
+        btn_row.pack(fill="x", padx=14, pady=14)
+        Button(btn_row, text="Cancel", command=self._cancel).pack(side="right", padx=(8, 0))
+        Button(btn_row, text="Add", command=self._confirm).pack(side="right")
+
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _update_help(self):
+        self.help_label.config(text=_ADAPTIVE_RISK_TRIGGER_HELP[self.trigger_var.get()])
+
+    def _confirm(self):
+        try:
+            threshold = float(self.threshold_var.get())
+            multiplier = float(self.multiplier_var.get())
+            self.result = AdaptiveRiskRule(
+                trigger=self.trigger_var.get(), threshold=threshold, risk_multiplier=multiplier,
+            )
+        except (ValueError, AdaptiveRiskError) as exc:
+            messagebox.showerror("Invalid rule", str(exc), parent=self)
+            return
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+    @classmethod
+    def ask(cls, parent) -> AdaptiveRiskRule | None:
+        dialog = cls(parent)
+        parent.wait_window(dialog)
+        return dialog.result
+
+
 class MainWindow:
     def __init__(self, root: Tk):
         self.root = root
@@ -309,12 +402,13 @@ class MainWindow:
         self.tab_portfolio = Frame(self.content, bg=BG)
         self.tab_multiobj = Frame(self.content, bg=BG)
         self.tab_wfga = Frame(self.content, bg=BG)
+        self.tab_ensemble = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
-            self.tab_multiobj, self.tab_wfga,
+            self.tab_multiobj, self.tab_wfga, self.tab_ensemble,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -335,6 +429,8 @@ class MainWindow:
             ("portfolio", "\u25C7", "11  PORTFOLIO", self.tab_portfolio),
             ("multiobj", "\u2696", "12  MULTI-OBJECTIVE", self.tab_multiobj),
             ("wfga", "\u21BB", "13  WALK-FORWARD GA", self.tab_wfga),
+            (None, None, None, None),  # divider — Finding an Edge group
+            ("ensemble", "\u25C6", "14  ENSEMBLE", self.tab_ensemble),
         ]
         self._nav_buttons: dict[str, Label] = {}
         self._build_sidebar_nav()
@@ -354,6 +450,7 @@ class MainWindow:
         self._build_portfolio_tab()
         self._build_multiobj_tab()
         self._build_wfga_tab()
+        self._build_ensemble_tab()
 
         self._show_page("dashboard")
 
@@ -2426,6 +2523,75 @@ class MainWindow:
             section, "Pip size (e.g. 0.0001 FX)", 0.0001
         )
 
+        adaptive_section = self._section(
+            f, "Adaptive risk (optional)",
+            "Declarative, engine-level money-management rules -- de-risk after a losing "
+            "streak, cut size once a daily loss threshold is hit, or coast once a "
+            "percentage of the way to the profit target. No strategy source can see its "
+            "own trade outcomes at signal-generation time; these rules apply at the "
+            "engine level instead, the same way the Daily Loss Limit circuit breaker "
+            "(Step 3, Prop Rules) already does. Off by default -- nothing changes about "
+            "position sizing unless enabled and at least one rule is added below. Active "
+            "rules stack multiplicatively (e.g. two active 0.5x rules together size at "
+            "0.25x, not 0.5x).",
+        )
+        self.adaptive_risk_enabled = LabeledCheckbox(adaptive_section, "Enable adaptive risk for Run & Report (Step 5)", False)
+        self.adaptive_profit_target_pct = LabeledEntry(
+            adaptive_section, "Profit target (% of balance, for 'progress to target' rules)", 8.0,
+        )
+
+        rules_frame = Frame(adaptive_section, bg=PANEL)
+        rules_frame.pack(fill="both", expand=True, padx=18, pady=(2, 8))
+        self.adaptive_rule_listbox = Listbox(
+            rules_frame, height=5, selectmode=SINGLE, exportselection=False,
+            bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.adaptive_rule_listbox.pack(side="left", fill="both", expand=True)
+        rule_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.adaptive_rule_listbox.yview, style="T58.Vertical.TScrollbar")
+        rule_scroll.pack(side="right", fill="y")
+        self.adaptive_rule_listbox.config(yscrollcommand=rule_scroll.set)
+
+        rule_btn_row = Frame(adaptive_section, bg=PANEL)
+        rule_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
+        self._button(rule_btn_row, "ADD RULE", self._adaptive_add_rule, primary=True).pack(side="left")
+        self._button(rule_btn_row, "REMOVE SELECTED RULE", self._adaptive_remove_rule).pack(side="left", padx=8)
+
+        self._adaptive_rules: list[AdaptiveRiskRule] = []
+
+    def _adaptive_add_rule(self):
+        rule = _AdaptiveRuleDialog.ask(self.root)
+        if rule is None:
+            return
+        self._adaptive_rules.append(rule)
+        self.adaptive_rule_listbox.insert(END, f"{rule.trigger} >= {rule.threshold}  ->  x{rule.risk_multiplier}")
+
+    def _adaptive_remove_rule(self):
+        sel = self.adaptive_rule_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.adaptive_rule_listbox.delete(idx)
+        del self._adaptive_rules[idx]
+
+    def _build_adaptive_risk_config(self) -> AdaptiveRiskConfig | None:
+        """Returns None (not just a disabled config) when adaptive risk isn't
+        enabled, so callers can pass it straight through to run_backtest()'s
+        `adaptive_risk=` parameter unconditionally -- None there means
+        "behave exactly as if this parameter never existed," same as a
+        disabled config would, but avoids constructing one at all on the
+        common path where nobody has touched this section."""
+        if not self.adaptive_risk_enabled.get() or not self._adaptive_rules:
+            return None
+        target_pct = self.adaptive_profit_target_pct.get_float(8.0)
+        balance = self.r_initial_balance.get_float(100000)
+        return AdaptiveRiskConfig(
+            enabled=True,
+            rules=list(self._adaptive_rules),
+            profit_target_amount=balance * target_pct / 100.0,
+        )
+
     def _build_risk_config(self) -> RiskConfig:
         return RiskConfig(
             initial_balance=self.r_initial_balance.get_float(100000),
@@ -2456,6 +2622,9 @@ class MainWindow:
             random_immigrants_frac=self.refine_immigrants.get_float(0.15),
             search_monte_carlo_sims=self.refine_search_sims.get_int(500),
             random_seed=self.refine_seed.get_int(42),
+            cost_stress_enabled=self.refine_cost_stress_enabled.get(),
+            cost_stress_multiplier=self.refine_cost_stress_multiplier.get_float(2.0),
+            cost_stress_penalty_weight=self.refine_cost_stress_weight.get_float(0.35),
         )
 
     def _execute_refinement(self, df, strategy, risk, rules, mc_cfg, log_fn) -> dict:
@@ -2554,6 +2723,19 @@ class MainWindow:
         self.refine_immigrants = LabeledEntry(settings, "Random immigrants fraction (0-1, per generation)", 0.15)
         self.refine_search_sims = LabeledEntry(settings, "Monte Carlo simulations per candidate during search", 500)
         self.refine_seed = LabeledEntry(settings, "Random seed", 42)
+
+        cost_stress_section = self._section(
+            f, "Cost-stress penalty (on by default)",
+            "ALSO re-backtests every candidate at spread/slippage/commission multiplied "
+            "by the factor below, and blends that stressed-cost result into the fitness "
+            "the GA actually selects on -- biasing the search toward strategies whose "
+            "edge survives worse execution, not just strategies that look best under the "
+            "default cost assumptions. Reported statistics always stay nominal (un-"
+            "stressed); only the scalar the GA breeds toward is adjusted.",
+        )
+        self.refine_cost_stress_enabled = LabeledCheckbox(cost_stress_section, "Enable cost-stress penalty", True)
+        self.refine_cost_stress_multiplier = LabeledEntry(cost_stress_section, "Cost multiplier for the stressed re-run", 2.0)
+        self.refine_cost_stress_weight = LabeledEntry(cost_stress_section, "Penalty weight (0=ignore, 1=full)", 0.35)
 
         button_row = Frame(f, bg=BG)
         button_row.pack(fill="x", padx=24, pady=10)
@@ -2895,9 +3077,12 @@ class MainWindow:
             self._log("Configuring risk & prop rules...")
             risk = self._build_risk_config()
             rules = self._build_prop_rules()
+            adaptive_risk = self._build_adaptive_risk_config()
+            if adaptive_risk is not None:
+                self._log(f"Adaptive risk enabled: {len(adaptive_risk.rules)} rule(s)")
 
             self._log("Running historical backtest...")
-            bt_result = run_backtest(df, strategy, risk)
+            bt_result = run_backtest(df, strategy, risk, adaptive_risk=adaptive_risk)
 
             if strategy.source_type == "python":
                 self._log("Checking for lookahead bias...")
@@ -3192,6 +3377,23 @@ class MainWindow:
         self.search_workers = LabeledEntry(space_section, "Parallel workers (blank = all CPU cores)", "")
         self.search_seed = LabeledEntry(space_section, "Random seed", 42)
 
+        pair_section = self._section(
+            f, "Pair instrument (Statistical Pairs / Relative Value family only)",
+            "Merges a second instrument's close price in as a 'pair_close' column so the "
+            "'stat_pairs' family can be searched. Leave blank to search every OTHER family "
+            "as usual (a family=All search simply skips stat_pairs without this).",
+        )
+        pair_row = Frame(pair_section, bg=PANEL)
+        pair_row.pack(fill="x", padx=18, pady=(2, 10))
+        self.search_pair_csv_label = Label(
+            pair_row, text="No pair instrument selected.", bg=PANEL, fg=TEXT_MUTED,
+            font=_safe_font(9), anchor="w",
+        )
+        self.search_pair_csv_label.pack(side="left", fill="x", expand=True)
+        self._button(pair_row, "CHOOSE PAIR CSV...", self._search_choose_pair_csv).pack(side="right")
+        self._button(pair_row, "CLEAR", self._search_clear_pair_csv).pack(side="right", padx=(0, 8))
+        self._search_pair_csv_path: str | None = None
+
         stage1_section = self._section(
             f, "Stage 1 -- cheap filter",
             "One fast backtest per candidate, no Monte Carlo. Kills the vast majority "
@@ -3210,6 +3412,9 @@ class MainWindow:
         self.search_ga_population = LabeledEntry(stage2_section, "GA population size", 10)
         self.search_ga_generations = LabeledEntry(stage2_section, "GA generations", 4)
         self.search_stage2_top_n = LabeledEntry(stage2_section, "Survivors that advance to Stage 3 (validation)", 10)
+        self.search_cost_stress_enabled = LabeledCheckbox(stage2_section, "Enable cost-stress penalty in the GA fitness", True)
+        self.search_cost_stress_multiplier = LabeledEntry(stage2_section, "Cost multiplier for the stressed re-run", 2.0)
+        self.search_cost_stress_weight = LabeledEntry(stage2_section, "Penalty weight (0=ignore, 1=full)", 0.35)
 
         stage3_section = self._section(
             f, "Stage 3 -- validation gate",
@@ -3346,6 +3551,20 @@ class MainWindow:
         if self._last_champion_html_path:
             webbrowser.open(f"file://{self._last_champion_html_path.resolve()}")
 
+    def _search_choose_pair_csv(self):
+        path = filedialog.askopenfilename(
+            title="Select the second instrument's market data CSV (for the stat_pairs family)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._search_pair_csv_path = path
+        self.search_pair_csv_label.config(text=os.path.basename(path), fg=TEXT)
+
+    def _search_clear_pair_csv(self):
+        self._search_pair_csv_path = None
+        self.search_pair_csv_label.config(text="No pair instrument selected.", fg=TEXT_MUTED)
+
     def _build_search_stage_config(self) -> SearchStageConfig:
         metric_label = self.search_metric.get_str()
         metric_key = self._refine_metric_label_to_key.get(metric_label, "composite_prop_score")
@@ -3364,6 +3583,9 @@ class MainWindow:
             fitness_metric=metric_key,
             workers=workers,
             random_seed=self.search_seed.get_int(42),
+            cost_stress_enabled=self.search_cost_stress_enabled.get(),
+            cost_stress_multiplier=self.search_cost_stress_multiplier.get_float(2.0),
+            cost_stress_penalty_weight=self.search_cost_stress_weight.get_float(0.35),
         )
 
     def _search_run_clicked(self):
@@ -3545,6 +3767,21 @@ class MainWindow:
                 df, _labels = merge_multi_timeframe([r.dataframe for _, r in per_file_results])
             self._log_search(f"Loaded {len(df)} bars.")
 
+            has_pair_data = False
+            if self._search_pair_csv_path:
+                pair_result = import_csv(str(store_csv_path(self._search_pair_csv_path)))
+                if not pair_result.is_valid:
+                    self._log_search(
+                        "Pair CSV import errors:\n" + "\n".join(pair_result.errors)
+                    )
+                    return
+                df = merge_pair_series(df, pair_result.dataframe)
+                has_pair_data = True
+                self._log_search(
+                    f"Merged pair instrument from {os.path.basename(self._search_pair_csv_path)} "
+                    "(enables the 'stat_pairs' family)."
+                )
+
             risk = self._build_risk_config()
             rules = self._build_prop_rules()
 
@@ -3567,6 +3804,7 @@ class MainWindow:
                     mode="family", family=family_key,
                     max_candidates=self.search_max_candidates.get_int(500),
                     seed=self.search_seed.get_int(42),
+                    has_pair_data=has_pair_data,
                 )
 
             # (run_search() itself logs the "Search space ready..." line via
@@ -3622,6 +3860,8 @@ class MainWindow:
 
         except StrategySpaceError as exc:
             self._log_search(f"\nSearch space error: {exc}")
+        except PairDataError as exc:
+            self._log_search(f"\nPair CSV error: {exc}")
         except StrategyError as exc:
             self._log_search(f"\nStrategy error: {exc}")
         except Exception:
@@ -4547,6 +4787,237 @@ class MainWindow:
             self._log_wfga("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.wfga_progress.stop()
+
+
+    # -----------------------------------------------------------------------
+    # Tab 14 — Multi-Strategy Ensemble (blend or vote)
+    # -----------------------------------------------------------------------
+
+    _ENSEMBLE_MODE_LABELS = {
+        "Blend (each strategy trades independently, correlation-adjusted risk)": "blend",
+        "Vote (one combined signal, entered only once enough strategies agree)": "vote",
+    }
+
+    def _build_ensemble_tab(self):
+        f = self._scrollable(self.tab_ensemble)
+
+        self._page_header(
+            f,
+            "14 / Finding an Edge",
+            "Multi-Strategy Ensemble",
+            "The mirror case of Step 11's Multi-Asset Portfolio: several DIFFERENT "
+            "strategies combined on the SAME instrument, instead of one strategy across "
+            "several instruments. Two modes -- Blend keeps every strategy trading "
+            "independently at a correlation-adjusted share of the account's risk budget "
+            "(reuses the Portfolio feature's own math); Vote combines every strategy's "
+            "signal into one entry, taken only once enough of them agree on direction. "
+            "Uses the market data currently selected on Step 1.",
+        )
+
+        legs_section = self._section(
+            f, "Strategy legs (at least 2 required)",
+            "Python (.py), PineScript (.pine), or MQL5 (.mq5) files -- mixing types in "
+            "the same ensemble is fine, each is detected by extension. Each leg trades "
+            "the SAME instrument, using the SAME base risk settings from Step 4.",
+            emphasize=True,
+        )
+        legs_frame = Frame(legs_section, bg=PANEL)
+        legs_frame.pack(fill="both", expand=True, padx=18, pady=(2, 8))
+
+        self.ensemble_leg_listbox = Listbox(
+            legs_frame, height=6, selectmode=EXTENDED, exportselection=False,
+            bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.ensemble_leg_listbox.pack(side="left", fill="both", expand=True)
+        leg_scroll = ttk.Scrollbar(legs_frame, orient="vertical", command=self.ensemble_leg_listbox.yview, style="T58.Vertical.TScrollbar")
+        leg_scroll.pack(side="right", fill="y")
+        self.ensemble_leg_listbox.config(yscrollcommand=leg_scroll.set)
+
+        leg_btn_row = Frame(legs_section, bg=PANEL)
+        leg_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
+        self._button(leg_btn_row, "ADD STRATEGY FILES...", self._ensemble_add_legs, primary=True).pack(side="left")
+        self._button(leg_btn_row, "REMOVE SELECTED", self._ensemble_remove_legs).pack(side="left", padx=8)
+        self._button(leg_btn_row, "CLEAR ALL", self._ensemble_clear_legs).pack(side="left")
+
+        self._ensemble_leg_paths: list[Path] = []
+
+        settings = self._section(f, "Ensemble settings", "")
+        self.ensemble_mode = LabeledCombo(
+            settings, "Combination mode", list(self._ENSEMBLE_MODE_LABELS.keys()),
+            "Blend (each strategy trades independently, correlation-adjusted risk)",
+        )
+        self.ensemble_min_agreement = LabeledEntry(settings, "Min agreement (Vote mode only)", 2)
+        self.ensemble_balance = LabeledEntry(settings, "Shared initial account balance ($)", 100000)
+        self.ensemble_corr_strength = LabeledEntry(
+            settings, "Correlation penalty strength (Blend mode, 0=ignore, 1=full re-weighting)", 0.6,
+        )
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN ENSEMBLE BACKTEST", self._ensemble_run_clicked, primary=True).pack(side="left")
+        self.open_ensemble_report_btn = self._button(button_row, "OPEN REPORT", self._open_ensemble_report)
+        self.open_ensemble_report_btn.config(state="disabled")
+        self.open_ensemble_report_btn.pack(side="left", padx=8)
+
+        self.ensemble_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.ensemble_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Ensemble output", "Live progress log.")
+        self.ensemble_output = Text(
+            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.ensemble_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_ensemble_html_path = None
+
+    def _log_ensemble(self, msg: str):
+        self.ensemble_output.insert(END, msg + "\n")
+        self.ensemble_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_ensemble_report(self):
+        if self._last_ensemble_html_path:
+            webbrowser.open(f"file://{self._last_ensemble_html_path.resolve()}")
+
+    def _ensemble_add_legs(self):
+        paths = filedialog.askopenfilenames(
+            title="Add strategy files for this ensemble (Python / PineScript / MQL5)",
+            filetypes=[
+                ("Supported strategy files", "*.py *.pine *.pinescript *.mq5 *.mqh *.txt"),
+                ("Python strategies", "*.py"),
+                ("PineScript strategies", "*.pine *.pinescript *.txt"),
+                ("MQL5 strategies", "*.mq5 *.mqh"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        existing = {str(p) for p in self._ensemble_leg_paths}
+        for p in paths:
+            if p not in existing:
+                self._ensemble_leg_paths.append(Path(p))
+                self.ensemble_leg_listbox.insert(END, f"  {Path(p).name}")
+
+    def _ensemble_remove_legs(self):
+        sel = list(self.ensemble_leg_listbox.curselection())
+        for i in reversed(sel):
+            self.ensemble_leg_listbox.delete(i)
+            del self._ensemble_leg_paths[i]
+
+    def _ensemble_clear_legs(self):
+        self.ensemble_leg_listbox.delete(0, END)
+        self._ensemble_leg_paths = []
+
+    def _ensemble_run_clicked(self):
+        if len(self._ensemble_leg_paths) < 2:
+            messagebox.showwarning(
+                "Not enough legs",
+                "An ensemble requires at least 2 strategy legs -- use ADD STRATEGY FILES above.",
+            )
+            return
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.ensemble_output.delete("1.0", END)
+        self.open_ensemble_report_btn.config(state="disabled")
+        self.ensemble_progress.start(10)
+        threading.Thread(target=self._ensemble_run_pipeline, daemon=True).start()
+
+    def _ensemble_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_ensemble)
+            if df is None:
+                return
+
+            strategies, names = [], []
+            for path in self._ensemble_leg_paths:
+                try:
+                    strategies.append(self._load_bulk_strategy(path))
+                except (StrategyError, Exception) as exc:
+                    self._log_ensemble(f"Skipped '{path.name}' -- could not load strategy: {exc}")
+                    continue
+                names.append(path.stem)
+            if len(strategies) < 2:
+                self._log_ensemble("\nFewer than 2 strategy legs loaded successfully -- nothing to combine.")
+                return
+            self._log_ensemble(f"Loaded {len(strategies)} strategy leg(s): {', '.join(names)}")
+
+            mode_label = self.ensemble_mode.get_str()
+            mode = self._ENSEMBLE_MODE_LABELS.get(mode_label, "blend")
+            balance = self.ensemble_balance.get_float(100000)
+            risk = RiskConfig(initial_balance=balance)
+            instrument = (
+                os.path.basename(self.csv_paths[0]) if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+
+            if mode == "blend":
+                self._log_ensemble(f"Running blend ensemble across {len(strategies)} strategies...")
+                config = PortfolioConfig(
+                    initial_balance=balance,
+                    correlation_penalty_strength=self.ensemble_corr_strength.get_float(0.6),
+                )
+                result = run_ensemble_blend(df, strategies, risk, names=names, config=config)
+                paths = generate_portfolio_report(OUTPUT_DIR / "ensemble", result)
+                self._last_ensemble_html_path = paths["html"]
+                self.open_ensemble_report_btn.config(state="normal")
+                self._log_ensemble(f"  Combined net profit: ${result.combined_statistics.net_profit:,.2f}")
+                for w in result.warnings:
+                    self._log_ensemble(f"  WARNING: {w}")
+                self._log_ensemble("\nDone. Ensemble (blend) report written to:")
+                for k, p in paths.items():
+                    self._log_ensemble(f"  {k}: {p}")
+
+            elif mode == "vote":
+                min_agreement = self.ensemble_min_agreement.get_int(2)
+                self._log_ensemble(
+                    f"Running vote ensemble across {len(strategies)} strategies "
+                    f"(min_agreement={min_agreement})..."
+                )
+                bt_result = run_ensemble_vote(
+                    df, strategies, risk, names=names,
+                    vote_config=EnsembleVoteConfig(min_agreement=min_agreement),
+                )
+                self._log_ensemble(
+                    f"  Trades: {len(bt_result.trades)}  Net profit: ${bt_result.statistics.net_profit:,.2f}"
+                )
+                if not bt_result.trades:
+                    self._log_ensemble("\nNo trades were generated by this vote ensemble -- nothing further to report.")
+                    return
+                rules = PropRules(account_size=balance)
+                period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
+                trade_pnls = [t.pnl for t in bt_result.trades]
+                trade_dates = [t.entry_time for t in bt_result.trades]
+                single_run = simulate_account(trade_pnls, trade_dates, rules)
+                mc_cfg = self._validation_mc_config()
+                mc_result = run_monte_carlo(bt_result.trades, rules, mc_cfg)
+                paths = generate_full_report(
+                    output_dir=OUTPUT_DIR / "ensemble", strategy_name=bt_result.strategy_name,
+                    strategy_source_type="ensemble_vote", instrument=instrument, timeframe="unknown",
+                    backtest_period=period, backtest_result=bt_result, prop_rules=rules,
+                    prop_single_run=single_run, monte_carlo_result=mc_result, holdout_comparison=None,
+                    risk_config=risk, price_df=df,
+                )
+                self._last_ensemble_html_path = paths["html"]
+                self.open_ensemble_report_btn.config(state="normal")
+                self._log_ensemble(f"  Evaluation pass probability: {mc_result.evaluation_pass_probability:.1f}%")
+                self._log_ensemble("\nDone. Ensemble (vote) report written to:")
+                for k, p in paths.items():
+                    self._log_ensemble(f"  {k}: {p}")
+            else:
+                self._log_ensemble(f"\nUnknown ensemble mode '{mode_label}'.")
+        except EnsembleError as exc:
+            self._log_ensemble(f"\nEnsemble error: {exc}")
+        except StrategyError as exc:
+            self._log_ensemble(f"\nStrategy error: {exc}")
+        except Exception:
+            self._log_ensemble("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.ensemble_progress.stop()
 
 
 def launch():

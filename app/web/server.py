@@ -36,6 +36,11 @@ from flask import (
 
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
+from app.data import alpaca_credentials
+from app.data.alpaca_source import (
+    ASSET_CLASSES, ADJUSTMENT_CHOICES, FEED_CHOICES, TIMEFRAME_LABELS,
+    AlpacaFetchError, AlpacaImportError, fetch_bars, save_bars_as_csv,
+)
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
@@ -270,6 +275,20 @@ def _saved_strategies_json() -> str:
     })
 
 
+def _alpaca_template_context() -> dict:
+    """Shared context injected wherever the Market Data card is rendered
+    (index.html today) -- the dropdown/option lists plus whether keys are
+    already saved, so the form can pre-check "save keys" and (for privacy)
+    never echo a saved secret back into the page source."""
+    return {
+        "alpaca_asset_classes": ASSET_CLASSES,
+        "alpaca_timeframes": TIMEFRAME_LABELS,
+        "alpaca_feeds": FEED_CHOICES,
+        "alpaca_adjustments": ADJUSTMENT_CHOICES,
+        "alpaca_has_saved_keys": alpaca_credentials.has_saved_credentials(),
+    }
+
+
 @app.route("/")
 def index():
     return render_template(
@@ -277,8 +296,77 @@ def index():
         stored_datasets=list_stored_datasets(),
         saved_strategies_json=_saved_strategies_json(),
         strategy_notice=request.args.get("strategy_notice"),
+        alpaca_notice=request.args.get("alpaca_notice"),
+        alpaca_notice_kind=request.args.get("alpaca_notice_kind", "info"),
         strategy_statuses=STRATEGY_STATUSES,
+        **_alpaca_template_context(),
     )
+
+
+@app.route("/data/alpaca/fetch", methods=["POST"])
+def data_alpaca_fetch():
+    """Fetches bars from Alpaca and saves them into data/raw/<SYMBOL>/,
+    same as the desktop app's FETCH & SAVE button. A plain form POST (not
+    AJAX) to stay consistent with the rest of this page and to keep
+    working with JS disabled; redirects back to '/' with a short notice."""
+    form = request.form
+    api_key = (form.get("alpaca_api_key") or "").strip()
+    secret_key = (form.get("alpaca_secret_key") or "").strip()
+    save_keys = form.get("alpaca_save_keys") == "on"
+
+    # A blank, masked secret field means "keep using the saved one" -- the
+    # page never echoes a real saved secret back into the HTML.
+    if not api_key or not secret_key:
+        saved = alpaca_credentials.load_credentials()
+        if saved:
+            api_key = api_key or saved.api_key
+            secret_key = secret_key or saved.secret_key
+
+    symbols = [s.strip() for s in (form.get("alpaca_symbols") or "").split(",") if s.strip()]
+    asset_class = form.get("alpaca_asset_class") or ASSET_CLASSES[0]
+    timeframe_label = form.get("alpaca_timeframe") or TIMEFRAME_LABELS[0]
+    start = (form.get("alpaca_start") or "").strip()
+    end = (form.get("alpaca_end") or "").strip()
+    feed = form.get("alpaca_feed") or FEED_CHOICES[0]
+    adjustment = form.get("alpaca_adjustment") or ADJUSTMENT_CHOICES[0]
+
+    if not api_key or not secret_key:
+        return redirect(url_for("index", alpaca_notice="Enter both an API key and a secret key.", alpaca_notice_kind="error"))
+    if not symbols:
+        return redirect(url_for("index", alpaca_notice="Enter at least one symbol.", alpaca_notice_kind="error"))
+
+    if save_keys:
+        alpaca_credentials.save_credentials(api_key, secret_key)
+
+    saved_names, errors = [], []
+    for symbol in symbols:
+        try:
+            df = fetch_bars(
+                api_key, secret_key, symbol, asset_class, timeframe_label, start, end,
+                feed=feed, adjustment=adjustment,
+            )
+            dest = save_bars_as_csv(df, symbol, timeframe_label)
+            saved_names.append(dest.relative_to(get_raw_data_dir()).as_posix())
+        except (AlpacaImportError, AlpacaFetchError) as exc:
+            errors.append(f"{symbol}: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive
+            errors.append(f"{symbol}: unexpected error ({exc})")
+
+    if saved_names and not errors:
+        notice, kind = f"Saved {len(saved_names)} file(s): {', '.join(saved_names)}.", "success"
+    elif saved_names and errors:
+        notice = f"Saved {len(saved_names)} file(s): {', '.join(saved_names)}. Failed: {'; '.join(errors)}"
+        kind = "warning"
+    else:
+        notice, kind = f"Fetch failed: {'; '.join(errors)}", "error"
+
+    return redirect(url_for("index", alpaca_notice=notice, alpaca_notice_kind=kind))
+
+
+@app.route("/data/alpaca/forget", methods=["POST"])
+def data_alpaca_forget():
+    alpaca_credentials.clear_credentials()
+    return redirect(url_for("index", alpaca_notice="Saved Alpaca keys removed from this computer.", alpaca_notice_kind="success"))
 
 
 @app.route("/dashboard")
@@ -449,7 +537,7 @@ def run_pipeline():
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(request.form, request.files)
         if dataset_error:
-            return render_template("index.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+            return render_template("index.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **_alpaca_template_context()), 400
 
         form = request.form
         strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
@@ -511,7 +599,7 @@ def run_pipeline():
                 "This usually means the strategy's entry conditions never "
                 "fired for this data/date range rather than an app problem."
             )
-            return render_template("index.html", error=msg, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+            return render_template("index.html", error=msg, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **_alpaca_template_context()), 400
 
         n_sims = int(form.get("n_sims", 5000))
         mc_cfg = MonteCarloConfig(n_simulations=min(n_sims, 50_000), method=form.get("mc_method", "bootstrap"))
@@ -558,6 +646,7 @@ def run_pipeline():
             "index.html",
             stored_datasets=list_stored_datasets(),
             saved_strategies_json=_saved_strategies_json(),
+            **_alpaca_template_context(),
             result={
                 "active_dataset": active_label,
                 "import_note": import_note,
@@ -579,9 +668,9 @@ def run_pipeline():
             },
         )
     except StrategyError as exc:
-        return render_template("index.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+        return render_template("index.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **_alpaca_template_context()), 400
     except Exception as exc:  # noqa: BLE001
-        return render_template("index.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 500
+        return render_template("index.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **_alpaca_template_context()), 500
 
 
 @app.route("/reports/<path:filename>")

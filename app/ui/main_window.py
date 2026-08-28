@@ -35,12 +35,20 @@ from app.data.importer import import_csv
 from app.data.multi_timeframe import merge_multi_timeframe
 from app.data.storage import EMPTY_DATASET_BYTES, list_datasets_by_instrument, list_stored_datasets, store_csv_path
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
-from app.optimize.parameter_space import RefinementError
+from app.optimize.parameter_space import RefinementError, apply_genome, extract_genome
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
+from app.optimize.multi_objective import DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement
+from app.optimize.walkforward_ga import run_walkforward_aware_refinement
+from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
 from app.reports import run_history
 from app.reports.refinement_report import generate_refinement_report
+from app.reports.validation_reports import (
+    generate_cpcv_report, generate_multi_objective_report, generate_pbo_report,
+    generate_portfolio_report, generate_sensitivity_report, generate_walk_forward_report,
+    generate_walkforward_ga_report,
+)
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
 from app.search.search_report import generate_search_report
 from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
@@ -59,6 +67,10 @@ from app.strategy.mql5 import MQL5Strategy
 from app.strategy.pinescript import PineScriptStrategy
 from app.strategy.python import PythonStrategy
 from app.ui.condition_builder import ConditionList
+from app.validation.cpcv import CPCVError, compute_pbo, run_cpcv
+from app.validation.sensitivity import compute_1d_sensitivity, compute_2d_heatmap, list_tunable_parameters
+from app.validation.walk_forward_opt import run_walk_forward_optimization
+import random
 
 OUTPUT_DIR = Path.cwd() / "reports"
 
@@ -291,10 +303,18 @@ class MainWindow:
         self.tab_run = Frame(self.content, bg=BG)
         self.tab_refine = Frame(self.content, bg=BG)
         self.tab_search = Frame(self.content, bg=BG)
+        self.tab_wfo = Frame(self.content, bg=BG)
+        self.tab_cpcv = Frame(self.content, bg=BG)
+        self.tab_sensitivity = Frame(self.content, bg=BG)
+        self.tab_portfolio = Frame(self.content, bg=BG)
+        self.tab_multiobj = Frame(self.content, bg=BG)
+        self.tab_wfga = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
+            self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
+            self.tab_multiobj, self.tab_wfga,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -308,6 +328,13 @@ class MainWindow:
             ("run", "\u25B6", "05  RUN & REPORT", self.tab_run),
             ("refine", "\u21BB", "06  REFINEMENT", self.tab_refine),
             ("search", "\u25A6", "07  SEARCH LAB", self.tab_search),
+            (None, None, None, None),  # divider — Validation Lab group
+            ("wfo", "\u21C6", "08  WALK-FORWARD OPT", self.tab_wfo),
+            ("cpcv", "\u25C9", "09  CPCV / PBO", self.tab_cpcv),
+            ("sensitivity", "\u2AF6", "10  SENSITIVITY", self.tab_sensitivity),
+            ("portfolio", "\u25C7", "11  PORTFOLIO", self.tab_portfolio),
+            ("multiobj", "\u2696", "12  MULTI-OBJECTIVE", self.tab_multiobj),
+            ("wfga", "\u21BB", "13  WALK-FORWARD GA", self.tab_wfga),
         ]
         self._nav_buttons: dict[str, Label] = {}
         self._build_sidebar_nav()
@@ -321,6 +348,12 @@ class MainWindow:
         self._build_run_tab()
         self._build_refine_tab()
         self._build_search_tab()
+        self._build_wfo_tab()
+        self._build_cpcv_tab()
+        self._build_sensitivity_tab()
+        self._build_portfolio_tab()
+        self._build_multiobj_tab()
+        self._build_wfga_tab()
 
         self._show_page("dashboard")
 
@@ -3630,6 +3663,890 @@ class MainWindow:
         finally:
             self.promote_champion_btn.config(state="normal")
             self.search_progress.stop()
+
+
+    # -----------------------------------------------------------------------
+    # Validation Lab — shared helpers used by all six tabs below
+    # -----------------------------------------------------------------------
+
+    def _load_df_for_page(self, log_fn) -> "pd.DataFrame | None":
+        """Loads (and, if multiple files are selected on Step 1, merges) the
+        currently-selected market data the exact same way every other tab
+        does. Returns None (after logging why) if nothing usable is
+        selected -- callers should stop rather than proceed with no data."""
+        if not self.csv_paths:
+            log_fn("Please select a market data CSV in Step 1 (Market Data) first.")
+            return None
+        per_file_results = []
+        for p in self.csv_paths:
+            result = import_csv(p)
+            if not result.is_valid:
+                log_fn(f"Import errors ({os.path.basename(p)}):\n" + "\n".join(result.errors))
+                return None
+            per_file_results.append((p, result))
+        if len(per_file_results) == 1:
+            df = per_file_results[0][1].dataframe
+        else:
+            df, _labels = merge_multi_timeframe([r.dataframe for _, r in per_file_results])
+        log_fn(f"Loaded {len(df)} bars.")
+        return df
+
+    def _validation_mc_config(self, n_simulations: int | None = None) -> MonteCarloConfig:
+        n_sims = n_simulations if n_simulations is not None else self.mc_sims.get_int(10000)
+        method = self.mc_method.get_str().strip() or "bootstrap"
+        return MonteCarloConfig(n_simulations=n_sims, method=method)
+
+    # -----------------------------------------------------------------------
+    # Tab 8 — Walk-Forward Optimization
+    # -----------------------------------------------------------------------
+
+    def _build_wfo_tab(self):
+        f = self._scrollable(self.tab_wfo)
+
+        self._page_header(
+            f,
+            "08 / Validation Lab",
+            "Walk-Forward Optimization",
+            "Re-optimizes this strategy fresh on each rolling or anchored fold's "
+            "training window using a small GA search, applies the winning "
+            "configuration UNCHANGED to that fold's held-out test window, and "
+            "chains every fold's out-of-sample trades into one continuous equity "
+            "curve. This is the number to trust over a single in-sample backtest "
+            "-- it never lets a fold's optimizer see the data it will be judged on.",
+        )
+
+        settings = self._section(
+            f, "Fold settings",
+            "'Rolling' slides a fixed-size train window forward each fold (better if "
+            "you suspect a regime-dependent edge). 'Anchored' always starts training "
+            "at bar 0 and grows it (better if you believe the edge is stable "
+            "over time, so more data only helps).",
+            emphasize=True,
+        )
+        self.wfo_window_mode = LabeledCombo(settings, "Window mode", ["rolling", "anchored"], "rolling")
+        self.wfo_folds = LabeledEntry(settings, "Number of folds", 5)
+        self.wfo_train_frac = LabeledEntry(settings, "Train fraction per fold (rolling mode)", 0.6)
+
+        ga_settings = self._section(
+            f, "Per-fold GA search settings",
+            "A fresh, smaller GA search runs once per fold -- keep these modest, "
+            "since the total work is population x generations x folds.",
+        )
+        self._wfo_metric_labels = list(FITNESS_METRICS.values())
+        self._wfo_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
+        self.wfo_metric = LabeledCombo(
+            ga_settings, "Fitness metric", self._wfo_metric_labels, FITNESS_METRICS["composite_prop_score"],
+        )
+        self.wfo_population = LabeledEntry(ga_settings, "Population size per fold", 8)
+        self.wfo_generations = LabeledEntry(ga_settings, "Generations per fold", 3)
+        self.wfo_seed = LabeledEntry(ga_settings, "Random seed", 42)
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN WALK-FORWARD OPTIMIZATION", self._wfo_run_clicked, primary=True).pack(side="left")
+        self.open_wfo_report_btn = self._button(button_row, "OPEN REPORT", self._open_wfo_report)
+        self.open_wfo_report_btn.config(state="disabled")
+        self.open_wfo_report_btn.pack(side="left", padx=8)
+
+        self.wfo_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.wfo_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Walk-forward output", "Live progress log.")
+        self.wfo_output = Text(
+            output_section, height=18, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.wfo_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_wfo_html_path = None
+
+    def _log_wfo(self, msg: str):
+        self.wfo_output.insert(END, msg + "\n")
+        self.wfo_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_wfo_report(self):
+        if self._last_wfo_html_path:
+            webbrowser.open(f"file://{self._last_wfo_html_path.resolve()}")
+
+    def _wfo_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.wfo_output.delete("1.0", END)
+        self.wfo_progress.start(10)
+        threading.Thread(target=self._wfo_run_pipeline, daemon=True).start()
+
+    def _wfo_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_wfo)
+            if df is None:
+                return
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            mc_cfg = self._validation_mc_config()
+
+            metric_key = self._wfo_metric_label_to_key.get(self.wfo_metric.get_str(), "composite_prop_score")
+            refine_cfg = RefinementConfig(
+                population_size=self.wfo_population.get_int(8),
+                generations=self.wfo_generations.get_int(3),
+                fitness_metric=metric_key,
+                random_seed=self.wfo_seed.get_int(42),
+            )
+
+            self._log_wfo("Starting walk-forward optimization...")
+            result = run_walk_forward_optimization(
+                df, strategy, risk, rules, mc_cfg,
+                n_folds=self.wfo_folds.get_int(5),
+                window_mode=self.wfo_window_mode.get_str(),
+                train_frac=self.wfo_train_frac.get_float(0.6),
+                refine_cfg=refine_cfg,
+                random_seed=self.wfo_seed.get_int(42),
+                progress_cb=self._log_wfo,
+            )
+            paths = generate_walk_forward_report(OUTPUT_DIR / "walk_forward", result)
+            self._last_wfo_html_path = paths["html"]
+            self.open_wfo_report_btn.config(state="normal")
+            self._log_wfo("\nDone. Walk-forward optimization report written to:")
+            for k, p in paths.items():
+                self._log_wfo(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_wfo(f"\nStrategy error: {exc}")
+        except RefinementError as exc:
+            self._log_wfo(f"\nWalk-forward optimization error: {exc}")
+        except Exception:
+            self._log_wfo("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.wfo_progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Tab 9 — CPCV / PBO
+    # -----------------------------------------------------------------------
+
+    def _build_cpcv_tab(self):
+        f = self._scrollable(self.tab_cpcv)
+
+        self._page_header(
+            f,
+            "09 / Validation Lab",
+            "Combinatorial Purged Cross-Validation & PBO",
+            "CPCV stress-tests this strategy across many different combinatorial "
+            "train/test partitions of the same data, instead of just one holdout "
+            "split. Probability of Backtest Overfitting (PBO) goes further: it "
+            "checks a small POOL of candidate configurations (this strategy plus "
+            "a few automatically perturbed variants) and reports the probability "
+            "that whichever one looks best in-sample is really just noise.",
+        )
+
+        cpcv_settings = self._section(
+            f, "CPCV settings (single strategy)",
+            "Splits the data into N groups and evaluates every combination of "
+            "k groups as the test set, with the rest as train.",
+            emphasize=True,
+        )
+        self.cpcv_n_groups = LabeledEntry(cpcv_settings, "Number of groups (N)", 6)
+        self.cpcv_n_test_groups = LabeledEntry(cpcv_settings, "Test groups per path (k)", 2)
+        self.cpcv_metric = LabeledEntry(cpcv_settings, "Metric (e.g. profit_factor, sharpe_ratio, net_profit)", "profit_factor")
+        self.cpcv_max_paths = LabeledEntry(cpcv_settings, "Max combinatorial paths to evaluate", 30)
+
+        cpcv_btn_row = Frame(f, bg=BG)
+        cpcv_btn_row.pack(fill="x", padx=24, pady=(4, 4))
+        self._button(cpcv_btn_row, "RUN CPCV", self._cpcv_run_clicked, primary=True).pack(side="left")
+        self.open_cpcv_report_btn = self._button(cpcv_btn_row, "OPEN CPCV REPORT", self._open_cpcv_report)
+        self.open_cpcv_report_btn.config(state="disabled")
+        self.open_cpcv_report_btn.pack(side="left", padx=8)
+
+        Frame(f, bg=BORDER, height=1).pack(fill="x", padx=24, pady=14)
+
+        pbo_settings = self._section(
+            f, "PBO settings (candidate pool)",
+            "The pool is this strategy's own configuration plus N-1 variants "
+            "with its numeric parameters randomly perturbed -- a quick, "
+            "self-contained way to check whether the search process itself is "
+            "trustworthy. For a genuine multi-strategy PBO, use the CLI "
+            "(--pbo) or call app.validation.cpcv.compute_pbo() directly with a "
+            "Search Lab leaderboard slice.",
+        )
+        self.pbo_n_groups = LabeledEntry(pbo_settings, "Number of groups (N)", 6)
+        self.pbo_n_test_groups = LabeledEntry(pbo_settings, "Test groups per path (k)", 2)
+        self.pbo_metric = LabeledEntry(pbo_settings, "Metric to rank candidates by", "sharpe_ratio")
+        self.pbo_max_paths = LabeledEntry(pbo_settings, "Max combinatorial paths to evaluate", 30)
+        self.pbo_n_candidates = LabeledEntry(pbo_settings, "Number of candidates (baseline + perturbed)", 5)
+        self.pbo_seed = LabeledEntry(pbo_settings, "Random seed (candidate perturbation)", 42)
+
+        pbo_btn_row = Frame(f, bg=BG)
+        pbo_btn_row.pack(fill="x", padx=24, pady=(4, 10))
+        self._button(pbo_btn_row, "RUN PBO", self._pbo_run_clicked, primary=True).pack(side="left")
+        self.open_pbo_report_btn = self._button(pbo_btn_row, "OPEN PBO REPORT", self._open_pbo_report)
+        self.open_pbo_report_btn.config(state="disabled")
+        self.open_pbo_report_btn.pack(side="left", padx=8)
+
+        self.cpcv_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.cpcv_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "CPCV / PBO output", "Live progress log.")
+        self.cpcv_output = Text(
+            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.cpcv_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_cpcv_html_path = None
+        self._last_pbo_html_path = None
+
+    def _log_cpcv(self, msg: str):
+        self.cpcv_output.insert(END, msg + "\n")
+        self.cpcv_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_cpcv_report(self):
+        if self._last_cpcv_html_path:
+            webbrowser.open(f"file://{self._last_cpcv_html_path.resolve()}")
+
+    def _open_pbo_report(self):
+        if self._last_pbo_html_path:
+            webbrowser.open(f"file://{self._last_pbo_html_path.resolve()}")
+
+    def _cpcv_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.cpcv_output.delete("1.0", END)
+        self.cpcv_progress.start(10)
+        threading.Thread(target=self._cpcv_run_pipeline, daemon=True).start()
+
+    def _cpcv_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_cpcv)
+            if df is None:
+                return
+            risk = self._build_risk_config()
+            # A fresh Strategy instance per call, since some strategy sources
+            # cache state keyed to the data they last saw.
+            strategy_builder = self._build_strategy
+
+            self._log_cpcv("Running CPCV...")
+            result = run_cpcv(
+                df, strategy_builder, risk,
+                n_groups=self.cpcv_n_groups.get_int(6),
+                n_test_groups=self.cpcv_n_test_groups.get_int(2),
+                metric=self.cpcv_metric.get_str().strip() or "profit_factor",
+                max_paths=self.cpcv_max_paths.get_int(30),
+            )
+            paths = generate_cpcv_report(OUTPUT_DIR / "cpcv", result)
+            self._last_cpcv_html_path = paths["html"]
+            self.open_cpcv_report_btn.config(state="normal")
+            self._log_cpcv(f"  Mean OOS {result.metric}: {result.mean_oos_metric:.3f}  (robust: {result.is_robust})")
+            self._log_cpcv("\nDone. CPCV report written to:")
+            for k, p in paths.items():
+                self._log_cpcv(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_cpcv(f"\nStrategy error: {exc}")
+        except CPCVError as exc:
+            self._log_cpcv(f"\nCPCV error: {exc}")
+        except Exception:
+            self._log_cpcv("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.cpcv_progress.stop()
+
+    def _pbo_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.cpcv_output.delete("1.0", END)
+        self.cpcv_progress.start(10)
+        threading.Thread(target=self._pbo_run_pipeline, daemon=True).start()
+
+    def _pbo_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_cpcv)
+            if df is None:
+                return
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+
+            n_candidates = self.pbo_n_candidates.get_int(5)
+            specs = [{"source_type": strategy.source_type,
+                      "config": dict(strategy.config)} if strategy.source_type == "manual"
+                     else {"source_type": strategy.source_type, "code_text": Path(strategy.file_path).read_text(),
+                           "code_extension": Path(strategy.file_path).suffix}]
+
+            if strategy.source_type == "manual":
+                genes = extract_genome(strategy.config)
+                rng = random.Random(self.pbo_seed.get_int(42))
+                for _ in range(max(n_candidates - 1, 0)):
+                    if not genes:
+                        break
+                    genome = [max(min(g.base_value + rng.uniform(-0.3, 0.3) * (g.hi - g.lo), g.hi), g.lo) for g in genes]
+                    specs.append({"source_type": "manual", "config": apply_genome(strategy.config, genes, genome)})
+                if not genes:
+                    self._log_cpcv(
+                        "This strategy has no tunable numeric parameters -- PBO will run "
+                        "with a single candidate, which is a degenerate (but still valid) case."
+                    )
+            else:
+                self._log_cpcv(
+                    f"'{strategy.source_type}' candidate perturbation isn't wired up in the "
+                    "desktop UI yet -- running PBO with just this one strategy as the pool "
+                    "(degenerate case). Use the CLI or compute_pbo() directly for a real "
+                    "multi-candidate code-strategy pool."
+                )
+
+            self._log_cpcv(f"Running PBO across {len(specs)} candidate(s)...")
+            result = compute_pbo(
+                df, specs, risk,
+                n_groups=self.pbo_n_groups.get_int(6),
+                n_test_groups=self.pbo_n_test_groups.get_int(2),
+                metric=self.pbo_metric.get_str().strip() or "sharpe_ratio",
+                max_paths=self.pbo_max_paths.get_int(30),
+            )
+            paths = generate_pbo_report(OUTPUT_DIR / "pbo", result)
+            self._last_pbo_html_path = paths["html"]
+            self.open_pbo_report_btn.config(state="normal")
+            self._log_cpcv(f"  PBO: {result.pbo * 100:.1f}%")
+            self._log_cpcv("\nDone. PBO report written to:")
+            for k, p in paths.items():
+                self._log_cpcv(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_cpcv(f"\nStrategy error: {exc}")
+        except CPCVError as exc:
+            self._log_cpcv(f"\nPBO error: {exc}")
+        except Exception:
+            self._log_cpcv("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.cpcv_progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Tab 10 — Parameter Sensitivity
+    # -----------------------------------------------------------------------
+
+    def _build_sensitivity_tab(self):
+        f = self._scrollable(self.tab_sensitivity)
+
+        self._page_header(
+            f,
+            "10 / Validation Lab",
+            "Parameter Sensitivity",
+            "Sweeps every tunable numeric parameter across +/- a percentage of its "
+            "current value, holding everything else fixed, and flags a 'cliff' "
+            "wherever the metric drops sharply between adjacent steps -- the sign "
+            "of a knife-edge parameter rather than a real, stable plateau. "
+            "Optionally also produces a 2D heatmap for a chosen pair of parameters, "
+            "since two parameters can interact even when each looks fine alone.",
+        )
+
+        settings = self._section(
+            f, "Sweep settings",
+            "Applies to every tunable numeric parameter this strategy has.",
+            emphasize=True,
+        )
+        self.sens_metric = LabeledEntry(settings, "Metric (e.g. profit_factor, net_profit, sharpe_ratio)", "profit_factor")
+        self.sens_pct_range = LabeledEntry(settings, "Sweep range (+/- fraction of current value)", 0.5)
+        self.sens_steps = LabeledEntry(settings, "Steps per 1D sweep", 9)
+
+        heatmap_settings = self._section(
+            f, "Optional 2D heatmap",
+            "Click LIST PARAMETERS to discover this strategy's tunable parameter "
+            "labels, then pick two for a heatmap. Leave blank to skip the heatmap "
+            "and only run the 1D sweeps above.",
+        )
+        list_row = Frame(heatmap_settings, bg=PANEL)
+        list_row.pack(fill="x", padx=18, pady=(0, 6))
+        self._button(list_row, "LIST PARAMETERS", self._sens_list_parameters).pack(side="left")
+        self.sens_param_status = Label(
+            list_row, text="No parameters listed yet.", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8),
+        )
+        self.sens_param_status.pack(side="left", padx=10)
+
+        self.sens_heatmap_a = LabeledCombo(heatmap_settings, "Heatmap parameter A", [], "")
+        self.sens_heatmap_b = LabeledCombo(heatmap_settings, "Heatmap parameter B", [], "")
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN SENSITIVITY", self._sens_run_clicked, primary=True).pack(side="left")
+        self.open_sens_report_btn = self._button(button_row, "OPEN REPORT", self._open_sens_report)
+        self.open_sens_report_btn.config(state="disabled")
+        self.open_sens_report_btn.pack(side="left", padx=8)
+
+        self.sens_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.sens_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Sensitivity output", "Live progress log.")
+        self.sens_output = Text(
+            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.sens_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_sens_html_path = None
+
+    def _log_sens(self, msg: str):
+        self.sens_output.insert(END, msg + "\n")
+        self.sens_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_sens_report(self):
+        if self._last_sens_html_path:
+            webbrowser.open(f"file://{self._last_sens_html_path.resolve()}")
+
+    def _sens_list_parameters(self):
+        try:
+            strategy = self._build_strategy()
+            labels = list_tunable_parameters(strategy)
+            self.sens_heatmap_a.combo.config(values=labels)
+            self.sens_heatmap_b.combo.config(values=labels)
+            if labels:
+                self.sens_param_status.config(
+                    text=f"{len(labels)} parameter(s) found.", fg=GREEN,
+                )
+            else:
+                self.sens_param_status.config(
+                    text="This strategy has no tunable numeric parameters.", fg=AMBER,
+                )
+        except StrategyError as exc:
+            messagebox.showerror("Strategy error", str(exc))
+        except Exception:
+            messagebox.showerror("Error", traceback.format_exc())
+
+    def _sens_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.sens_output.delete("1.0", END)
+        self.sens_progress.start(10)
+        threading.Thread(target=self._sens_run_pipeline, daemon=True).start()
+
+    def _sens_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_sens)
+            if df is None:
+                return
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            mc_cfg = self._validation_mc_config(n_simulations=min(self.mc_sims.get_int(10000), 1000))
+            metric = self.sens_metric.get_str().strip() or "profit_factor"
+
+            self._log_sens("Running 1D sensitivity sweeps...")
+            sweeps = compute_1d_sensitivity(
+                df, strategy, risk, rules, mc_cfg, metric=metric,
+                pct_range=self.sens_pct_range.get_float(0.5), n_steps=self.sens_steps.get_int(9),
+            )
+            for r in sweeps:
+                flag = " <-- CLIFF" if r.cliff_detected else ""
+                self._log_sens(f"  {r.gene_label}: max adjacent-step drop {r.max_pct_drop_between_adjacent_steps:.0f}%{flag}")
+
+            heatmap = None
+            a_label, b_label = self.sens_heatmap_a.get_str().strip(), self.sens_heatmap_b.get_str().strip()
+            if a_label and b_label:
+                self._log_sens(f"Running 2D heatmap for {a_label} x {b_label}...")
+                heatmap = compute_2d_heatmap(df, strategy, risk, rules, mc_cfg, a_label, b_label, metric=metric)
+
+            paths = generate_sensitivity_report(OUTPUT_DIR / "sensitivity", sweeps, heatmap)
+            self._last_sens_html_path = paths["html"]
+            self.open_sens_report_btn.config(state="normal")
+            self._log_sens("\nDone. Sensitivity report written to:")
+            for k, p in paths.items():
+                self._log_sens(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_sens(f"\nStrategy error: {exc}")
+        except RefinementError as exc:
+            self._log_sens(f"\nSensitivity error: {exc}")
+        except Exception:
+            self._log_sens("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.sens_progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Tab 11 — Multi-Asset Portfolio
+    # -----------------------------------------------------------------------
+
+    def _build_portfolio_tab(self):
+        f = self._scrollable(self.tab_portfolio)
+
+        self._page_header(
+            f,
+            "11 / Validation Lab",
+            "Multi-Asset Portfolio",
+            "Applies the strategy currently configured on Step 2 to every instrument "
+            "listed below, computes the correlation matrix of their daily returns, "
+            "re-weights each instrument's risk (correlated instruments get sized "
+            "down), and merges every instrument's trades into one shared account "
+            "equity curve -- the way trading a portfolio out of one prop account "
+            "actually works.",
+        )
+
+        legs_section = self._section(
+            f, "Instrument legs (at least 2 required)",
+            "Each leg uses the SAME strategy configuration from Step 2 and the SAME "
+            "base risk settings from Step 4, applied to that instrument's own data.",
+            emphasize=True,
+        )
+        legs_frame = Frame(legs_section, bg=PANEL)
+        legs_frame.pack(fill="both", expand=True, padx=18, pady=(2, 8))
+
+        self.portfolio_leg_listbox = Listbox(
+            legs_frame, height=6, selectmode=SINGLE, exportselection=False,
+            bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.portfolio_leg_listbox.pack(side="left", fill="both", expand=True)
+        leg_scroll = ttk.Scrollbar(legs_frame, orient="vertical", command=self.portfolio_leg_listbox.yview, style="T58.Vertical.TScrollbar")
+        leg_scroll.pack(side="right", fill="y")
+        self.portfolio_leg_listbox.config(yscrollcommand=leg_scroll.set)
+
+        leg_btn_row = Frame(legs_section, bg=PANEL)
+        leg_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
+        self._button(leg_btn_row, "ADD LEG (CSV)", self._portfolio_add_leg, primary=True).pack(side="left")
+        self._button(leg_btn_row, "REMOVE SELECTED LEG", self._portfolio_remove_leg).pack(side="left", padx=8)
+
+        self._portfolio_legs: list[dict] = []
+
+        settings = self._section(f, "Portfolio settings", "")
+        self.portfolio_balance = LabeledEntry(settings, "Shared initial account balance ($)", 100000)
+        self.portfolio_corr_strength = LabeledEntry(
+            settings, "Correlation penalty strength (0=ignore, 1=full re-weighting)", 0.6,
+        )
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN PORTFOLIO BACKTEST", self._portfolio_run_clicked, primary=True).pack(side="left")
+        self.open_portfolio_report_btn = self._button(button_row, "OPEN REPORT", self._open_portfolio_report)
+        self.open_portfolio_report_btn.config(state="disabled")
+        self.open_portfolio_report_btn.pack(side="left", padx=8)
+
+        self.portfolio_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.portfolio_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Portfolio output", "Live progress log.")
+        self.portfolio_output = Text(
+            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.portfolio_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_portfolio_html_path = None
+
+    def _log_portfolio(self, msg: str):
+        self.portfolio_output.insert(END, msg + "\n")
+        self.portfolio_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_portfolio_report(self):
+        if self._last_portfolio_html_path:
+            webbrowser.open(f"file://{self._last_portfolio_html_path.resolve()}")
+
+    def _portfolio_add_leg(self):
+        path = filedialog.askopenfilename(
+            title="Select market data CSV for this instrument",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        weight = simpledialog.askfloat(
+            "Instrument weight",
+            f"Nominal (pre-correlation) risk weight for {os.path.basename(path)}:",
+            initialvalue=1.0, minvalue=0.01, maxvalue=10.0,
+        )
+        if weight is None:
+            return
+        self._portfolio_legs.append({"path": path, "weight": weight})
+        self.portfolio_leg_listbox.insert(END, f"{os.path.basename(path)}  (weight={weight:g})")
+
+    def _portfolio_remove_leg(self):
+        sel = self.portfolio_leg_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.portfolio_leg_listbox.delete(idx)
+        del self._portfolio_legs[idx]
+
+    def _portfolio_run_clicked(self):
+        if len(self._portfolio_legs) < 2:
+            messagebox.showwarning(
+                "Not enough legs",
+                "Portfolio backtesting requires at least 2 instrument legs -- use ADD LEG (CSV) above.",
+            )
+            return
+        self.portfolio_output.delete("1.0", END)
+        self.portfolio_progress.start(10)
+        threading.Thread(target=self._portfolio_run_pipeline, daemon=True).start()
+
+    def _portfolio_run_pipeline(self):
+        try:
+            legs = []
+            for leg_spec in self._portfolio_legs:
+                stored_path = str(store_csv_path(leg_spec["path"]))
+                result = import_csv(stored_path)
+                if not result.is_valid:
+                    self._log_portfolio(f"Import errors ({os.path.basename(stored_path)}):\n" + "\n".join(result.errors))
+                    return
+                self._log_portfolio(f"Loaded {len(result.dataframe)} bars from {os.path.basename(stored_path)}")
+                legs.append(InstrumentLeg(
+                    name=Path(stored_path).stem, df=result.dataframe,
+                    strategy=self._build_strategy(), risk=self._build_risk_config(),
+                    weight=leg_spec["weight"],
+                ))
+
+            self._log_portfolio(f"Running portfolio backtest across {len(legs)} instrument(s)...")
+            config = PortfolioConfig(
+                initial_balance=self.portfolio_balance.get_float(100000),
+                correlation_penalty_strength=self.portfolio_corr_strength.get_float(0.6),
+            )
+            result = run_portfolio_backtest(legs, config)
+            paths = generate_portfolio_report(OUTPUT_DIR / "portfolio", result)
+            self._last_portfolio_html_path = paths["html"]
+            self.open_portfolio_report_btn.config(state="normal")
+            self._log_portfolio(f"  Combined net profit: ${result.combined_statistics.net_profit:,.2f}")
+            for w in result.warnings:
+                self._log_portfolio(f"  WARNING: {w}")
+            self._log_portfolio("\nDone. Portfolio report written to:")
+            for k, p in paths.items():
+                self._log_portfolio(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_portfolio(f"\nStrategy error: {exc}")
+        except PortfolioError as exc:
+            self._log_portfolio(f"\nPortfolio error: {exc}")
+        except Exception:
+            self._log_portfolio("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.portfolio_progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Tab 12 — Multi-Objective Optimization
+    # -----------------------------------------------------------------------
+
+    def _build_multiobj_tab(self):
+        f = self._scrollable(self.tab_multiobj)
+
+        self._page_header(
+            f,
+            "12 / Validation Lab",
+            "Multi-Objective Optimization",
+            "Runs a real NSGA-II search across several objectives at once (e.g. "
+            "Sharpe, max drawdown, eval-pass probability) instead of collapsing "
+            "them into one weighted score the way Iterative Refinement's GA does. "
+            "Produces a Pareto front -- a set of candidates where none is "
+            "strictly worse than any other on the front. Picking a final winner "
+            "from that list is left as your call.",
+        )
+
+        obj_section = self._section(
+            f, "Objectives (pick at least 2)",
+            "Direction (higher/lower is better) is handled automatically for each.",
+            emphasize=True,
+        )
+        self._multiobj_vars: dict[str, BooleanVar] = {}
+        obj_grid = Frame(obj_section, bg=PANEL)
+        obj_grid.pack(fill="x", padx=18, pady=(0, 10))
+        for i, (obj_name, direction) in enumerate(OBJECTIVE_DIRECTIONS.items()):
+            var = BooleanVar(value=obj_name in DEFAULT_OBJECTIVES)
+            self._multiobj_vars[obj_name] = var
+            cb = Checkbutton(
+                obj_grid, text=f"{obj_name}  ({direction})", variable=var,
+                bg=PANEL, fg=TEXT_MUTED, activebackground=PANEL, selectcolor=PANEL_3,
+                highlightthickness=0, bd=0, font=_safe_font(9), anchor="w",
+            )
+            cb.grid(row=i // 2, column=i % 2, sticky="w", padx=6, pady=3)
+
+        settings = self._section(f, "Search settings", "")
+        self.mo_population = LabeledEntry(settings, "Population size", 20)
+        self.mo_generations = LabeledEntry(settings, "Generations", 8)
+        self.mo_seed = LabeledEntry(settings, "Random seed", 42)
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN MULTI-OBJECTIVE SEARCH", self._multiobj_run_clicked, primary=True).pack(side="left")
+        self.open_multiobj_report_btn = self._button(button_row, "OPEN REPORT", self._open_multiobj_report)
+        self.open_multiobj_report_btn.config(state="disabled")
+        self.open_multiobj_report_btn.pack(side="left", padx=8)
+
+        self.multiobj_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.multiobj_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Multi-objective output", "Live progress log.")
+        self.multiobj_output = Text(
+            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.multiobj_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_multiobj_html_path = None
+
+    def _log_multiobj(self, msg: str):
+        self.multiobj_output.insert(END, msg + "\n")
+        self.multiobj_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_multiobj_report(self):
+        if self._last_multiobj_html_path:
+            webbrowser.open(f"file://{self._last_multiobj_html_path.resolve()}")
+
+    def _multiobj_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        selected = [name for name, var in self._multiobj_vars.items() if var.get()]
+        if len(selected) < 2:
+            messagebox.showwarning("Not enough objectives", "Select at least 2 objectives.")
+            return
+        self.multiobj_output.delete("1.0", END)
+        self.multiobj_progress.start(10)
+        threading.Thread(target=self._multiobj_run_pipeline, args=(selected,), daemon=True).start()
+
+    def _multiobj_run_pipeline(self, selected_objectives: list[str]):
+        try:
+            df = self._load_df_for_page(self._log_multiobj)
+            if df is None:
+                return
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            mc_cfg = self._validation_mc_config()
+
+            mo_cfg = MultiObjectiveConfig(
+                objectives=selected_objectives,
+                population_size=self.mo_population.get_int(20),
+                generations=self.mo_generations.get_int(8),
+                random_seed=self.mo_seed.get_int(42),
+            )
+            self._log_multiobj(f"Running multi-objective search for: {selected_objectives}...")
+            result = run_multi_objective_refinement(df, strategy, risk, rules, mc_cfg, mo_cfg, progress_cb=self._log_multiobj)
+            paths = generate_multi_objective_report(OUTPUT_DIR / "multi_objective", result)
+            self._last_multiobj_html_path = paths["html"]
+            self.open_multiobj_report_btn.config(state="normal")
+            self._log_multiobj(f"  Final Pareto front size: {len(result.pareto_front)}")
+            self._log_multiobj("\nDone. Multi-objective report written to:")
+            for k, p in paths.items():
+                self._log_multiobj(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_multiobj(f"\nStrategy error: {exc}")
+        except RefinementError as exc:
+            self._log_multiobj(f"\nMulti-objective error: {exc}")
+        except Exception:
+            self._log_multiobj("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.multiobj_progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Tab 13 — Walk-Forward-Aware GA
+    # -----------------------------------------------------------------------
+
+    def _build_wfga_tab(self):
+        f = self._scrollable(self.tab_wfga)
+
+        self._page_header(
+            f,
+            "13 / Validation Lab",
+            "Walk-Forward-Aware GA",
+            "Same crossover/mutation/tournament-selection GA as Iterative Refinement "
+            "(Step 6), but every candidate's fitness is scored ONLY on chained "
+            "out-of-sample fold data -- never on the training windows or the full "
+            "dataset. A genome that only fits one historical stretch simply scores "
+            "lower here and gets selected against, generation over generation.",
+        )
+
+        settings = self._section(
+            f, "Fold + search settings",
+            "'Rolling' or 'anchored' fold windows, same meaning as Walk-Forward Optimization (Step 8).",
+            emphasize=True,
+        )
+        self.wfga_window_mode = LabeledCombo(settings, "Window mode", ["rolling", "anchored"], "rolling")
+        self.wfga_folds = LabeledEntry(settings, "Number of folds", 4)
+        self._wfga_metric_labels = list(FITNESS_METRICS.values())
+        self._wfga_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
+        self.wfga_metric = LabeledCombo(
+            settings, "Fitness metric", self._wfga_metric_labels, FITNESS_METRICS["composite_prop_score"],
+        )
+        self.wfga_population = LabeledEntry(settings, "Population size", 12)
+        self.wfga_generations = LabeledEntry(settings, "Generations", 6)
+        self.wfga_seed = LabeledEntry(settings, "Random seed", 42)
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN WALK-FORWARD-AWARE GA", self._wfga_run_clicked, primary=True).pack(side="left")
+        self.open_wfga_report_btn = self._button(button_row, "OPEN REPORT", self._open_wfga_report)
+        self.open_wfga_report_btn.config(state="disabled")
+        self.open_wfga_report_btn.pack(side="left", padx=8)
+
+        self.wfga_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.wfga_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Walk-forward-aware GA output", "Live progress log.")
+        self.wfga_output = Text(
+            output_section, height=18, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.wfga_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_wfga_html_path = None
+
+    def _log_wfga(self, msg: str):
+        self.wfga_output.insert(END, msg + "\n")
+        self.wfga_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_wfga_report(self):
+        if self._last_wfga_html_path:
+            webbrowser.open(f"file://{self._last_wfga_html_path.resolve()}")
+
+    def _wfga_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.wfga_output.delete("1.0", END)
+        self.wfga_progress.start(10)
+        threading.Thread(target=self._wfga_run_pipeline, daemon=True).start()
+
+    def _wfga_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_wfga)
+            if df is None:
+                return
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            mc_cfg = self._validation_mc_config()
+
+            metric_key = self._wfga_metric_label_to_key.get(self.wfga_metric.get_str(), "composite_prop_score")
+            refine_cfg = RefinementConfig(
+                population_size=self.wfga_population.get_int(12),
+                generations=self.wfga_generations.get_int(6),
+                fitness_metric=metric_key,
+                random_seed=self.wfga_seed.get_int(42),
+            )
+
+            self._log_wfga("Starting walk-forward-aware GA...")
+            result = run_walkforward_aware_refinement(
+                df, strategy, risk, rules, mc_cfg, refinement_config=refine_cfg,
+                n_folds=self.wfga_folds.get_int(4), window_mode=self.wfga_window_mode.get_str(),
+                progress_cb=self._log_wfga,
+            )
+            paths = generate_walkforward_ga_report(OUTPUT_DIR / "walkforward_ga", result)
+            self._last_wfga_html_path = paths["html"]
+            self.open_wfga_report_btn.config(state="normal")
+            self._log_wfga(f"  Best chained-OOS fitness: {result.best.fitness:.3f}  (overfitting gap: {result.overfitting_gap})")
+            for w in result.warnings:
+                self._log_wfga(f"  WARNING: {w}")
+            self._log_wfga("\nDone. Walk-forward-aware GA report written to:")
+            for k, p in paths.items():
+                self._log_wfga(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_wfga(f"\nStrategy error: {exc}")
+        except RefinementError as exc:
+            self._log_wfga(f"\nWalk-forward-aware GA error: {exc}")
+        except Exception:
+            self._log_wfga("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.wfga_progress.stop()
 
 
 def launch():

@@ -348,7 +348,11 @@ rule set and an example.
 
 Steps 6-13 are all about validating a strategy rigorously once you already
 have one. This step is aimed one level upstream — at actually finding a
-real edge in the first place — across four additions:
+real edge in the first place — across four additions. All four are
+available on the desktop GUI (the new "14 ENSEMBLE" sidebar tab, a new
+"Adaptive risk" section on Step 4/Risk & Execution, and new cost-stress
+controls on Step 6/Refinement and Step 7/Search Lab), the CLI, and
+directly via the underlying modules.
 
 - **Wider Search Lab hypothesis space.** Four new named families join the
   original three: **Volatility Breakout** (a Donchian breakout gated by
@@ -361,9 +365,13 @@ real edge in the first place — across four additions:
   merged-in instrument's price ratio z-score — see
   `app/data/pairs.py::merge_pair_series()`; only the primary leg is
   actually traded, since the engine stays single-instrument, so treat this
-  as a relative-value entry filter, not a full two-leg pairs trade). A
-  search over `family="all"` automatically skips the pairs family unless
-  you've merged in a second instrument first (`--pair-csv` on the CLI).
+  as a relative-value entry filter, not a full two-leg pairs trade). No
+  GUI/CLI changes were needed for the family dropdown itself — it's
+  generated from `app.search.strategy_space.list_families()`, so new
+  families just appear. A search over `family="all"` automatically skips
+  the pairs family unless you've merged in a second instrument first (a
+  "Pair instrument" CSV picker on the Search Lab tab, or `--pair-csv` on
+  the CLI).
 - **Cost-stress-adjusted GA fitness.** Iterative Refinement, Search Lab's
   Stage 2, and the Walk-Forward-Aware GA all now ALSO re-backtest every
   candidate at spread/slippage/commission multiplied by
@@ -376,6 +384,8 @@ real edge in the first place — across four additions:
   distinct from Stage 3's cost-ladder check and the Refinement report's
   own cost-ladder table, which only *report* cost sensitivity after the
   fact — this feeds it back into what gets selected in the first place.
+  GUI: a "Cost-stress penalty" section on both the Refinement tab (Step 6)
+  and the Search Lab tab's Stage 2 section (Step 7).
 - **Declarative adaptive risk layer** (`app/backtest/adaptive_risk.py`):
   engine-level money-management rules — `consecutive_losses`,
   `daily_loss_pct`, `daily_profit_pct`, `progress_to_target_pct` — each
@@ -383,7 +393,10 @@ real edge in the first place — across four additions:
   triggered; multiple active rules stack multiplicatively. Passed as an
   optional `AdaptiveRiskConfig` into `run_backtest()`; every `Trade` records
   the multiplier and which rule(s) were active when it opened, so a report
-  can show exactly when and why sizing was cut. CLI: `--adaptive-risk-rules
+  can show exactly when and why sizing was cut. GUI: a new "Adaptive
+  risk" section on the Risk & Execution tab (Step 4) — enable, set a
+  profit-target %, and add rules via a small dialog (trigger, threshold,
+  multiplier). CLI: `--adaptive-risk-rules
   '{"rules": [{"trigger": "consecutive_losses", "threshold": 2,
   "risk_multiplier": 0.5}], "profit_target_amount_pct": 8.0}'`.
 - **Multi-strategy ensembles** (`app/ensemble/ensemble.py`): the mirror
@@ -395,7 +408,8 @@ real edge in the first place — across four additions:
   unmodified, just pointed at one shared `df`) and `run_ensemble_vote`
   (combines every leg's raw signal into one majority/threshold-vote entry,
   run through the ordinary single-position engine; risk management is
-  inherited from the first-listed leg only). CLI: `--ensemble
+  inherited from the first-listed leg only). GUI: new "14 ENSEMBLE" tab
+  (add strategy files, pick Blend/Vote). CLI: `--ensemble
   --ensemble-strategy path1.py --ensemble-strategy path2.pine
   --ensemble-mode blend|vote`.
 
@@ -556,7 +570,7 @@ T58-Prop-Algo-Backtester/
 ├── app/
 │   ├── main.py                 # entry point (GUI, or --cli headless run — see CLI reference)
 │   ├── ui/
-│   │   ├── main_window.py      # Tkinter desktop GUI (13-step sidebar: Steps 1-7 core + 8-13 Validation Lab)
+│   │   ├── main_window.py      # Tkinter desktop GUI (14-step sidebar: Steps 1-7 core, 8-13 Validation Lab, 14 Ensemble)
 │   │   └── condition_builder.py  # visual condition-row widget used by the Manual Builder
 │   ├── web/                    # Flask mobile/web app (same engine, new front end)
 │   │   ├── server.py

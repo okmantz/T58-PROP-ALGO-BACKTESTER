@@ -92,6 +92,19 @@ class RefinementConfig:
     random_immigrants_frac: float = 0.15  # fraction of each new generation that is freshly randomized
     search_monte_carlo_sims: int = 500    # cheap MC used while searching, for speed
     random_seed: int | None = 42
+    # Cost-stress: while ranking candidates, ALSO backtest each one at
+    # spread_pips/slippage_pips/commission_per_trade multiplied by
+    # cost_stress_multiplier, and blend that stressed-cost fitness into the
+    # score the GA actually selects on (see _apply_cost_stress below). This
+    # is what makes the search prefer strategies whose edge SURVIVES worse
+    # execution, rather than strategies that only look good under the
+    # default (fairly forgiving) cost assumptions -- without this, a
+    # strategy that is pure curve-fit to optimistic fills scores identically
+    # to a strategy with a real edge, right up until Stage 3's cost-ladder
+    # check (which only reports, it doesn't feed back into what gets bred).
+    cost_stress_enabled: bool = True
+    cost_stress_multiplier: float = 2.0
+    cost_stress_penalty_weight: float = 0.35   # 0 = ignore stress entirely, 1 = fully penalize any degradation
 
     def __post_init__(self):
         self.population_size = max(int(self.population_size), 4)
@@ -101,6 +114,8 @@ class RefinementConfig:
         self.mutation_strength = min(max(float(self.mutation_strength), 0.01), 1.0)
         self.random_immigrants_frac = min(max(float(self.random_immigrants_frac), 0.0), 0.9)
         self.search_monte_carlo_sims = max(int(self.search_monte_carlo_sims), 50)
+        self.cost_stress_multiplier = max(float(self.cost_stress_multiplier), 1.0)
+        self.cost_stress_penalty_weight = min(max(float(self.cost_stress_penalty_weight), 0.0), 1.0)
         if self.fitness_metric not in FITNESS_METRICS:
             raise RefinementError(f"Unknown fitness metric '{self.fitness_metric}'.")
 
@@ -177,6 +192,48 @@ def compute_fitness(stats: dict, prop_summary: dict | None, mc: MonteCarloResult
     raise RefinementError(f"Unknown fitness metric '{metric}'.")
 
 
+def _stressed_risk_config(risk: RiskConfig, multiplier: float) -> RiskConfig:
+    """A copy of `risk` with every execution-cost assumption (spread,
+    slippage, commission) scaled up by `multiplier` -- used to re-backtest
+    a candidate under deliberately worse fills, never to change position
+    sizing or account rules."""
+    return replace(
+        risk,
+        spread_pips=risk.spread_pips * multiplier,
+        slippage_pips=risk.slippage_pips * multiplier,
+        commission_per_trade=risk.commission_per_trade * multiplier,
+    )
+
+
+def apply_cost_stress_penalty(nominal_fitness: float, stressed_fitness: float, weight: float) -> float:
+    """
+    Blends a stressed-cost fitness value into a nominal one, penalizing
+    degradation without rewarding a stressed run that (by noise) scores
+    slightly ABOVE nominal. Metric-agnostic: works the same whether
+    `metric` is a raw dollar figure, a ratio, or a 0-1 probability, because
+    the penalty is expressed as a FRACTION of the nominal score, not an
+    absolute offset.
+
+        weight=0.0 -> stress is ignored entirely (returns nominal_fitness)
+        weight=1.0 -> full erosion under stress drives fitness to exactly 0
+
+    A candidate that is already unprofitable/invalid at nominal cost
+    (nominal_fitness <= 0, or non-finite) is returned unchanged -- there is
+    no meaningful "how much of the edge survived" to measure once there
+    was no edge at nominal cost either, and stressing it further would
+    double-penalize a candidate Stage 1/the GA's own selection pressure
+    already rejects on nominal grounds.
+    """
+    if weight <= 0 or not math.isfinite(nominal_fitness) or nominal_fitness <= 0:
+        return nominal_fitness
+    if not math.isfinite(stressed_fitness):
+        degradation = 1.0
+    else:
+        degradation = max(0.0, (nominal_fitness - stressed_fitness) / abs(nominal_fitness))
+        degradation = min(degradation, 1.0)
+    return nominal_fitness - weight * degradation * nominal_fitness
+
+
 def _mc_summary(mc: MonteCarloResult) -> dict:
     return {
         "evaluation_pass_probability": mc.evaluation_pass_probability,
@@ -197,8 +254,20 @@ def _evaluate(
     mc_cfg: MonteCarloConfig,
     metric: str,
     keep_full: bool = False,
+    cost_stress_multiplier: float | None = None,
+    cost_stress_penalty_weight: float = 0.0,
 ):
-    """Runs one full backtest -> prop sim -> Monte Carlo pass for one strategy instance."""
+    """Runs one full backtest -> prop sim -> Monte Carlo pass for one strategy instance.
+
+    When `cost_stress_multiplier` is given (and `cost_stress_penalty_weight` >
+    0), ALSO re-runs the same strategy on the same data with spread/
+    slippage/commission scaled up by that multiplier, and blends that
+    stressed-cost result into the returned fitness via
+    apply_cost_stress_penalty(). The returned `statistics`/`prop_summary`/
+    `mc_summary` always describe the NOMINAL run (so reports keep showing
+    real, un-stressed numbers) -- only the scalar fitness the GA selects on
+    is cost-stress-adjusted.
+    """
     bt_result = run_backtest(df, strategy, risk)
 
     if not bt_result.trades:
@@ -221,6 +290,21 @@ def _evaluate(
     fitness = compute_fitness(bt_result.statistics.to_dict(), prop_summary, mc_result, metric)
     if not math.isfinite(fitness):
         fitness = float("-inf")
+
+    if cost_stress_multiplier and cost_stress_penalty_weight > 0 and math.isfinite(fitness):
+        stressed_risk = _stressed_risk_config(risk, cost_stress_multiplier)
+        stressed_bt = run_backtest(df, strategy, stressed_risk)
+        if stressed_bt.trades:
+            stressed_pnls = [t.pnl for t in stressed_bt.trades]
+            stressed_dates = [t.entry_time for t in stressed_bt.trades]
+            stressed_single_run = simulate_account(stressed_pnls, stressed_dates, prop_rules)
+            stressed_mc = run_monte_carlo(stressed_bt.trades, prop_rules, mc_cfg)
+            stressed_fitness = compute_fitness(
+                stressed_bt.statistics.to_dict(), summarize_single_run(stressed_single_run), stressed_mc, metric,
+            )
+        else:
+            stressed_fitness = float("-inf")
+        fitness = apply_cost_stress_penalty(fitness, stressed_fitness, cost_stress_penalty_weight)
 
     return (
         fitness,
@@ -404,6 +488,8 @@ def run_iterative_refinement(
             candidate_strategy = build(genome)
             fitness, stats, prop_summary, mc_summary, bt_full, mc_full, single_full = _evaluate(
                 df, candidate_strategy, risk, prop_rules, search_mc_cfg, cfg.fitness_metric, keep_full=keep_full,
+                cost_stress_multiplier=cfg.cost_stress_multiplier if cfg.cost_stress_enabled else None,
+                cost_stress_penalty_weight=cfg.cost_stress_penalty_weight if cfg.cost_stress_enabled else 0.0,
             )
             config, code_text, code_ext = (None, None, None)
             if keep_full:
@@ -473,6 +559,8 @@ def run_iterative_refinement(
         best_strategy = build(best_ever.genome)
         final_fitness, final_stats, final_prop, final_mc_summary, final_bt, final_mc, final_single = _evaluate(
             df, best_strategy, risk, prop_rules, mc_config, cfg.fitness_metric, keep_full=True,
+            cost_stress_multiplier=cfg.cost_stress_multiplier if cfg.cost_stress_enabled else None,
+            cost_stress_penalty_weight=cfg.cost_stress_penalty_weight if cfg.cost_stress_enabled else 0.0,
         )
         final_config, final_code_text, final_code_ext = snapshot(best_ever.genome)
         best_final = Candidate(

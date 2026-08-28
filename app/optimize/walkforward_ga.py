@@ -54,7 +54,9 @@ from app.optimize.refinement import (
     _crossover,
     _mutate,
     _random_gene_value,
+    _stressed_risk_config,
     _tournament_select,
+    apply_cost_stress_penalty,
     compute_fitness,
 )
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
@@ -138,23 +140,21 @@ def run_walkforward_aware_refinement(
         rng = random.Random(cfg.random_seed)
         search_mc_cfg = replace(mc_config, n_simulations=cfg.search_monte_carlo_sims)
 
-        def oos_fitness(genome: list) -> tuple[float, int]:
-            """Fitness computed ONLY from chaining every fold's held-out test slice."""
-            candidate_strategy = build(genome)
+        def _chained_fitness(strategy_to_run, slices, risk_to_use) -> tuple[float, int]:
             all_trades: list[Trade] = []
-            for test_df in test_slices:
-                bt = run_backtest(test_df, candidate_strategy, risk)
+            for test_df in slices:
+                bt = run_backtest(test_df, strategy_to_run, risk_to_use)
                 all_trades.extend(bt.trades)
             if not all_trades:
                 return float("-inf"), 0
-            equity = risk.initial_balance
+            equity = risk_to_use.initial_balance
             rows = []
             ordered = sorted(all_trades, key=lambda t: t.exit_time)
             for t in ordered:
                 equity += t.pnl if math.isfinite(t.pnl) else 0.0
                 rows.append({"timestamp": t.exit_time, "equity": equity})
             equity_curve = pd.DataFrame(rows)
-            stats = compute_statistics(all_trades, equity_curve, initial_balance=risk.initial_balance)
+            stats = compute_statistics(all_trades, equity_curve, initial_balance=risk_to_use.initial_balance)
             pnls = [t.pnl for t in all_trades]
             dates = [t.entry_time for t in all_trades]
             single_run = simulate_account(pnls, dates, prop_rules)
@@ -162,6 +162,21 @@ def run_walkforward_aware_refinement(
             prop_summary = summarize_single_run(single_run)
             fitness = compute_fitness(stats.to_dict(), prop_summary, mc, cfg.fitness_metric)
             return (fitness if math.isfinite(fitness) else float("-inf")), len(all_trades)
+
+        def oos_fitness(genome: list) -> tuple[float, int]:
+            """Fitness computed ONLY from chaining every fold's held-out test slice,
+            cost-stress-adjusted the same way Iterative Refinement's plain GA is
+            (see app.optimize.refinement.apply_cost_stress_penalty) -- a genome that
+            only survives on nominal costs AND only on one historical stretch is
+            exactly the double-overfitting failure mode this module plus that
+            adjustment together are meant to catch."""
+            candidate_strategy = build(genome)
+            fitness, trade_count = _chained_fitness(candidate_strategy, test_slices, risk)
+            if cfg.cost_stress_enabled and cfg.cost_stress_penalty_weight > 0 and math.isfinite(fitness):
+                stressed_risk = _stressed_risk_config(risk, cfg.cost_stress_multiplier)
+                stressed_fitness, _ = _chained_fitness(candidate_strategy, test_slices, stressed_risk)
+                fitness = apply_cost_stress_penalty(fitness, stressed_fitness, cfg.cost_stress_penalty_weight)
+            return fitness, trade_count
 
         def full_df_fitness(genome: list) -> float:
             candidate_strategy = build(genome)

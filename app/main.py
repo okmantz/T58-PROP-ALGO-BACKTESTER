@@ -60,6 +60,10 @@ def run_cli(
     refine_generations: int = 5,
     refine_metric: str = "composite_prop_score",
     refine_seed: int | None = 42,
+    refine_cost_stress_enabled: bool = True,
+    refine_cost_stress_multiplier: float = 2.0,
+    refine_cost_stress_weight: float = 0.35,
+    adaptive_risk_rules_json: str | None = None,
 ) -> None:
     if csv_path is None:
         csv_path = _resolve_default_csv()
@@ -82,8 +86,25 @@ def run_cli(
     risk = RiskConfig()
     rules = PropRules()
 
+    adaptive_risk = None
+    if adaptive_risk_rules_json:
+        import json
+        from app.backtest.adaptive_risk import AdaptiveRiskConfig, AdaptiveRiskRule
+        try:
+            parsed = json.loads(adaptive_risk_rules_json)
+            target_pct = parsed.get("profit_target_amount_pct", rules.evaluation_profit_target_pct)
+            adaptive_risk = AdaptiveRiskConfig(
+                enabled=True,
+                rules=[AdaptiveRiskRule(**r) for r in parsed.get("rules", [])],
+                profit_target_amount=risk.initial_balance * float(target_pct) / 100.0,
+            )
+            print(f"Adaptive risk enabled: {len(adaptive_risk.rules)} rule(s)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not parse --adaptive-risk-rules: {exc}")
+            sys.exit(1)
+
     print("Running historical backtest...")
-    bt_result = run_backtest(df, strategy, risk)
+    bt_result = run_backtest(df, strategy, risk, adaptive_risk=adaptive_risk)
     print(f"  Trades: {len(bt_result.trades)}  Net profit: ${bt_result.statistics.net_profit:,.2f}  "
           f"Win rate: {bt_result.statistics.win_rate:.1f}%")
 
@@ -150,6 +171,9 @@ def run_cli(
         population_size=refine_population,
         generations=refine_generations,
         random_seed=refine_seed,
+        cost_stress_enabled=refine_cost_stress_enabled,
+        cost_stress_multiplier=refine_cost_stress_multiplier,
+        cost_stress_penalty_weight=refine_cost_stress_weight,
     )
     try:
         result = run_iterative_refinement(
@@ -195,6 +219,10 @@ def run_search_cli(
     seed: int = 42,
     db_path: str | None = None,
     promote: bool = True,
+    cost_stress_enabled: bool = True,
+    cost_stress_multiplier: float = 2.0,
+    cost_stress_penalty_weight: float = 0.35,
+    pair_csv: str | None = None,
 ) -> None:
     """
     Search Lab: Stages 1-5. Generates a candidate pool, runs it through the
@@ -235,6 +263,17 @@ def run_search_cli(
     df = import_result.dataframe
     print(f"Loaded {len(df)} bars from {csv_path}")
 
+    has_pair_data = False
+    if pair_csv:
+        from app.data.pairs import merge_pair_series
+        pair_import = import_csv(str(store_csv_path(pair_csv)))
+        if not pair_import.is_valid:
+            print(f"Could not load --pair-csv '{pair_csv}': {pair_import.errors}")
+            sys.exit(1)
+        df = merge_pair_series(df, pair_import.dataframe)
+        has_pair_data = True
+        print(f"Merged pair-instrument close from {pair_csv} (enables the 'stat_pairs' family)")
+
     built_strategy = None
     if strategy_file:
         ext = Path(strategy_file).suffix.lower()
@@ -274,6 +313,7 @@ def run_search_cli(
         else:
             space = generate_search_space(
                 mode="family", family=family, max_candidates=max_candidates, seed=seed,
+                has_pair_data=has_pair_data,
             )
 
     stage_cfg = SearchStageConfig(
@@ -283,6 +323,8 @@ def run_search_cli(
         full_mc_sims=full_mc_sims, walk_forward_folds=walk_forward_folds,
         robustness_neighbors=robustness_neighbors, fitness_metric=fitness_metric,
         workers=workers, random_seed=seed,
+        cost_stress_enabled=cost_stress_enabled, cost_stress_multiplier=cost_stress_multiplier,
+        cost_stress_penalty_weight=cost_stress_penalty_weight,
     )
     risk = RiskConfig()
     rules = PropRules()
@@ -590,6 +632,102 @@ def run_multi_objective_cli(
         print(f"  {k}: {p}")
 
 
+def run_ensemble_cli(
+    csv_path: str | None,
+    strategy_files: list[str],
+    output_dir: str,
+    mode: str = "blend",
+    min_agreement: int = 2,
+    initial_balance: float = 100_000.0,
+    correlation_penalty_strength: float = 0.6,
+) -> None:
+    """Multi-strategy ensemble backtest: several DIFFERENT strategies
+    (Python/PineScript/MQL5 files) on the SAME instrument, combined either
+    by correlation-aware blending (mode="blend", each leg keeps trading
+    independently) or by entry-timing vote (mode="vote", one combined
+    single-position signal). See app.ensemble.ensemble for the full
+    tradeoffs between the two modes."""
+    from app.ensemble.ensemble import EnsembleVoteConfig, run_ensemble_blend, run_ensemble_vote
+    from app.reports.validation_reports import generate_portfolio_report
+    from app.strategy.mql5 import MQL5Strategy
+    from app.strategy.pinescript import PineScriptStrategy
+    from app.strategy.python import PythonStrategy
+
+    if len(strategy_files) < 2:
+        print("Ensemble backtesting requires at least 2 --ensemble-strategy files.")
+        sys.exit(1)
+
+    if csv_path is None:
+        csv_path = _resolve_default_csv()
+    else:
+        csv_path = str(store_csv_path(csv_path))
+    import_result = import_csv(csv_path)
+    if not import_result.is_valid:
+        print("Import failed:")
+        for e in import_result.errors:
+            print(f"  ERROR: {e}")
+        sys.exit(1)
+    df = import_result.dataframe
+    print(f"Loaded {len(df)} bars from {csv_path}")
+
+    strategies, names = [], []
+    for path in strategy_files:
+        ext = Path(path).suffix.lower()
+        try:
+            if ext == ".py":
+                strategies.append(PythonStrategy(path))
+            elif ext == ".pine":
+                strategies.append(PineScriptStrategy(Path(path).read_text(encoding="utf-8")))
+            elif ext == ".mq5":
+                strategies.append(MQL5Strategy(Path(path).read_text(encoding="utf-8")))
+            else:
+                print(f"Unsupported --ensemble-strategy extension '{ext}' (expected .py, .pine, or .mq5).")
+                sys.exit(1)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not load strategy file '{path}': {exc}")
+            sys.exit(1)
+        names.append(Path(path).stem)
+    print(f"Loaded {len(strategies)} strategy leg(s): {', '.join(names)}")
+
+    risk = RiskConfig(initial_balance=initial_balance)
+    if mode == "blend":
+        from app.portfolio.portfolio import PortfolioConfig
+        result = run_ensemble_blend(
+            df, strategies, risk, names=names,
+            config=PortfolioConfig(initial_balance=initial_balance, correlation_penalty_strength=correlation_penalty_strength),
+        )
+        paths = generate_portfolio_report(output_dir, result)
+        print(f"  Combined net profit: ${result.combined_statistics.net_profit:,.2f}")
+        print("\nEnsemble (blend) report written to:")
+        for k, p in paths.items():
+            print(f"  {k}: {p}")
+    elif mode == "vote":
+        from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
+        rules = PropRules(account_size=initial_balance)
+        bt_result = run_ensemble_vote(df, strategies, risk, names=names, vote_config=EnsembleVoteConfig(min_agreement=min_agreement))
+        print(f"  Trades: {len(bt_result.trades)}  Net profit: ${bt_result.statistics.net_profit:,.2f}")
+        if not bt_result.trades:
+            print("\nNo trades were generated by this vote ensemble -- nothing further to report.")
+            return
+        period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
+        trade_pnls = [t.pnl for t in bt_result.trades]
+        trade_dates = [t.entry_time for t in bt_result.trades]
+        single_run = simulate_account(trade_pnls, trade_dates, rules)
+        mc_result = run_monte_carlo(bt_result.trades, rules, MonteCarloConfig(n_simulations=3000))
+        paths = generate_full_report(
+            output_dir=output_dir, strategy_name=bt_result.strategy_name, strategy_source_type="ensemble_vote",
+            instrument=Path(csv_path).name, timeframe="unknown", backtest_period=period,
+            backtest_result=bt_result, prop_rules=rules, prop_single_run=single_run,
+            monte_carlo_result=mc_result, holdout_comparison=None, risk_config=risk, price_df=df,
+        )
+        print("\nEnsemble (vote) report written to:")
+        for k, p in paths.items():
+            print(f"  {k}: {p}")
+    else:
+        print(f"Unknown --ensemble-mode '{mode}' (expected 'blend' or 'vote').")
+        sys.exit(1)
+
+
 def run_wfga_cli(
     csv_path: str | None,
     output_dir: str,
@@ -662,6 +800,20 @@ def main():
         help="Iterative Refinement: fitness metric to optimize for",
     )
     parser.add_argument("--refine-seed", type=int, default=42, help="Iterative Refinement: random seed")
+    parser.add_argument("--refine-no-cost-stress", action="store_true",
+                         help="disable the cost-stress penalty in Iterative Refinement's GA fitness (on by default).")
+    parser.add_argument("--refine-cost-stress-multiplier", type=float, default=2.0,
+                         help="Iterative Refinement: spread/slippage/commission multiplier used for the stressed-cost re-run.")
+    parser.add_argument("--refine-cost-stress-weight", type=float, default=0.35,
+                         help="Iterative Refinement: how strongly stressed-cost degradation penalizes fitness (0=ignore, 1=full).")
+    parser.add_argument(
+        "--adaptive-risk-rules", default=None,
+        help='JSON object of declarative money-management rules applied to --cli\'s backtest, e.g. '
+             '\'{"rules": [{"trigger": "consecutive_losses", "threshold": 2, "risk_multiplier": 0.5}, '
+             '{"trigger": "progress_to_target_pct", "threshold": 80, "risk_multiplier": 0.3}], '
+             '"profit_target_amount_pct": 8.0}\'. See app.backtest.adaptive_risk for the supported '
+             "trigger types.",
+    )
 
     parser.add_argument(
         "--search", action="store_true",
@@ -725,6 +877,35 @@ def main():
                          help="path to the SQLite results database (default: <output>/search.db)")
     parser.add_argument("--search-no-promote", action="store_true",
                          help="skip Stage 5 (don't auto-promote the champion to a full report).")
+    parser.add_argument("--search-no-cost-stress", action="store_true",
+                         help="disable the cost-stress penalty in Stage 2's GA fitness (on by default).")
+    parser.add_argument("--search-cost-stress-multiplier", type=float, default=2.0,
+                         help="Search Lab Stage 2: spread/slippage/commission multiplier for the stressed-cost re-run.")
+    parser.add_argument("--search-cost-stress-weight", type=float, default=0.35,
+                         help="Search Lab Stage 2: how strongly stressed-cost degradation penalizes fitness (0=ignore, 1=full).")
+    parser.add_argument(
+        "--pair-csv", default=None,
+        help="path to a second instrument's market data CSV, merged in as a 'pair_close' column "
+             "(see app.data.pairs.merge_pair_series) so the 'stat_pairs' family can be searched. "
+             "Omit to search every other family unaffected; searching --search-family stat_pairs "
+             "specifically without this will fail with a clear error.",
+    )
+
+    parser.add_argument("--ensemble", action="store_true",
+                         help="run a multi-strategy ensemble backtest: several DIFFERENT strategies on the "
+                              "SAME instrument, combined by correlation-aware blending or entry-timing vote.")
+    parser.add_argument("--ensemble-strategy", action="append", default=None,
+                         help="path to a .py, .pine, or .mq5 strategy file for one ensemble leg; repeat for "
+                              "each leg (at least 2 required).")
+    parser.add_argument("--ensemble-mode", default="blend", choices=["blend", "vote"],
+                         help="'blend' (default): each leg trades independently at a correlation-adjusted "
+                              "risk weight, reusing the Portfolio feature's own math. 'vote': one combined "
+                              "signal, entering only once --ensemble-min-agreement legs agree on direction.")
+    parser.add_argument("--ensemble-min-agreement", type=int, default=2,
+                         help="'vote' mode only: how many legs must agree on direction before entering.")
+    parser.add_argument("--ensemble-balance", type=float, default=100_000.0, help="Ensemble: shared initial account balance")
+    parser.add_argument("--ensemble-correlation-strength", type=float, default=0.6,
+                         help="Ensemble 'blend' mode: 0 = ignore correlation, 1 = full inverse-correlation re-weighting")
 
     parser.add_argument("--wfo", action="store_true",
                          help="run Walk-Forward Optimization: re-optimizes fresh on each fold's train "
@@ -814,6 +995,10 @@ def main():
             full_mc_sims=args.search_full_mc_sims, walk_forward_folds=args.search_walk_forward_folds,
             robustness_neighbors=args.search_robustness_neighbors, fitness_metric=args.search_metric,
             seed=args.search_seed, db_path=args.search_db, promote=not args.search_no_promote,
+            cost_stress_enabled=not args.search_no_cost_stress,
+            cost_stress_multiplier=args.search_cost_stress_multiplier,
+            cost_stress_penalty_weight=args.search_cost_stress_weight,
+            pair_csv=args.pair_csv,
         )
     elif args.wfo:
         run_wfo_cli(
@@ -848,6 +1033,12 @@ def main():
             args.csv, args.output, objectives=args.mo_objectives, population=args.mo_population,
             generations=args.mo_generations, seed=args.mo_seed,
         )
+    elif args.ensemble:
+        run_ensemble_cli(
+            args.csv, args.ensemble_strategy or [], args.output,
+            mode=args.ensemble_mode, min_agreement=args.ensemble_min_agreement,
+            initial_balance=args.ensemble_balance, correlation_penalty_strength=args.ensemble_correlation_strength,
+        )
     elif args.wfga:
         run_wfga_cli(
             args.csv, args.output, n_folds=args.wfga_folds, window_mode=args.wfga_window_mode,
@@ -862,6 +1053,10 @@ def main():
             refine_generations=args.refine_generations,
             refine_metric=args.refine_metric,
             refine_seed=args.refine_seed,
+            refine_cost_stress_enabled=not args.refine_no_cost_stress,
+            refine_cost_stress_multiplier=args.refine_cost_stress_multiplier,
+            refine_cost_stress_weight=args.refine_cost_stress_weight,
+            adaptive_risk_rules_json=args.adaptive_risk_rules,
         )
     else:
         launch()

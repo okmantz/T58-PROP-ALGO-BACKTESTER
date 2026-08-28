@@ -196,6 +196,98 @@ def svg_histogram(
 """.strip()
 
 
+def svg_heatmap(
+    a_values: list[float],
+    b_values: list[float],
+    grid: list[list[float]],
+    a_label: str = "",
+    b_label: str = "",
+    width: int = 620,
+    height: int = 460,
+    title: str = "",
+) -> str:
+    """
+    A 2D parameter-sensitivity heatmap: grid[i][j] is the metric value at
+    (a_values[i], b_values[j]). Colored red (worst) -> yellow -> green
+    (best) so a person can see at a glance whether a strategy sits on a
+    stable plateau or a narrow, fragile ridge.
+    """
+    pad_left, pad_right, pad_top, pad_bottom = 70, 20, 34, 50
+    n_a, n_b = len(a_values), len(b_values)
+    if not n_a or not n_b:
+        return f'<svg width="{width}" height="{height}"><text x="20" y="20">No data.</text></svg>'
+
+    plot_w = max(width - pad_left - pad_right, 10)
+    plot_h = max(height - pad_top - pad_bottom, 10)
+    cell_w = plot_w / n_b
+    cell_h = plot_h / n_a
+
+    flat = [v for row in grid for v in row if math.isfinite(v)]
+    lo, hi = (min(flat), max(flat)) if flat else (0.0, 1.0)
+    if lo == hi:
+        lo -= 1
+        hi += 1
+
+    def color_for(v: float) -> str:
+        if not math.isfinite(v):
+            return "#cccccc"
+        t = max(0.0, min(1.0, (v - lo) / (hi - lo)))
+        # red (low) -> yellow (mid) -> green (high)
+        if t < 0.5:
+            r, g, b = 217, int(60 + t * 2 * (196 - 60)), 60
+        else:
+            t2 = (t - 0.5) * 2
+            r, g, b = int(217 - t2 * (217 - 60)), int(196 - t2 * (196 - 180) + t2 * 20), 60
+        return f"rgb({r},{g},{b})"
+
+    cells = []
+    for i in range(n_a):
+        for j in range(n_b):
+            v = grid[i][j]
+            x = pad_left + j * cell_w
+            y = pad_top + i * cell_h
+            cells.append(
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_w:.1f}" height="{cell_h:.1f}" '
+                f'fill="{color_for(v)}" stroke="#ffffff" stroke-width="1"/>'
+            )
+
+    a_axis_labels = []
+    for i, av in enumerate(a_values):
+        y = pad_top + i * cell_h + cell_h / 2 + 3
+        a_axis_labels.append(f'<text x="{pad_left - 6}" y="{y:.1f}" font-size="9" fill="#444" text-anchor="end">{av:g}</text>')
+
+    b_axis_labels = []
+    for j, bv in enumerate(b_values):
+        x = pad_left + j * cell_w + cell_w / 2
+        b_axis_labels.append(
+            f'<text x="{x:.1f}" y="{pad_top + plot_h + 14}" font-size="9" fill="#444" '
+            f'text-anchor="middle" transform="rotate(45 {x:.1f} {pad_top + plot_h + 14})">{bv:g}</text>'
+        )
+
+    title_el = f'<text x="{pad_left}" y="14" font-size="12" font-weight="700" fill="#111">{title}</text>' if title else ""
+    a_label_el = (
+        f'<text x="14" y="{pad_top + plot_h / 2:.1f}" font-size="10" fill="#666" '
+        f'transform="rotate(-90 14 {pad_top + plot_h / 2:.1f})" text-anchor="middle">{a_label}</text>'
+        if a_label else ""
+    )
+    b_label_el = (
+        f'<text x="{pad_left + plot_w / 2:.1f}" y="{height - 4}" font-size="10" fill="#666" text-anchor="middle">{b_label}</text>'
+        if b_label else ""
+    )
+
+    return f"""
+<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>
+  {title_el}
+  {''.join(cells)}
+  {''.join(a_axis_labels)}
+  {''.join(b_axis_labels)}
+  {a_label_el}
+  {b_label_el}
+</svg>
+""".strip()
+
+
 def svg_multi_line_chart(
     series: list[tuple[str, list[float], str]],
     width: int = 760,

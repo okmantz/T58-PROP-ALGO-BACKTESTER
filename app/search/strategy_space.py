@@ -161,6 +161,10 @@ class SkeletonSpec:
     param_grid: dict[str, list]
     build: Callable[[dict], dict]
     valid: Callable[[dict], bool] = field(default=lambda params: True)
+    requires_pair_data: bool = False   # True only for the stat_pairs family -- see
+    # app.data.pairs.merge_pair_series; generate_search_space()/batch_runner surface a
+    # clear error up front if this family is requested without a "pair_close" column
+    # merged into the working DataFrame, instead of letting it fail bar-by-bar as NaNs.
 
     def combinations(self) -> list[dict]:
         keys = list(self.param_grid.keys())
@@ -376,11 +380,265 @@ _MEAN_REVERSION_BAND = SkeletonSpec(
 )
 
 
+# ---------------------------------------------------------------------------
+# Family D: Volatility Breakout
+#   A Donchian-style breakout taken ONLY while the market's own ATR regime
+#   is expanding relative to its recent baseline -- a distinct hypothesis
+#   from Family A's trend-breakout, which filters by trend DIRECTION (EMA
+#   alignment) rather than by volatility STATE. Many real breakout edges
+#   depend on catching genuine range expansion, not just any N-bar high;
+#   trading every breakout regardless of the prevailing volatility regime
+#   is a common way that family fails in a way this family is built to
+#   avoid.
+# ---------------------------------------------------------------------------
+
+def _build_volatility_breakout(p: dict) -> dict:
+    lookback, atr_period, expansion_mult = p["lookback"], p["atr_period"], p["expansion_mult"]
+    return {
+        "name": f"Volatility Breakout (lb={lookback}, atr{atr_period} x{expansion_mult} expansion)",
+        "entry_conditions": {
+            "long": [
+                _cond(_breakout_flag(lookback, "bullish"), "is true", _val(1)),
+                _cond({"type": "atr_regime", "period": atr_period, "expansion_mult": expansion_mult}, "==", _val(1)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_breakout_flag(lookback, "bearish"), "is true", _val(1)),
+                _cond({"type": "atr_regime", "period": atr_period, "expansion_mult": expansion_mult}, "==", _val(1)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p.get("max_bars")),
+    }
+
+
+_VOLATILITY_BREAKOUT = SkeletonSpec(
+    name="volatility_breakout",
+    label="Volatility Breakout (Donchian + ATR expansion filter)",
+    description=(
+        "N-bar breakout taken only while ATR is running materially above its own recent "
+        "baseline (an expanding-volatility regime), regardless of trend direction. A "
+        "distinct hypothesis from Family A: this filters by volatility STATE, not trend "
+        "direction, so it can fire on genuine range-expansion moves a pure trend filter "
+        "would miss or wrongly admit."
+    ),
+    param_grid={
+        "lookback": [10, 20, 40],
+        "atr_period": [14, 20],
+        "expansion_mult": [1.05, 1.15],
+        "stop_atr_mult": [1.0, 1.5, 2.0],
+        "target_atr_mult": [2.0, 3.0, 4.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_volatility_breakout,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family E: Session / Time-of-Day Effect
+#   Trades an opening-range breakout, but ONLY within a specific session
+#   window (e.g. the first hours after a session open). A genuinely
+#   different hypothesis class from A-D: it bets that a particular clock-
+#   time window has structurally different order flow (session opens,
+#   overlap windows) rather than betting on any price- or volatility-based
+#   pattern that could occur at any hour.
+# ---------------------------------------------------------------------------
+
+def _build_session_time_effect(p: dict) -> dict:
+    start, end = p["session_start"], p["session_end"]
+    return {
+        "name": f"Session Effect ({start}-{end} opening-range breakout)",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("close", 1), ">",
+                      {"type": "opening_range_high", "session_start": start, "session_end": end}),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("close", 1), "<",
+                      {"type": "opening_range_low", "session_start": start, "session_end": end}),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [], "short": [],
+            "long_connectors": [], "short_connectors": [],
+        },
+        "risk_management": _risk_management(
+            p["stop_atr_mult"], p["target_atr_mult"],
+            max_bars_in_trade=p["max_bars"],
+        ),
+        # A clock-time flat-by exit is essential for a session strategy --
+        # without it a trade opened near the session window's own close
+        # can run indefinitely into hours the hypothesis says nothing about.
+        "_time_based_exit": p["flat_time"],
+    }
+
+
+def _apply_time_based_exit(config: dict) -> dict:
+    flat_time = config.pop("_time_based_exit", None)
+    if flat_time:
+        config["risk_management"]["time_based_exit"] = {"enabled": True, "time": flat_time}
+    return config
+
+
+_SESSION_TIME_EFFECT = SkeletonSpec(
+    name="session_time_effect",
+    label="Session / Time-of-Day Effect (opening-range breakout, session-gated)",
+    description=(
+        "Bets on a specific clock-time window (e.g. a session open) having structurally "
+        "different order flow than the rest of the day: takes an opening-range breakout, "
+        "but ONLY within that session window, and force-flattens by a configured clock "
+        "time so the trade can't run on into hours the hypothesis makes no claim about. "
+        "A genuinely different edge source from A-D -- this one is about WHEN, not what "
+        "price or volatility is doing."
+    ),
+    param_grid={
+        "session_start": ["08:30", "13:30"],
+        "session_end": ["10:30", "15:30"],
+        "flat_time": ["16:00"],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.5],
+        "max_bars": [12, 24],
+    },
+    build=lambda p: _apply_time_based_exit(_build_session_time_effect(p)),
+    valid=lambda p: p["session_start"] < p["session_end"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Family F: Volume-Imbalance
+#   Trades in the direction of a rolling signed-volume imbalance (more
+#   volume trading through up-close bars than down-close bars, or vice
+#   versa) once it exceeds a threshold -- an order-flow-pressure hypothesis,
+#   independent of price pattern or volatility regime. Requires the market
+#   data to include a real volume column; on volume-less feeds (some FX
+#   sources report tick count as a volume proxy, which still works here)
+#   app.strategy.indicators.volume_delta degrades to a flat 0.0 series, so
+#   this family will simply generate zero trades rather than fail loudly --
+#   Stage 1's cheap filter drops zero-trade candidates on its own.
+# ---------------------------------------------------------------------------
+
+def _build_volume_imbalance(p: dict) -> dict:
+    period, threshold = p["period"], p["threshold"]
+    return {
+        "name": f"Volume Imbalance (period={period}, thresh={threshold})",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "volume_delta", "period": period}, ">", _val(threshold)),
+                _cond(_ind("close", 1), ">", {"type": "price", "field": "open"}),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond({"type": "volume_delta", "period": period}, "<", _val(-threshold)),
+                _cond(_ind("close", 1), "<", {"type": "price", "field": "open"}),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond({"type": "volume_delta", "period": period}, "<", _val(0.0))],
+            "short": [_cond({"type": "volume_delta", "period": period}, ">", _val(0.0))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_VOLUME_IMBALANCE = SkeletonSpec(
+    name="volume_imbalance",
+    label="Volume Imbalance (signed-volume pressure)",
+    description=(
+        "Trades in the direction of a rolling signed-volume imbalance (volume weighted "
+        "toward up-close vs. down-close bars) once it clears a threshold, exiting when "
+        "the imbalance flips back through zero. An order-flow-pressure hypothesis, "
+        "independent of the price-pattern and volatility-regime hypotheses in the other "
+        "families -- degrades to zero trades (not an error) on volume-less data."
+    ),
+    param_grid={
+        "period": [10, 20, 40],
+        "threshold": [0.15, 0.3, 0.45],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.5],
+        "max_bars": [24, 48],
+    },
+    build=_build_volume_imbalance,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family G: Statistical Pairs / Relative Value
+#   Mean-reverts the PRIMARY instrument against a second, correlated
+#   instrument's price -- a genuinely different edge source from every
+#   other family here, none of which look outside the single instrument
+#   being tested at all. Requires the working DataFrame to already have a
+#   second instrument's close merged in as a "pair_close" column (see
+#   app.data.pairs.merge_pair_series) BEFORE this family is run; the
+#   engine itself stays single-instrument (see that module's docstring for
+#   why), so only the PRIMARY leg is ever actually traded here -- this is
+#   an honest, explicitly-scoped proxy for a full two-leg pairs trade, not
+#   one, and is documented as such rather than silently pretending to
+#   trade both legs.
+# ---------------------------------------------------------------------------
+
+def _build_stat_pairs(p: dict) -> dict:
+    period, entry_z, exit_z = p["period"], p["entry_z"], p["exit_z"]
+    return {
+        "name": f"Stat Pairs Relative Value (period={period}, entry_z={entry_z})",
+        "entry_conditions": {
+            "long": [_cond({"type": "pair_zscore", "period": period}, "<", _val(-entry_z))],
+            "short": [_cond({"type": "pair_zscore", "period": period}, ">", _val(entry_z))],
+        },
+        "exit_conditions": {
+            "long": [_cond({"type": "pair_zscore", "period": period}, ">", _val(-exit_z))],
+            "short": [_cond({"type": "pair_zscore", "period": period}, "<", _val(exit_z))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_STAT_PAIRS = SkeletonSpec(
+    name="stat_pairs",
+    label="Statistical Pairs / Relative Value (requires merged pair data)",
+    description=(
+        "Mean-reverts the primary instrument's price ratio against a second, correlated "
+        "instrument once their relative-value z-score stretches past a threshold, exiting "
+        "as it reverts toward zero. REQUIRES a 'pair_close' column already merged into the "
+        "working data via app.data.pairs.merge_pair_series() -- only the primary instrument "
+        "is actually traded (this app's engine is single-instrument), so treat this as a "
+        "relative-value ENTRY FILTER on the primary leg, not a full two-leg pairs trade."
+    ),
+    param_grid={
+        "period": [30, 50, 100],
+        "entry_z": [1.5, 2.0, 2.5],
+        "exit_z": [0.25, 0.5],
+        "stop_atr_mult": [1.5, 2.0],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [48, 96],
+    },
+    build=_build_stat_pairs,
+    valid=lambda p: p["exit_z"] < p["entry_z"],
+    requires_pair_data=True,
+)
+
+
 FAMILIES: dict[str, SkeletonSpec] = {
     _TREND_BREAKOUT.name: _TREND_BREAKOUT,
     _MTF_PULLBACK.name: _MTF_PULLBACK,
     _MEAN_REVERSION_BAND.name: _MEAN_REVERSION_BAND,
+    _VOLATILITY_BREAKOUT.name: _VOLATILITY_BREAKOUT,
+    _SESSION_TIME_EFFECT.name: _SESSION_TIME_EFFECT,
+    _VOLUME_IMBALANCE.name: _VOLUME_IMBALANCE,
+    _STAT_PAIRS.name: _STAT_PAIRS,
 }
+
+# Families that need something beyond the plain OHLCV df -- checked by
+# generate_search_space() and by batch_runner.run_search() so a family
+# needing "pair_close" merged in first fails with one clear message up
+# front, instead of quietly producing zero-trade candidates for every
+# single grid point.
+FAMILIES_REQUIRING_PAIR_DATA = {name for name, spec in FAMILIES.items() if spec.requires_pair_data}
 
 
 def list_families() -> dict[str, str]:
@@ -518,6 +776,7 @@ def generate_search_space(
     max_candidates: int = 2000,
     seed: int = 42,
     grid_points_per_gene: int = 3,
+    has_pair_data: bool = False,
 ) -> SearchSpace:
     """
     mode="single":
@@ -577,6 +836,21 @@ def generate_search_space(
     for fam in families_to_run:
         if fam not in FAMILIES:
             raise StrategySpaceError(f"Unknown strategy family '{fam}'. Known families: {list(FAMILIES)}")
+
+    if not has_pair_data:
+        requested_pair_families = [f for f in families_to_run if f in FAMILIES_REQUIRING_PAIR_DATA]
+        if requested_pair_families:
+            if family in (None, "all"):
+                # Searching "all" families with no pair data merged in: skip the
+                # pair-only families rather than failing the entire search --
+                # every other family still works fine on plain OHLCV data.
+                families_to_run = [f for f in families_to_run if f not in FAMILIES_REQUIRING_PAIR_DATA]
+            else:
+                raise StrategySpaceError(
+                    f"Family '{family}' requires a second instrument's price merged into the "
+                    "working data first (see app.data.pairs.merge_pair_series) and "
+                    "has_pair_data=True passed here. Merge pair data before searching this family."
+                )
 
     all_items: list[tuple[str, dict]] = []
     for fam in families_to_run:

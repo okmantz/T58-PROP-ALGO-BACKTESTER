@@ -121,6 +121,14 @@ class SearchStageConfig:
     ga_search_sims: int = 300
     stage2_top_n: int = 10                    # survivors that advance to Stage 3
 
+    # Stage 2 cost-stress: see RefinementConfig.cost_stress_* -- exposed here
+    # so a family-wide search can bias its whole GA toward candidates that
+    # survive worse execution, not just candidates that look best under the
+    # default cost assumptions.
+    cost_stress_enabled: bool = True
+    cost_stress_multiplier: float = 2.0
+    cost_stress_penalty_weight: float = 0.35
+
     # Stage 3 -- validation gate
     full_mc_sims: int = 3000
     walk_forward_folds: int = 4
@@ -233,6 +241,9 @@ def _stage2_task(
         generations=refine_kwargs["generations"],
         search_monte_carlo_sims=mc_search_sims,
         random_seed=seed,
+        cost_stress_enabled=refine_kwargs.get("cost_stress_enabled", True),
+        cost_stress_multiplier=refine_kwargs.get("cost_stress_multiplier", 2.0),
+        cost_stress_penalty_weight=refine_kwargs.get("cost_stress_penalty_weight", 0.35),
     )
     try:
         result = run_iterative_refinement(df, strategy, risk, prop_rules, mc_cfg, refine_cfg, progress_cb=None)
@@ -501,7 +512,12 @@ def run_search(
 
             # ---------------- Stage 2: GA refinement ----------------
             log(f"Stage 2/5: genetic-algorithm refinement on {len(survivors1)} surviving skeleton(s)...")
-            refine_kwargs = {"population": stage_cfg.ga_population, "generations": stage_cfg.ga_generations}
+            refine_kwargs = {
+                "population": stage_cfg.ga_population, "generations": stage_cfg.ga_generations,
+                "cost_stress_enabled": stage_cfg.cost_stress_enabled,
+                "cost_stress_multiplier": stage_cfg.cost_stress_multiplier,
+                "cost_stress_penalty_weight": stage_cfg.cost_stress_penalty_weight,
+            }
             futures = {
                 pool.submit(
                     _stage2_task, r["candidate_id"], _spec_from_record(r), refine_kwargs,

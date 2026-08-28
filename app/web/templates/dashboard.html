@@ -23,6 +23,35 @@
   <p>Live stats across every strategy run through the app -- desktop, web, and Search Lab all feed this.</p>
 </div>
 
+<div class="t58-card">
+  <h2>Market data library -- data/raw, grouped by instrument</h2>
+  {% if dataset_groups %}
+  <div class="t58-grid cols-3" style="gap:10px;">
+    {% for g in dataset_groups %}
+    <div class="t58-stat" style="text-align:left;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;">
+        <span style="font-weight:600;font-size:13px;">{{ g.instrument }}</span>
+        <span style="font-size:11px;color:var(--text-dim);">{{ g.file_count }} file{{ 's' if g.file_count != 1 }}</span>
+      </div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">
+        {{ "{:,}".format(g.total_rows) }} rows total
+        {% if g.empty_count %}
+        <span class="t58-pill fail" style="margin-left:6px;">{{ g.empty_count }} empty file{{ 's' if g.empty_count != 1 }}</span>
+        {% endif %}
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.6;">
+        {% for f in g.files %}
+        <span style="{{ 'opacity:0.4;text-decoration:line-through;' if f.empty }}">{{ f.name }}</span>{{ ", " if not loop.last }}
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="t58-empty">No CSVs found under data/raw/ yet -- upload one from Run &amp; report, or drop files into instrument subfolders there.</div>
+  {% endif %}
+</div>
+
 <div class="t58-grid cols-4" id="stat-cards">
   <div class="t58-stat">
     <div class="label">Strategies tested</div>
@@ -87,7 +116,7 @@
       </tbody>
     </table>
     {% else %}
-    <div class="t58-empty">No runs yet. Head to Run &amp; report and run your first strategy -- it'll show up here automatically.</div>
+    <div class="t58-empty">No backtests run yet. Your market data is loaded and ready above -- head to Run &amp; report and run your first strategy to populate this scorecard.</div>
     {% endif %}
   </div>
 </div>

@@ -37,7 +37,7 @@ from flask import (
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data.importer import import_csv, import_csv_bytes
-from app.data.storage import get_app_base_dir, get_raw_data_dir, list_stored_datasets, store_csv_bytes
+from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
@@ -283,7 +283,11 @@ def index():
 
 @app.route("/dashboard")
 def dashboard():
-    return render_template("dashboard.html", data=run_history.dashboard_data())
+    return render_template(
+        "dashboard.html",
+        data=run_history.dashboard_data(),
+        dataset_groups=list_datasets_by_instrument(),
+    )
 
 
 @app.route("/api/dashboard-data")

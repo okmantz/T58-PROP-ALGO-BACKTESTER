@@ -59,13 +59,14 @@ jobs:
           Write-Host ""
           Write-Host "=== RAW DATA FILES ==="
 
-          $rawFiles = Get-ChildItem "data\raw" -File -ErrorAction SilentlyContinue
+          $rawFiles = Get-ChildItem "data\raw" -File -Recurse -ErrorAction SilentlyContinue
 
           if ($rawFiles.Count -eq 0) {
             Write-Warning "data/raw exists but contains no files."
           }
           else {
-            $rawFiles | Select-Object Name, Length
+            Write-Host "Found $($rawFiles.Count) CSV file(s) under data/raw (including instrument subfolders):"
+            $rawFiles | Select-Object FullName, Length
           }
 
           Write-Host ""
@@ -162,7 +163,7 @@ jobs:
           }
 
           if (Test-Path "data\raw") {
-            $rawFiles = Get-ChildItem "data\raw" -File -ErrorAction SilentlyContinue
+            $rawFiles = Get-ChildItem "data\raw" -File -Recurse -ErrorAction SilentlyContinue
 
             if ($rawFiles.Count -gt 0) {
               Copy-Item `
@@ -184,16 +185,16 @@ jobs:
         run: |
           Write-Host "=== VERIFYING PACKAGED DATA ==="
 
-          $rawFiles = Get-ChildItem "release\data\raw" -File -ErrorAction SilentlyContinue
+          $rawFiles = Get-ChildItem "release\data\raw" -File -Recurse -ErrorAction SilentlyContinue
 
           if ($rawFiles.Count -eq 0) {
             Write-Warning "No CSV files were packaged into release/data/raw."
           }
           else {
-            Write-Host "Packaged CSV files:"
+            Write-Host "Packaged $($rawFiles.Count) CSV file(s) into release/data/raw (including instrument subfolders):"
             $rawFiles |
               Where-Object { $_.Extension -ieq ".csv" } |
-              Select-Object Name, Length
+              Select-Object FullName, Length
           }
 
       - name: Create ZIP package

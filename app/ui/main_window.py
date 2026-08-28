@@ -27,7 +27,7 @@ from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data.importer import import_csv
 from app.data.multi_timeframe import merge_multi_timeframe
-from app.data.storage import list_stored_datasets, store_csv_path
+from app.data.storage import EMPTY_DATASET_BYTES, list_datasets_by_instrument, list_stored_datasets, store_csv_path
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.parameter_space import RefinementError
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
@@ -750,6 +750,14 @@ class MainWindow:
         self._dash_stats_row = Frame(scroll_frame, bg=BG)
         self._dash_stats_row.pack(fill="x", padx=24, pady=(4, 14))
 
+        library_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        library_wrap.pack(fill="x", padx=24, pady=(0, 14))
+        Label(library_wrap, text="MARKET DATA LIBRARY — data/raw, BY INSTRUMENT", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=14, pady=(10, 4)
+        )
+        self._dash_library_frame = Frame(library_wrap, bg=PANEL)
+        self._dash_library_frame.pack(fill="x", padx=14, pady=(0, 14))
+
         universe_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         universe_wrap.pack(fill="x", padx=24, pady=(0, 14))
         Label(universe_wrap, text="STRATEGY UNIVERSE", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
@@ -829,6 +837,8 @@ class MainWindow:
             card = self._stat_card(self._dash_stats_row, label, value, color)
             card.pack(side="left", fill="both", expand=True, padx=6)
 
+        self._paint_data_library()
+
         self.root.after(30, lambda: self._paint_universe(data["graph"]))
         self.root.after(30, lambda: self._paint_equity(data["equity_series"]))
         self.root.after(30, lambda: self._paint_heatmap(data["heatmap"]))
@@ -842,6 +852,53 @@ class MainWindow:
                 f"{s['sharpe_ratio']:.2f}", f"{s['max_drawdown_pct']:.1f}%",
                 s["run_count"], "PASS" if s["single_run_passed"] else "FAIL",
             ))
+
+    def _paint_data_library(self):
+        for child in self._dash_library_frame.winfo_children():
+            child.destroy()
+        try:
+            groups = list_datasets_by_instrument()
+        except Exception:
+            groups = []
+
+        if not groups:
+            Label(
+                self._dash_library_frame,
+                text="No CSVs found under data/raw/ yet — upload one from the Data tab, or drop "
+                     "files into instrument subfolders there.",
+                bg=PANEL, fg=TEXT_DIM, font=_safe_font(9), wraplength=760, justify="left",
+            ).pack(anchor="w", pady=4)
+            return
+
+        n_cols = 3
+        grid = Frame(self._dash_library_frame, bg=PANEL)
+        grid.pack(fill="x")
+        for col in range(n_cols):
+            grid.grid_columnconfigure(col, weight=1, uniform="lib")
+
+        for i, g in enumerate(groups):
+            cell = Frame(grid, bg=PANEL_2, highlightthickness=1, highlightbackground=BORDER)
+            cell.grid(row=i // n_cols, column=i % n_cols, sticky="ew", padx=4, pady=4)
+
+            top = Frame(cell, bg=PANEL_2)
+            top.pack(fill="x", padx=10, pady=(8, 2))
+            Label(top, text=g["instrument"], bg=PANEL_2, fg=TEXT, font=_safe_font(9, "bold")).pack(side="left")
+            Label(
+                top, text=f"{g['file_count']} file{'s' if g['file_count'] != 1 else ''}",
+                bg=PANEL_2, fg=TEXT_DIM, font=_safe_font(7),
+            ).pack(side="right")
+
+            detail_text = f"{g['total_rows']:,} rows total"
+            Label(cell, text=detail_text, bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(8)).pack(
+                anchor="w", padx=10, pady=(0, 2)
+            )
+            if g["empty_count"]:
+                Label(
+                    cell, text=f"⚠ {g['empty_count']} empty file{'s' if g['empty_count'] != 1 else ''} (0 rows)",
+                    bg=PANEL_2, fg=AMBER, font=_safe_font(7, "bold"),
+                ).pack(anchor="w", padx=10, pady=(0, 8))
+            else:
+                Frame(cell, bg=PANEL_2, height=6).pack()
 
     def _paint_universe(self, graph):
         c = self._dash_universe_canvas
@@ -1063,8 +1120,19 @@ class MainWindow:
             self.dataset_listbox.insert(END, f"  {ds.name}")
 
         if self._stored_datasets and not self.csv_paths:
-            self.dataset_listbox.selection_set(0)
-            self._select_datasets([self._stored_datasets[0].path])
+            # Auto-select the first dataset with real data in it, not just
+            # the most-recently-modified file — with data organized into
+            # per-instrument folders it's common for some timeframes to be
+            # empty placeholder exports (0 rows), and mtimes on a fresh
+            # checkout/extraction can tie or favor one of those. Landing on
+            # an empty file here used to silently leave "no data" active
+            # (or pop a blocking error dialog) the moment the app opened.
+            candidates = [ds for ds in self._stored_datasets if ds.size_bytes > EMPTY_DATASET_BYTES]
+            chosen = candidates[0] if candidates else self._stored_datasets[0]
+            idx = self._stored_datasets.index(chosen)
+            self.dataset_listbox.selection_set(idx)
+            self.dataset_listbox.see(idx)
+            self._select_datasets([chosen.path], silent=True)
 
     def _on_dataset_selected(self, _event):
         sel = self.dataset_listbox.curselection()
@@ -1073,18 +1141,30 @@ class MainWindow:
         paths = [self._stored_datasets[i].path for i in sel]
         self._select_datasets(paths)
 
-    def _select_datasets(self, paths: list[Path]):
+    def _select_datasets(self, paths: list[Path], silent: bool = False):
         """Load and validate one or more selected CSVs. Multiple files are
-        treated as multiple timeframes for a multi-timeframe backtest."""
+        treated as multiple timeframes for a multi-timeframe backtest.
+
+        silent=True (used only for the automatic startup pick above) never
+        pops a blocking messagebox — an empty/invalid file just leaves the
+        status line red with an explanation, so the app can never freeze
+        on launch waiting for a dialog no one is there to dismiss."""
         results = []
         for path in paths:
             result = import_csv(path)
             if not result.is_valid:
-                messagebox.showerror(
-                    "Import failed",
-                    f"{path.name}:\n" + "\n".join(result.errors),
-                )
-                self.data_status.config(text=f"●  {path.name}: import failed.", fg=RED)
+                detail = "; ".join(result.errors) or "no rows found"
+                if silent:
+                    self.data_status.config(
+                        text=f"●  {path.name}: {detail} — pick another dataset from the list.",
+                        fg=AMBER,
+                    )
+                else:
+                    messagebox.showerror(
+                        "Import failed",
+                        f"{path.name}:\n" + "\n".join(result.errors),
+                    )
+                    self.data_status.config(text=f"●  {path.name}: import failed.", fg=RED)
                 return
             results.append((path, result))
 

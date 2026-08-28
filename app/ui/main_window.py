@@ -26,6 +26,11 @@ from tkinter import (
 
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
+from app.data import alpaca_credentials
+from app.data.alpaca_source import (
+    ASSET_CLASSES, ADJUSTMENT_CHOICES, FEED_CHOICES, TIMEFRAME_LABELS,
+    AlpacaFetchError, AlpacaImportError, fetch_bars, save_bars_as_csv, test_connection,
+)
 from app.data.importer import import_csv
 from app.data.multi_timeframe import merge_multi_timeframe
 from app.data.storage import EMPTY_DATASET_BYTES, list_datasets_by_instrument, list_stored_datasets, store_csv_path
@@ -135,7 +140,7 @@ def _safe_font(size=10, weight="normal"):
 
 
 class LabeledEntry(Frame):
-    def __init__(self, parent, label, default=""):
+    def __init__(self, parent, label, default="", secret=False, width=20):
         super().__init__(parent, bg=PANEL)
         self.configure(height=36)
 
@@ -151,10 +156,9 @@ class LabeledEntry(Frame):
 
         self.var = StringVar(value=str(default))
 
-        self.entry = Entry(
-            self,
+        entry_kwargs = dict(
             textvariable=self.var,
-            width=20,
+            width=width,
             bg=PANEL_3,
             fg=TEXT,
             insertbackground=TEXT,
@@ -164,6 +168,13 @@ class LabeledEntry(Frame):
             highlightcolor=BORDER_LIGHT,
             font=_safe_font(10),
         )
+        # secret=True masks the field like a password input -- used for API
+        # keys/secrets so they aren't visible over someone's shoulder or in
+        # a screen share.
+        if secret:
+            entry_kwargs["show"] = "\u2022"
+
+        self.entry = Entry(self, **entry_kwargs)
         self.entry.pack(side="left", ipady=5, padx=(4, 0))
 
         self.pack(fill="x", pady=3, padx=18)
@@ -1111,7 +1122,194 @@ class MainWindow:
             font=_safe_font(8),
         ).pack(anchor="w", padx=26)
 
+        self._build_alpaca_section(f)
+
         self._refresh_dataset_list()
+
+    # -----------------------------------------------------------------------
+    # Tab 1 — Market Data — Alpaca API fetch
+    # -----------------------------------------------------------------------
+
+    def _build_alpaca_section(self, parent):
+        """An alternative to picking local files above: fetch bars directly
+        from Alpaca using saved (or freshly entered) API keys. Fetched data
+        is written into data/raw/<SYMBOL>/ as a normal CSV, so it shows up
+        in the 'Available datasets' list above and can be picked -- alone
+        or Ctrl/Cmd-clicked together with other files -- exactly like any
+        manually imported CSV. This mirrors how the falsification-kit
+        scripts (fetch_5m.py / fetch_cache.py) pull bars via alpaca-py,
+        except keys are entered once here and saved for reuse instead of
+        being read from ALPACA_API_KEY/ALPACA_SECRET_KEY environment
+        variables every run."""
+        section = self._section(
+            parent,
+            "Fetch data from Alpaca",
+            "Alternative to local files above — pulls bars via the Alpaca API "
+            "(stocks + crypto only; no forex/futures/CFD feed) and saves them into "
+            "data/raw/ so they join the dataset list above.",
+        )
+
+        saved = alpaca_credentials.load_credentials()
+        prefill_key = saved.api_key if saved else ""
+        prefill_secret = saved.secret_key if saved else ""
+
+        self.alp_api_key = LabeledEntry(section, "Alpaca API key", prefill_key, secret=True, width=32)
+        self.alp_secret_key = LabeledEntry(section, "Alpaca secret key", prefill_secret, secret=True, width=32)
+        self.alp_save_keys = LabeledCheckbox(
+            section, "Save these keys on this computer for next time", default=bool(saved)
+        )
+
+        self.alp_asset_class = LabeledCombo(section, "Asset class", ASSET_CLASSES, default=ASSET_CLASSES[0])
+        self.alp_asset_class.combo.bind("<<ComboboxSelected>>", lambda _e: self._on_alpaca_asset_class_changed())
+        self.alp_symbols = LabeledEntry(
+            section, "Symbol(s), comma-separated", "AAPL", width=32
+        )
+        self.alp_timeframe = LabeledCombo(
+            section, "Timeframe", TIMEFRAME_LABELS, default="1Day"
+        )
+        self.alp_start = LabeledEntry(section, "Start date (YYYY-MM-DD)", "2024-01-01")
+        self.alp_end = LabeledEntry(section, "End date (YYYY-MM-DD)", "2026-01-01")
+        self.alp_feed = LabeledCombo(section, "Feed (stocks only)", FEED_CHOICES, default="iex")
+        self.alp_adjustment = LabeledCombo(
+            section, "Adjustment (stocks only)", ADJUSTMENT_CHOICES, default="raw"
+        )
+
+        btn_row = Frame(section, bg=PANEL)
+        btn_row.pack(anchor="w", padx=18, pady=(4, 4))
+
+        self.alp_test_btn = self._button(btn_row, "TEST CONNECTION", self._test_alpaca_connection)
+        self.alp_test_btn.pack(side="left")
+
+        self.alp_fetch_btn = self._button(btn_row, "FETCH & SAVE", self._fetch_alpaca_clicked, primary=True)
+        self.alp_fetch_btn.pack(side="left", padx=8)
+
+        self.alp_forget_btn = self._button(btn_row, "FORGET SAVED KEYS", self._forget_alpaca_keys)
+        self.alp_forget_btn.pack(side="left")
+
+        self.alpaca_status = Label(
+            section,
+            text="●  A free Alpaca paper-trading account provides API keys for data access.",
+            bg=PANEL,
+            fg=TEXT_MUTED,
+            font=_safe_font(9),
+            wraplength=760,
+            justify="left",
+        )
+        self.alpaca_status.pack(anchor="w", padx=18, pady=(2, 14))
+
+    def _on_alpaca_asset_class_changed(self):
+        # Feed/adjustment only apply to stock bars on Alpaca; crypto has
+        # neither concept, so grey them out rather than let them silently
+        # do nothing when Crypto is selected.
+        is_stock = self.alp_asset_class.get_str() == "Stock"
+        state = "readonly" if is_stock else "disabled"
+        self.alp_feed.combo.config(state=state)
+        self.alp_adjustment.combo.config(state=state)
+
+    def _set_alpaca_status(self, text, color=None):
+        self.alpaca_status.config(text=f"●  {text}", fg=color or TEXT_MUTED)
+        self.root.update_idletasks()
+
+    def _set_alpaca_buttons_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        self.alp_test_btn.config(state=state)
+        self.alp_fetch_btn.config(state=state)
+        self.alp_forget_btn.config(state=state)
+
+    def _maybe_save_alpaca_keys(self, api_key: str, secret_key: str):
+        if self.alp_save_keys.get():
+            alpaca_credentials.save_credentials(api_key, secret_key)
+
+    def _forget_alpaca_keys(self):
+        alpaca_credentials.clear_credentials()
+        self.alp_api_key.var.set("")
+        self.alp_secret_key.var.set("")
+        self.alp_save_keys.var.set(False)
+        self._set_alpaca_status("Saved keys removed from this computer.", GREEN)
+
+    def _test_alpaca_connection(self):
+        api_key = self.alp_api_key.get_str().strip()
+        secret_key = self.alp_secret_key.get_str().strip()
+        if not api_key or not secret_key:
+            messagebox.showwarning("Missing keys", "Enter both an API key and a secret key first.")
+            return
+
+        self._set_alpaca_buttons_enabled(False)
+        self._set_alpaca_status("Testing connection...", AMBER)
+
+        def worker():
+            try:
+                message = test_connection(api_key, secret_key)
+                self._maybe_save_alpaca_keys(api_key, secret_key)
+                self._set_alpaca_status(message, GREEN)
+            except (AlpacaImportError, AlpacaFetchError) as exc:
+                self._set_alpaca_status(str(exc), RED)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._set_alpaca_status(f"Unexpected error: {exc}", RED)
+            finally:
+                self._set_alpaca_buttons_enabled(True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _fetch_alpaca_clicked(self):
+        api_key = self.alp_api_key.get_str().strip()
+        secret_key = self.alp_secret_key.get_str().strip()
+        symbols = [s.strip() for s in self.alp_symbols.get_str().split(",") if s.strip()]
+        asset_class = self.alp_asset_class.get_str()
+        timeframe_label = self.alp_timeframe.get_str()
+        start = self.alp_start.get_str().strip()
+        end = self.alp_end.get_str().strip()
+        feed = self.alp_feed.get_str()
+        adjustment = self.alp_adjustment.get_str()
+
+        if not api_key or not secret_key:
+            messagebox.showwarning("Missing keys", "Enter both an API key and a secret key first.")
+            return
+        if not symbols:
+            messagebox.showwarning("Missing symbol", "Enter at least one symbol (comma-separated for more than one).")
+            return
+
+        self._set_alpaca_buttons_enabled(False)
+        threading.Thread(
+            target=self._fetch_alpaca_pipeline,
+            args=(api_key, secret_key, symbols, asset_class, timeframe_label, start, end, feed, adjustment),
+            daemon=True,
+        ).start()
+
+    def _fetch_alpaca_pipeline(self, api_key, secret_key, symbols, asset_class, timeframe_label, start, end, feed, adjustment):
+        try:
+            self._maybe_save_alpaca_keys(api_key, secret_key)
+            saved_paths = []
+            for i, symbol in enumerate(symbols, start=1):
+                self._set_alpaca_status(f"Fetching {symbol} ({i}/{len(symbols)})...", AMBER)
+                df = fetch_bars(
+                    api_key, secret_key, symbol, asset_class, timeframe_label, start, end,
+                    feed=feed, adjustment=adjustment,
+                )
+                dest = save_bars_as_csv(df, symbol, timeframe_label)
+                saved_paths.append(dest)
+                self._set_alpaca_status(f"Saved {symbol}: {len(df):,} bars -> {dest.name}", GREEN)
+
+            self._refresh_dataset_list()
+            if len(saved_paths) == 1:
+                self._select_datasets(saved_paths, silent=True)
+                self._set_alpaca_status(
+                    f"Done. {saved_paths[0].name} is now the active dataset.", GREEN
+                )
+            else:
+                names = ", ".join(p.name for p in saved_paths)
+                self._set_alpaca_status(
+                    f"Done. Saved {len(saved_paths)} file(s): {names}. "
+                    "Ctrl/Cmd-click them in the list above to combine as multi-timeframe, "
+                    "or pick just one.",
+                    GREEN,
+                )
+        except (AlpacaImportError, AlpacaFetchError) as exc:
+            self._set_alpaca_status(str(exc), RED)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._set_alpaca_status(f"Unexpected error: {exc}", RED)
+        finally:
+            self._set_alpaca_buttons_enabled(True)
 
     def _refresh_dataset_list(self):
         self.dataset_listbox.delete(0, END)

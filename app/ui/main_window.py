@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import traceback
@@ -1115,9 +1116,34 @@ class MainWindow:
     def _refresh_dataset_list(self):
         self.dataset_listbox.delete(0, END)
         self._stored_datasets = list_stored_datasets()
+        by_name = {ds.name: i for i, ds in enumerate(self._stored_datasets)}
 
-        for ds in self._stored_datasets:
-            self.dataset_listbox.insert(END, f"  {ds.name}")
+        # Grouped by instrument folder (e.g. data/raw/EURUSD/...) rather than
+        # a flat mtime-sorted list, so opening the Data tab actually shows
+        # "the different instrument folders" instead of one long file list.
+        groups = list_datasets_by_instrument()
+        self._dataset_row_map: dict[int, int] = {}      # listbox row -> _stored_datasets index
+        self._dataset_index_to_row: dict[int, int] = {}  # _stored_datasets index -> listbox row
+        row = 0
+        first_nonempty_row = None
+
+        for g in groups:
+            self.dataset_listbox.insert(END, f"\u2500\u2500 {g['instrument']} \u2500\u2500")
+            self.dataset_listbox.itemconfig(row, fg=TEXT_MUTED, selectforeground=TEXT_MUTED, selectbackground=PANEL)
+            row += 1
+            for file_info in g["files"]:
+                idx = by_name.get(file_info["full_name"])
+                if idx is None:
+                    continue
+                label = f"    {file_info['name']}" + ("   (empty)" if file_info["empty"] else "")
+                self.dataset_listbox.insert(END, label)
+                if file_info["empty"]:
+                    self.dataset_listbox.itemconfig(row, fg=TEXT_DIM)
+                elif first_nonempty_row is None:
+                    first_nonempty_row = row
+                self._dataset_row_map[row] = idx
+                self._dataset_index_to_row[idx] = row
+                row += 1
 
         if self._stored_datasets and not self.csv_paths:
             # Auto-select the first dataset with real data in it, not just
@@ -1127,18 +1153,18 @@ class MainWindow:
             # checkout/extraction can tie or favor one of those. Landing on
             # an empty file here used to silently leave "no data" active
             # (or pop a blocking error dialog) the moment the app opened.
-            candidates = [ds for ds in self._stored_datasets if ds.size_bytes > EMPTY_DATASET_BYTES]
-            chosen = candidates[0] if candidates else self._stored_datasets[0]
-            idx = self._stored_datasets.index(chosen)
-            self.dataset_listbox.selection_set(idx)
-            self.dataset_listbox.see(idx)
-            self._select_datasets([chosen.path], silent=True)
+            target_row = first_nonempty_row if first_nonempty_row is not None else next(iter(self._dataset_row_map), None)
+            if target_row is not None:
+                chosen = self._stored_datasets[self._dataset_row_map[target_row]]
+                self.dataset_listbox.selection_set(target_row)
+                self.dataset_listbox.see(target_row)
+                self._select_datasets([chosen.path], silent=True)
 
     def _on_dataset_selected(self, _event):
         sel = self.dataset_listbox.curselection()
-        if not sel:
+        paths = [self._stored_datasets[self._dataset_row_map[i]].path for i in sel if i in self._dataset_row_map]
+        if not paths:
             return
-        paths = [self._stored_datasets[i].path for i in sel]
         self._select_datasets(paths)
 
     def _select_datasets(self, paths: list[Path], silent: bool = False):
@@ -1221,8 +1247,11 @@ class MainWindow:
 
             for i, ds in enumerate(self._stored_datasets):
                 if ds.path == imported[-1]:
-                    self.dataset_listbox.selection_clear(0, END)
-                    self.dataset_listbox.selection_set(i)
+                    row = self._dataset_index_to_row.get(i)
+                    if row is not None:
+                        self.dataset_listbox.selection_clear(0, END)
+                        self.dataset_listbox.selection_set(row)
+                        self.dataset_listbox.see(row)
                     break
 
         if failed:
@@ -2836,6 +2865,7 @@ class MainWindow:
         "Family -- named hypothesis grid (Manual strategies only)": "family_named",
         "Family -- grid around my current Strategy tab config (any strategy type)": "family_grid",
         "Single -- re-validate my current Strategy tab config exactly as configured": "single",
+        "Bulk backtest -- upload multiple Python / PineScript / MQL5 files and run each one": "bulk_upload",
     }
 
     def _build_search_tab(self):
@@ -2886,6 +2916,40 @@ class MainWindow:
         self.search_grid_points = LabeledEntry(
             mode_section, "Grid points per parameter (grid-around-config mode above)", 3,
         )
+
+        bulk_section = self._section(
+            f, "Strategies to upload (Bulk backtest mode above)",
+            "Runs every file added here through the exact same pipeline as Run & Report -- "
+            "full historical backtest, prop-firm simulation, Monte Carlo, and a saved HTML "
+            "report each -- reusing the Prop Rules (Step 3) and Risk & Execution (Step 4) "
+            "settings and the dataset(s) currently loaded on the Data tab, so every strategy "
+            "is judged on the same terms. Mixing Python (.py), PineScript (.pine/.txt), and "
+            "MQL5 (.mq5) files in the same batch is fine -- each is detected by extension. "
+            "Every result is recorded automatically and shows up on the Dashboard afterward.",
+        )
+        bulk_list_frame = Frame(bulk_section, bg=PANEL)
+        bulk_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 8))
+
+        self.bulk_strategy_listbox = Listbox(
+            bulk_list_frame, height=6, selectmode=EXTENDED, exportselection=False,
+            bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+        )
+        self.bulk_strategy_listbox.pack(side="left", fill="both", expand=True)
+        bulk_scroll = ttk.Scrollbar(
+            bulk_list_frame, orient="vertical", command=self.bulk_strategy_listbox.yview,
+            style="T58.Vertical.TScrollbar",
+        )
+        bulk_scroll.pack(side="right", fill="y")
+        self.bulk_strategy_listbox.config(yscrollcommand=bulk_scroll.set)
+
+        bulk_btn_row = Frame(bulk_section, bg=BG)
+        bulk_btn_row.pack(fill="x", padx=18, pady=(0, 12))
+        self._button(bulk_btn_row, "ADD STRATEGY FILES...", self._bulk_add_files).pack(side="left")
+        self._button(bulk_btn_row, "REMOVE SELECTED", self._bulk_remove_selected).pack(side="left", padx=8)
+        self._button(bulk_btn_row, "CLEAR ALL", self._bulk_clear_files).pack(side="left")
+
+        self._bulk_strategy_paths: list[Path] = []
 
         space_section = self._section(
             f, "Search space size",
@@ -2985,6 +3049,59 @@ class MainWindow:
         # look) -- they're simply ignored by _search_run_pipeline in Single
         # mode.
 
+    def _bulk_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Add strategy files (Python / PineScript / MQL5)",
+            filetypes=[
+                ("Supported strategy files", "*.py *.pine *.pinescript *.mq5 *.mqh *.txt"),
+                ("Python strategies", "*.py"),
+                ("PineScript strategies", "*.pine *.pinescript *.txt"),
+                ("MQL5 strategies", "*.mq5 *.mqh"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        existing = {str(p) for p in self._bulk_strategy_paths}
+        for p in paths:
+            if p not in existing:
+                self._bulk_strategy_paths.append(Path(p))
+                self.bulk_strategy_listbox.insert(END, f"  {Path(p).name}")
+
+    def _bulk_remove_selected(self):
+        sel = list(self.bulk_strategy_listbox.curselection())
+        for i in reversed(sel):
+            self.bulk_strategy_listbox.delete(i)
+            del self._bulk_strategy_paths[i]
+
+    def _bulk_clear_files(self):
+        self.bulk_strategy_listbox.delete(0, END)
+        self._bulk_strategy_paths = []
+
+    @staticmethod
+    def _load_bulk_strategy(path: Path):
+        """Detect a strategy's source type by extension and construct it --
+        mirrors what the Strategy tab does per-type, just driven by a file
+        list instead of the tab's radio selection."""
+        suffix = path.suffix.lower()
+        if suffix == ".py":
+            return PythonStrategy(path)
+        if suffix in (".pine", ".pinescript"):
+            return PineScriptStrategy(path)
+        if suffix in (".mq5", ".mqh"):
+            return MQL5Strategy(path)
+        if suffix == ".txt":
+            # Ambiguous extension -- sniff for PineScript's declaration
+            # syntax before falling back to treating it as one.
+            try:
+                head = path.read_text(encoding="utf-8", errors="ignore")[:400]
+            except OSError:
+                head = ""
+            if "//@version" in head or "strategy(" in head or "indicator(" in head:
+                return PineScriptStrategy(path)
+            return PineScriptStrategy(path)
+        raise StrategyError(f"Unsupported strategy file type: {path.name}")
+
     def _log_search(self, msg: str):
         self.search_output.insert(END, msg + "\n")
         self.search_output.see(END)
@@ -3025,12 +3142,158 @@ class MainWindow:
                 "Please select a market data CSV in Step 1.",
             )
             return
+
+        mode_key = self._SEARCH_MODE_LABELS.get(self.search_mode.get_str(), "family_named")
+        if mode_key == "bulk_upload":
+            if not self._bulk_strategy_paths:
+                messagebox.showwarning(
+                    "No strategy files added",
+                    "Add at least one Python (.py), PineScript (.pine), or MQL5 (.mq5) "
+                    "file above before running a bulk backtest.",
+                )
+                return
+            self.search_output.delete("1.0", END)
+            self.open_search_report_btn.config(state="disabled")
+            self.promote_champion_btn.config(state="disabled")
+            self.open_champion_report_btn.config(state="disabled")
+            self.search_progress.start(10)
+            threading.Thread(target=self._run_bulk_backtest_pipeline, daemon=True).start()
+            return
+
         self.search_output.delete("1.0", END)
         self.open_search_report_btn.config(state="disabled")
         self.promote_champion_btn.config(state="disabled")
         self.open_champion_report_btn.config(state="disabled")
         self.search_progress.start(10)
         threading.Thread(target=self._search_run_pipeline, daemon=True).start()
+
+    def _run_bulk_backtest_pipeline(self):
+        """Runs every uploaded strategy file through the exact same
+        backtest -> prop-firm sim -> Monte Carlo -> report pipeline as
+        Run & Report, one after another, reusing the currently configured
+        Prop Rules / Risk / Monte Carlo settings so every strategy is
+        judged on the same terms. Each report funnels through
+        generate_full_report(), so every result is automatically recorded
+        into run_history and shows up on the Dashboard afterward -- no
+        separate wiring needed here."""
+        try:
+            self._log_search(f"Loading {len(self.csv_paths)} market data file(s)...")
+            per_file_results = []
+            for p in self.csv_paths:
+                result = import_csv(p)
+                if not result.is_valid:
+                    self._log_search(
+                        f"Import errors ({os.path.basename(p)}):\n" + "\n".join(result.errors)
+                    )
+                    return
+                per_file_results.append((p, result))
+
+            if len(per_file_results) == 1:
+                df = per_file_results[0][1].dataframe
+            else:
+                df, _labels = merge_multi_timeframe([r.dataframe for _, r in per_file_results])
+            self._log_search(f"Loaded {len(df)} bars.\n")
+
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            n_sims = self.mc_sims.get_int(10000)
+            method = self.mc_method.get_str().strip() or "bootstrap"
+            instrument = (
+                os.path.basename(self.csv_paths[0]) if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+            period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
+
+            total = len(self._bulk_strategy_paths)
+            results_summary = []
+
+            for i, path in enumerate(self._bulk_strategy_paths, start=1):
+                self._log_search(f"[{i}/{total}] {path.name}")
+                try:
+                    strategy = self._load_bulk_strategy(path)
+                except (StrategyError, Exception) as exc:
+                    self._log_search(f"  Skipped -- could not load strategy: {exc}\n")
+                    continue
+
+                try:
+                    bt_result = run_backtest(df, strategy, risk)
+                except Exception as exc:
+                    self._log_search(f"  Skipped -- backtest error: {exc}\n")
+                    continue
+
+                if not bt_result.trades:
+                    self._log_search("  Skipped -- 0 trades generated on this data.\n")
+                    continue
+
+                self._log_search(
+                    f"  Trades: {len(bt_result.trades)}  "
+                    f"Net profit: ${bt_result.statistics.net_profit:,.2f}  "
+                    f"Win rate: {bt_result.statistics.win_rate:.1f}%"
+                )
+
+                trade_pnls = [t.pnl for t in bt_result.trades]
+                trade_dates = [t.entry_time for t in bt_result.trades]
+                single_run = simulate_account(trade_pnls, trade_dates, rules)
+
+                mc_cfg = MonteCarloConfig(n_simulations=n_sims, method=method)
+                mc_result = run_monte_carlo(bt_result.trades, rules, mc_cfg)
+
+                try:
+                    holdout_comparison = run_holdout_comparison(df, strategy, risk, holdout_frac=0.2)
+                except Exception:
+                    holdout_comparison = None
+
+                paths = generate_full_report(
+                    output_dir=OUTPUT_DIR,
+                    basename=f"bulk_{i:02d}_{re.sub(r'[^A-Za-z0-9_-]+', '_', path.stem)}",
+                    strategy_name=path.stem,
+                    strategy_source_type=strategy.source_type,
+                    instrument=instrument,
+                    timeframe="unknown",
+                    backtest_period=period,
+                    backtest_result=bt_result,
+                    prop_rules=rules,
+                    prop_single_run=single_run,
+                    monte_carlo_result=mc_result,
+                    holdout_comparison=holdout_comparison,
+                    risk_config=risk,
+                    price_df=df,
+                )
+
+                self._log_search(
+                    f"  Eval pass probability: {mc_result.evaluation_pass_probability:.1f}%  "
+                    f"Report: {paths['html'].name}\n"
+                )
+                results_summary.append({
+                    "name": path.stem,
+                    "net_profit": bt_result.statistics.net_profit,
+                    "eval_pass": mc_result.evaluation_pass_probability,
+                    "html": paths["html"],
+                })
+
+            self._log_search(f"\nDone. {len(results_summary)}/{total} strategies produced a report.")
+            if results_summary:
+                ranked = sorted(results_summary, key=lambda r: r["eval_pass"], reverse=True)
+                self._log_search("\nRanked by eval pass probability:")
+                for r in ranked:
+                    self._log_search(
+                        f"  {r['eval_pass']:5.1f}%  ${r['net_profit']:>12,.2f}   {r['name']}"
+                    )
+                self._last_search_html_path = ranked[0]["html"]
+                self.open_search_report_btn.config(state="normal")
+                self._log_search(
+                    "\nOpen Leaderboard above opens the top-ranked strategy's report. "
+                    "Full results for all strategies are on the Dashboard tab."
+                )
+            try:
+                self._refresh_dashboard()
+            except Exception:
+                pass
+
+        except Exception:
+            self._log_search("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.search_progress.stop()
 
     def _search_run_pipeline(self):
         try:

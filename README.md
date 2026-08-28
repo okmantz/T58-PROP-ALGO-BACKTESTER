@@ -255,13 +255,16 @@ tuning one you already picked. A 5-stage funnel
 
 1. **Generate** a candidate pool — either a combinatorial grid across one
    of the built-in named-hypothesis families (trend/breakout, multi-
-   timeframe pullback, mean-reversion band —
+   timeframe pullback, mean-reversion band, volatility breakout, session/
+   time-of-day effect, volume imbalance, statistical pairs/relative-value —
    `app/search/strategy_space.py::FAMILIES`), or a grid over an uploaded
    strategy file's own tunable parameters.
 2. **Stage 1 — cheap filter**: a fast backtest-only pass over every
    candidate, gated by minimum trade count and profit factor.
 3. **Stage 2 — GA refinement**: the same Iterative Refinement engine from
-   Step 6, applied to each Stage-1 survivor's own tunable parameters.
+   Step 6, applied to each Stage-1 survivor's own tunable parameters —
+   including its cost-stress penalty (see Step 14 below), so the GA itself
+   is biased toward candidates whose edge survives worse execution.
 4. **Stage 3 — validation gate**: full Monte Carlo + walk-forward holdout +
    parameter-neighborhood robustness + Deflated Sharpe Ratio
    (`app/search/robustness.py`) — candidates that only look good in-sample
@@ -329,16 +332,72 @@ added specifically for Sensitivity). See **CLI reference** below for every
 flag; the desktop tabs expose the same functionality with live progress
 logs.
 
-**Known limitation, stated plainly**: `generate_signals(df)` (and its
-Manual/PineScript/MQL5 equivalents) is called once, statelessly, over the
-whole dataset before any P&L exists. None of the above — nor any strategy
-source — can implement its own account-state-dependent logic (today's
-running P&L, a consecutive-loss counter, a "phase" that auto-switches risk
-once a target is hit). That protection belongs at the engine level
-(`RiskConfig.daily_loss_limit_pct`, `RiskConfig.max_trades_per_day`, the
-Prop Rules tab), which is where T58 enforces it for every strategy
-uniformly — see `app/strategy/python.py`'s docstring for the full
-reasoning.
+**Known limitation, now closed for account-state logic (see Step 14)**:
+`generate_signals(df)` (and its Manual/PineScript/MQL5 equivalents) is
+still called once, statelessly, over the whole dataset before any P&L
+exists — no strategy source can implement its own account-state-dependent
+logic directly. What changed: that protection no longer has to be a hard
+binary breaker only. `app/backtest/adaptive_risk.py` adds a declarative,
+engine-level money-management layer (de-risk after N losses, cut size once
+a daily loss threshold is hit, coast once X% of the way to a profit
+target) that plugs into `run_backtest()` the same way
+`RiskConfig.daily_loss_limit_pct` already did — see Step 14 for the full
+rule set and an example.
+
+## Step 14 — Finding an Edge (widened Search Lab, cost-stress fitness, adaptive risk, ensembles)
+
+Steps 6-13 are all about validating a strategy rigorously once you already
+have one. This step is aimed one level upstream — at actually finding a
+real edge in the first place — across four additions:
+
+- **Wider Search Lab hypothesis space.** Four new named families join the
+  original three: **Volatility Breakout** (a Donchian breakout gated by
+  ATR expanding vs. its own baseline, not by trend direction), **Session /
+  Time-of-Day Effect** (an opening-range breakout confined to a specific
+  clock-time window, with a forced flat-by time), **Volume Imbalance**
+  (trades a rolling signed-volume-pressure oscillator,
+  `app/strategy/indicators.py::volume_delta`), and **Statistical Pairs /
+  Relative Value** (mean-reverts the primary instrument against a second,
+  merged-in instrument's price ratio z-score — see
+  `app/data/pairs.py::merge_pair_series()`; only the primary leg is
+  actually traded, since the engine stays single-instrument, so treat this
+  as a relative-value entry filter, not a full two-leg pairs trade). A
+  search over `family="all"` automatically skips the pairs family unless
+  you've merged in a second instrument first (`--pair-csv` on the CLI).
+- **Cost-stress-adjusted GA fitness.** Iterative Refinement, Search Lab's
+  Stage 2, and the Walk-Forward-Aware GA all now ALSO re-backtest every
+  candidate at spread/slippage/commission multiplied by
+  `cost_stress_multiplier` (default 2x) and blend that stressed-cost
+  result into the fitness the GA actually selects on
+  (`app/optimize/refinement.py::apply_cost_stress_penalty`) — on by
+  default, tunable via `cost_stress_penalty_weight` (0 = ignore, 1 = full
+  penalty), reported statistics/summaries in every report stay nominal
+  (un-stressed); only the scalar the GA breeds toward is adjusted. This is
+  distinct from Stage 3's cost-ladder check and the Refinement report's
+  own cost-ladder table, which only *report* cost sensitivity after the
+  fact — this feeds it back into what gets selected in the first place.
+- **Declarative adaptive risk layer** (`app/backtest/adaptive_risk.py`):
+  engine-level money-management rules — `consecutive_losses`,
+  `daily_loss_pct`, `daily_profit_pct`, `progress_to_target_pct` — each
+  scaling new-entry position size by a configured multiplier once
+  triggered; multiple active rules stack multiplicatively. Passed as an
+  optional `AdaptiveRiskConfig` into `run_backtest()`; every `Trade` records
+  the multiplier and which rule(s) were active when it opened, so a report
+  can show exactly when and why sizing was cut. CLI: `--adaptive-risk-rules
+  '{"rules": [{"trigger": "consecutive_losses", "threshold": 2,
+  "risk_multiplier": 0.5}], "profit_target_amount_pct": 8.0}'`.
+- **Multi-strategy ensembles** (`app/ensemble/ensemble.py`): the mirror
+  case of Step 11's multi-asset Portfolio — several *different*,
+  weakly-correlated strategies combined on the *same* instrument, instead
+  of one strategy across several instruments. Two modes: `run_ensemble_blend`
+  (each leg keeps trading independently at a correlation-adjusted risk
+  weight — reuses `app.portfolio.portfolio.run_portfolio_backtest`
+  unmodified, just pointed at one shared `df`) and `run_ensemble_vote`
+  (combines every leg's raw signal into one majority/threshold-vote entry,
+  run through the ordinary single-position engine; risk management is
+  inherited from the first-listed leg only). CLI: `--ensemble
+  --ensemble-strategy path1.py --ensemble-strategy path2.pine
+  --ensemble-mode blend|vote`.
 
 ## PineScript support (subset)
 
@@ -402,7 +461,8 @@ is not subject to any of this limitation.)
   (crossover/mutation/tournament selection/elitism/random immigrants) that
   power Iterative Refinement, the Search Lab's Stage 2, the Walk-Forward-
   Aware GA, and (via non-dominated sorting instead of scalar tournament)
-  Multi-Objective Optimization.
+  Multi-Objective Optimization. `refinement.py` also owns the cost-stress
+  penalty (Step 14) shared by all three GA-based searches.
 - **Report generator** (`app/reports/generator.py` + `app/reports/charts.py`,
   plus `refinement_report.py` and `validation_reports.py` for the
   research-stack features above): combines everything into a report,
@@ -435,11 +495,20 @@ current list with defaults — this is a summary, not the source of truth.
 | `--portfolio` (+ `--portfolio-csv` [repeatable, 2+ required] `/-balance/-correlation-strength`) | Multi-Asset Portfolio (Step 11) |
 | `--multi-objective` (+ `--mo-objectives/-population/-generations/-seed`) | Multi-Objective Optimization (Step 12) |
 | `--wfga` (+ `--wfga-folds/-window-mode/-population/-generations/-metric/-seed`) | Walk-Forward-Aware GA (Step 13) |
+| `--ensemble` (+ `--ensemble-strategy` [repeatable, 2+ required] `/-mode/-min-agreement/-balance/-correlation-strength`) | Multi-strategy ensemble, blend or vote (Step 14) |
 
-Each of the eight `--wfo`/`--cpcv`/`--pbo`/`--sensitivity`/`--portfolio`/
-`--multi-objective`/`--wfga` runs is mutually exclusive with the others and
-with `--search`/plain `--cli`; pick one per invocation. All write their
-report(s) under `--output` (default `reports/`).
+`--refine` and `--search` additionally accept `--refine-no-cost-stress` /
+`--refine-cost-stress-multiplier` / `--refine-cost-stress-weight` and
+`--search-no-cost-stress` / `--search-cost-stress-multiplier` /
+`--search-cost-stress-weight` respectively (Step 14's cost-stress fitness,
+on by default). `--search` also accepts `--pair-csv <path>` to merge in a
+second instrument so the `stat_pairs` family can be searched. Plain `--cli`
+accepts `--adaptive-risk-rules '<json>'` (Step 14's adaptive risk layer).
+
+Each of the nine `--wfo`/`--cpcv`/`--pbo`/`--sensitivity`/`--portfolio`/
+`--multi-objective`/`--wfga`/`--ensemble` runs is mutually exclusive with
+the others and with `--search`/plain `--cli`; pick one per invocation. All
+write their report(s) under `--output` (default `reports/`).
 
 ## MVP scope decisions
 
@@ -462,11 +531,12 @@ report(s) under `--output` (default `reports/`).
   cloud host). The Validation Lab (Steps 8-13) is desktop-only for now —
   it's fully usable headlessly via the CLI in the meantime.
 - One open position at a time (consistent with the standardized long/flat/
-  short signal model); no partial fills or multi-leg positions in v1. This
-  also means a strategy's own account-state-dependent logic (daily-loss
-  circuit breakers, consecutive-loss risk scaling, "phase" auto-switching)
-  cannot be expressed inside `generate_signals()` — see the Validation Lab
-  section above for why, and where that protection belongs instead.
+  short signal model); no partial fills or multi-leg positions in v1.
+  Account-state-dependent money management (daily-loss circuit breakers,
+  consecutive-loss risk scaling, progress-to-target coasting) still can't
+  be expressed inside a strategy's own `generate_signals()` — but is now
+  available as a first-class, declarative engine feature; see Step 14's
+  adaptive risk layer.
 - Multi-timeframe analysis is implemented as an as-of merge onto the finest
   selected timeframe (see step 1 above) rather than running fully separate
   per-timeframe backtests — this keeps every strategy source (Manual,
@@ -496,6 +566,7 @@ T58-Prop-Algo-Backtester/
 │   │   ├── importer.py         # CSV import + validation
 │   │   ├── storage.py          # persists imported CSVs alongside the app/exe
 │   │   ├── multi_timeframe.py  # merges multiple timeframes onto the finest one
+│   │   ├── pairs.py            # Step 14: merges a second instrument's close in for pairs/relative-value
 │   │   ├── alpaca_source.py    # optional Alpaca API data fetch (US equities/crypto)
 │   │   └── alpaca_credentials.py
 │   ├── strategy/                # manual / python / pinescript / mql5 adapters
@@ -507,6 +578,8 @@ T58-Prop-Algo-Backtester/
 │   │   ├── lookahead_check.py    # generic, code-agnostic lookahead-bias detector
 │   │   └── library.py            # persistent strategy library (save/load python/pinescript/mql5)
 │   ├── backtest/                 # execution engine, risk sizing, statistics, holdout comparison
+│   │   └── adaptive_risk.py      # Step 14: declarative consecutive-loss/daily-P&L/progress-to-target sizing rules
+│   ├── ensemble/ensemble.py       # Step 14: multi-strategy ensembles (blend or vote) on one instrument
 │   ├── optimize/
 │   │   ├── parameter_space.py / code_parameter_space.py   # shared gene discovery (all 4 strategy sources)
 │   │   ├── refinement.py         # Step 6: Iterative Refinement GA

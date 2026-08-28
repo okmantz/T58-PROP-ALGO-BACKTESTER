@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from app.backtest.adaptive_risk import AdaptiveRiskConfig
 from app.backtest.execution import Trade, run_execution
 from app.backtest.risk import RiskConfig
 from app.backtest.statistics import BacktestStatistics, compute_statistics
@@ -76,11 +77,19 @@ def run_holdout_comparison(
     }
 
 
-def run_backtest(df: pd.DataFrame, strategy: Strategy, risk: RiskConfig) -> BacktestResult:
+def run_backtest(
+    df: pd.DataFrame,
+    strategy: Strategy,
+    risk: RiskConfig,
+    adaptive_risk: AdaptiveRiskConfig | None = None,
+) -> BacktestResult:
     """
     df: standardized OHLCV DataFrame (see app.data.importer)
     strategy: any Strategy subclass instance (manual/python/pinescript/mql5)
     risk: RiskConfig describing sizing, costs, and execution assumptions
+    adaptive_risk: optional declarative money-management overlay (see
+        app.backtest.adaptive_risk) -- None/omitted runs exactly as before
+        this parameter existed.
     """
     strat_result: StrategyResult = strategy.generate(df)
 
@@ -94,6 +103,7 @@ def run_backtest(df: pd.DataFrame, strategy: Strategy, risk: RiskConfig) -> Back
         take_profit_distance=strat_result.take_profit_distance,
         trailing_stop_distance=strat_result.trailing_stop_distance,
         breakeven_trigger_r=strat_result.breakeven_trigger_r,
+        adaptive_risk=adaptive_risk,
     )
 
     stats = compute_statistics(trades, equity_curve, initial_balance=risk.initial_balance)

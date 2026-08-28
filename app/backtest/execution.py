@@ -18,6 +18,7 @@ from dataclasses import dataclass, asdict
 
 import pandas as pd
 
+from app.backtest.adaptive_risk import AdaptiveRiskConfig, AdaptiveRiskState
 from app.backtest.risk import RiskConfig
 
 
@@ -35,6 +36,8 @@ class Trade:
     commission: float
     equity_after: float
     initial_risk: float | None = None  # |entry - stop| in raw price units, at entry time
+    adaptive_risk_multiplier: float = 1.0     # position-size multiplier in effect when this trade was OPENED
+    adaptive_risk_rules_active: tuple = ()    # human-readable labels of whichever adaptive-risk rule(s) fired
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -56,6 +59,7 @@ def run_execution(
     take_profit_distance: pd.Series | None = None,
     trailing_stop_distance: pd.Series | None = None,
     breakeven_trigger_r: float | None = None,
+    adaptive_risk: AdaptiveRiskConfig | None = None,
 ) -> tuple[list[Trade], pd.DataFrame]:
     """
     Returns (trades, equity_curve_df) where equity_curve_df has columns
@@ -73,11 +77,21 @@ def run_execution(
     breakeven_trigger_r: once open profit reaches this multiple of the
     trade's initial risk (entry-to-stop distance), the stop is moved to
     the entry price (only ever tightened, never loosened).
+
+    adaptive_risk: optional declarative money-management overlay (see
+    app.backtest.adaptive_risk) -- scales the SIZE of each new entry by
+    whatever multiplier its rules currently imply (consecutive losses,
+    today's realized P&L, progress toward a profit target). Evaluated
+    fresh at every entry decision using only trade outcomes ALREADY
+    realized as of that bar, so it introduces no lookahead. None/disabled
+    means every entry uses its full nominal size, unchanged from before
+    this parameter existed.
     """
     n = len(df)
     equity = risk.initial_balance
     equity_curve = []
     trades: list[Trade] = []
+    adaptive_state = AdaptiveRiskState(initial_balance=risk.initial_balance)
 
     open_trade: dict | None = None
     trades_today: dict[pd.Timestamp, int] = {}
@@ -158,7 +172,10 @@ def run_execution(
                     commission=risk.commission_per_trade,
                     equity_after=equity,
                     initial_risk=open_trade["initial_risk"],
+                    adaptive_risk_multiplier=open_trade["adaptive_multiplier"],
+                    adaptive_risk_rules_active=tuple(open_trade["adaptive_rules_active"]),
                 ))
+                adaptive_state.record_trade_close(pnl, is_new_day=bar_date not in pnl_today)
                 pnl_today[bar_date] = pnl_today.get(bar_date, 0.0) + pnl
                 open_trade = None
                 force_closed_count += 1
@@ -243,7 +260,10 @@ def run_execution(
                     commission=risk.commission_per_trade,
                     equity_after=equity,
                     initial_risk=open_trade["initial_risk"],
+                    adaptive_risk_multiplier=open_trade["adaptive_multiplier"],
+                    adaptive_risk_rules_active=tuple(open_trade["adaptive_rules_active"]),
                 ))
+                adaptive_state.record_trade_close(pnl, is_new_day=bar_date not in pnl_today)
                 pnl_today[bar_date] = pnl_today.get(bar_date, 0.0) + pnl
                 open_trade = None
 
@@ -297,6 +317,13 @@ def run_execution(
                     sizing_pips = stop_loss_pips or 0
                 size = risk.position_size(equity, sizing_pips)
 
+                adaptive_multiplier = 1.0
+                adaptive_rules_active: list[str] = []
+                if adaptive_risk is not None and adaptive_risk.enabled:
+                    adaptive_multiplier = adaptive_state.active_multiplier(adaptive_risk)
+                    adaptive_rules_active = adaptive_state.active_rule_labels(adaptive_risk)
+                    size *= adaptive_multiplier
+
                 if not math.isfinite(size) or size <= 0:
                     # Degenerate sizing (e.g. an ATR-based stop distance
                     # that rounds to ~0 for this bar) — skip this entry
@@ -330,6 +357,8 @@ def run_execution(
                         "initial_risk": initial_risk,
                         "breakeven_done": False,
                         "trailing_distance": bar_trail_distance,
+                        "adaptive_multiplier": adaptive_multiplier,
+                        "adaptive_rules_active": adaptive_rules_active,
                     }
                     trades_today[bar_date] = n_today + 1
 
@@ -356,7 +385,10 @@ def run_execution(
             commission=risk.commission_per_trade,
             equity_after=equity,
             initial_risk=open_trade["initial_risk"],
+            adaptive_risk_multiplier=open_trade["adaptive_multiplier"],
+            adaptive_risk_rules_active=tuple(open_trade["adaptive_rules_active"]),
         ))
+        adaptive_state.record_trade_close(pnl, is_new_day=pd.Timestamp(ts[i]).normalize() not in pnl_today)
 
     equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
 

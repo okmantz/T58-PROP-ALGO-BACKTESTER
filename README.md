@@ -1,4 +1,4 @@
-# T58 Trading — Prop Algo Backtester (MVP)
+# T58 Trading — Prop Algo Backtester
 
 Answers one question:
 
@@ -15,7 +15,16 @@ Market Data + Strategy + Risk + Prop Rules
         -> Comprehensive Report
 ```
 
-Three ways to run it: a **Windows desktop app (.exe)**, a **local Python app** (any OS), or a **mobile-friendly web app** you open in a phone browser.
+On top of that core loop sits a full research stack for finding, tuning, and
+stress-testing strategies before you ever risk a real evaluation fee:
+**Iterative Refinement** (single-strategy GA tuning), the **Search Lab**
+(multi-strategy discovery across a 5-stage funnel), and the **Validation
+Lab** (walk-forward optimization, combinatorial purged cross-validation,
+parameter sensitivity, multi-asset portfolios, multi-objective search, and
+a walk-forward-aware GA) — all described below.
+
+Three ways to run it: a **Windows desktop app (.exe)**, a **local Python app**
+(any OS), or a **mobile-friendly web app** you open in a phone browser.
 
 ## 1. Windows `.exe`
 
@@ -60,13 +69,17 @@ python -m app.main --cli --csv data/examples/EURUSD_5M_sample.csv --sims 10000  
 
 CLI output is written to `reports/report.{json,html}` plus `report_summary.csv`
 and `report_trades.csv`. Open `report.html` in a browser — it's self-contained
-(charts included, see below) and print-to-PDF friendly.
+(charts included, see below) and print-to-PDF friendly. See **CLI reference**
+below for every other headless mode (Iterative Refinement, Search Lab, and
+all six Validation Lab features).
 
 ## 3. Mobile app (web / installable PWA)
 
 Tkinter (the desktop GUI toolkit) can't run on a phone, so mobile access is
 provided as a lightweight **Flask web app that reuses the exact same
 engine** — no logic is duplicated between the desktop and mobile versions.
+(The Validation Lab tabs described below are currently desktop-only; the
+web app covers the core Steps 1-5 workflow.)
 
 ### Easiest: download `T58-Web-App.exe` (no Python install, no terminal)
 
@@ -98,7 +111,7 @@ QR code, serves on `http://0.0.0.0:5000`). You can also run the plainer
 From your phone's browser:
 
 - The page is mobile-responsive with the full 5-step workflow (upload CSV,
-  pick a strategy, set prop rules/risk, run).
+  pick a strategy, set prop rules/risk, run), plus Search Lab.
 - Tap **Share → Add to Home Screen** (iOS Safari) or the browser's **Install
   app** prompt (Android Chrome) to install it as a standalone PWA with its
   own icon (`app/web/static/manifest.json` + `sw.js`) — it opens without
@@ -109,7 +122,7 @@ From your phone's browser:
   phone instead. Running the Python server process directly *on* the phone
   itself is out of scope for this MVP.
 
-## Workflow (matches the product spec 1:1)
+## Workflow (Steps 1-5 — the core loop)
 
 1. **Upload Market Data** — CSV import with auto column-mapping, timestamp/OHLC
    validation, duplicate & gap detection (`app/data/importer.py`). A sample
@@ -126,6 +139,12 @@ From your phone's browser:
    backward merge — no lookahead) as `tfNN_open/high/low/close/volume`
    columns, e.g. `tf60_close`, `tf15_high`. Those columns are directly usable
    as a condition source in the strategy builder below.
+
+   **Alpaca API fetch** (`app/data/alpaca_source.py`): an alternative to
+   picking local files — pulls bars directly from Alpaca (US equities +
+   crypto only; no forex/futures/CFD feed) using saved or freshly entered
+   API keys (`app/data/alpaca_credentials.py`), and saves them into
+   `data/raw/` so they join the normal dataset list.
 
 2. **Import/Create a Strategy** — four adapters, all reduced to the same
    standardized `-1/0/1` signal series before hitting the backtest engine
@@ -157,17 +176,46 @@ From your phone's browser:
        initial risk, e.g. "+1R"), a Time-Based Exit, Maximum Bars in Trade,
        an Opposite-Signal-Exit toggle, and Indicator Exit conditions (built
        the same way as entry conditions).
-   - **Python** — upload/paste a `.py` file exposing `generate_signals(df)`.
+   - **Python** — upload/paste a `.py` file exposing `generate_signals(df)`
+     (see `app/strategy/python.py`'s docstring for the full contract,
+     including the `.attrs` mechanism for per-trade dynamic stop/target/
+     trailing distances, and the multi-timeframe-bias lookahead trap it
+     specifically warns about).
    - **PineScript** (`app/strategy/pinescript.py`) and **MQL5**
      (`app/strategy/mql5.py`) — real parsers supporting a common subset of
      each language (see below), not full language implementations.
      Anything outside the supported subset raises a clear, specific
      `StrategyError` instead of silently producing an inaccurate backtest.
 
+   Every strategy — regardless of source — can be checked for **lookahead
+   bias** (`app/strategy/lookahead_check.py`) before you trust its numbers:
+   it re-runs the strategy's own signal generation on the data truncated
+   right after each of several checkpoints (chosen from where the strategy
+   actually fired a trade, not arbitrary evenly-spaced points) and diffs
+   the result against the full-data run. Any bar whose signal changes
+   depending on data that hadn't happened yet is a confirmed leak, named
+   with the exact bar/timestamp it first appears at. The same class of bug
+   — a naive higher-timeframe filter that leaks the still-forming current
+   HTF bar into every bar that isn't exactly on its boundary — was found
+   in a real uploaded strategy and flipped its reported result from
+   solidly profitable to a clear loser once fixed; see
+   `app/strategy/mtf.py`'s docstring for the exact before/after numbers and
+   `app/strategy/lookahead_check.py`'s own docstring for how the detector
+   itself works.
+
+   **Strategy Library** (`app/strategy/library.py`): any Python/PineScript/
+   MQL5 strategy can be saved *inside* the app's own data folder — the same
+   persistent, writable location `app.data.storage` uses for market-data
+   CSVs — instead of only ever being pulled from wherever it happens to
+   live on a particular computer or phone. Once saved, it shows up in the
+   library dropdown/listbox on every future run, with per-strategy status
+   tags, backtest/lookahead/search result history, and library-wide export.
+
 3. **Enter Prop-Firm Rules** — account size, eval profit target, daily loss
-   limit, max drawdown (trailing or static), consistency rule, minimum
-   trading days, payout threshold/cap/frequency, required buffer, max
-   position size (`app/prop/simulator.py::PropRules`).
+   limit, max drawdown (trailing or static, intrabar or end-of-day check
+   mode), consistency rule, minimum trading days, payout threshold/cap/
+   frequency, required buffer, max position size
+   (`app/prop/simulator.py::PropRules`).
 
 4. **Configure Risk & Execution** — fixed-$ or %-of-equity risk per trade,
    max trades/day, commission, slippage, spread, pip size
@@ -176,7 +224,123 @@ From your phone's browser:
 5. **Backtest -> Prop Simulation -> Monte Carlo -> Report** — one click in
    the GUI/web app's run step, or the `--cli` flag.
 
-### PineScript support (subset)
+## Step 6 — Iterative Refinement (optional)
+
+A genetic-algorithm-style parameter search: re-runs the current strategy
+many times with mutated numeric parameters on the *same* historical data,
+keeps the best-performing configurations each generation (elitism +
+tournament selection + random immigrants), and converges toward the
+best-scoring configuration it can find, judged by a configurable fitness
+metric (composite prop score, eval-pass probability, first-payout
+probability, expected payout, net profit, profit factor, or Sharpe —
+`app/optimize/refinement.py::FITNESS_METRICS`).
+
+Works across all four strategy sources via a shared gene-discovery layer
+(`app/optimize/parameter_space.py`, `app/optimize/code_parameter_space.py`):
+Manual Builder numeric fields, every top-level `SCREAMING_SNAKE_CASE`
+numeric constant in a Python strategy, every `input.int()`/`input.float()`
+in PineScript, and every `iMA()`/`iRSI()` period in MQL5 (plus the
+`T58_SL_PIPS`/`T58_TP_PIPS` directives for all three). A strategy with no
+such parameters says so clearly rather than running a meaningless search.
+Produces its own separate report (`app/reports/refinement_report.py`) and
+an "apply best configuration back to the Strategy tab" button — the normal
+Run & Report pipeline is completely unaffected unless you explicitly
+enable this.
+
+## Step 7 — Search Lab
+
+Discovers and validates *many* candidate strategies in one run, instead of
+tuning one you already picked. A 5-stage funnel
+(`app/search/batch_runner.py`):
+
+1. **Generate** a candidate pool — either a combinatorial grid across one
+   of the built-in named-hypothesis families (trend/breakout, multi-
+   timeframe pullback, mean-reversion band —
+   `app/search/strategy_space.py::FAMILIES`), or a grid over an uploaded
+   strategy file's own tunable parameters.
+2. **Stage 1 — cheap filter**: a fast backtest-only pass over every
+   candidate, gated by minimum trade count and profit factor.
+3. **Stage 2 — GA refinement**: the same Iterative Refinement engine from
+   Step 6, applied to each Stage-1 survivor's own tunable parameters.
+4. **Stage 3 — validation gate**: full Monte Carlo + walk-forward holdout +
+   parameter-neighborhood robustness + Deflated Sharpe Ratio
+   (`app/search/robustness.py`) — candidates that only look good in-sample
+   get filtered out here.
+5. **Stage 4/5 — leaderboard + champion promotion**: every surviving
+   candidate's results are stored in a queryable SQLite database
+   (`app/search/results_db.py`) and ranked; the top candidate can be
+   promoted to a full, standalone report exactly like a normal single-
+   strategy run.
+
+Completely separate from the normal Run & Report pipeline and from Step 6
+— running it doesn't touch either.
+
+## Steps 8-13 — Validation Lab
+
+Six additional statistical-rigor tools, each answering a different
+"how much should I actually trust this backtest?" question that a single
+in-sample run or a single 80/20 holdout split can't answer on its own.
+Each has its own desktop tab (sidebar group below Search Lab) and CLI flag;
+all six reuse the same gene-discovery/GA machinery as Iterative Refinement,
+so they work across Manual/Python/PineScript/MQL5 strategies consistently.
+
+- **08 — Walk-Forward Optimization** (`app/validation/walk_forward_opt.py`):
+  a first-class workflow, not just a holdout check. Splits the data into
+  rolling or anchored folds, runs a *fresh* GA search on each fold's train
+  window only, applies the winning configuration unchanged to that fold's
+  held-out test window, and chains every fold's out-of-sample trades into
+  ONE continuous equity curve — the number to trust over a single in-
+  sample backtest.
+- **09 — CPCV / PBO** (`app/validation/cpcv.py`): Combinatorial Purged
+  Cross-Validation stress-tests one strategy across many combinatorial
+  train/test partitions of the same data (not just one split); the
+  Probability of Backtest Overfitting (Bailey/López de Prado) checks a
+  *pool* of candidates and reports the probability that whichever one
+  looks best in-sample is, out-of-sample, no better than a coin flip.
+- **10 — Parameter Sensitivity** (`app/validation/sensitivity.py`): 1D
+  sweeps of every tunable parameter (±X%, with automatic "cliff"
+  detection for a knife-edge parameter vs. a real stable plateau), plus an
+  optional 2D heatmap for a chosen pair of parameters.
+- **11 — Multi-Asset Portfolio** (`app/portfolio/portfolio.py`): runs a
+  strategy across several instruments, computes their return correlation
+  matrix, re-weights each instrument's risk (correlated legs sized down),
+  and merges every leg's trades into one shared account equity curve —
+  modeling "one prop account trading several instruments," with an
+  explicit, documented set of simplifications (see the module's own
+  docstring) rather than pretending to be a full multi-position margin
+  engine.
+- **12 — Multi-Objective Optimization** (`app/optimize/multi_objective.py`):
+  a real NSGA-II implementation (non-dominated sorting + crowding
+  distance) producing a genuine Pareto front across several objectives at
+  once (e.g. Sharpe, max drawdown, eval-pass probability) instead of
+  collapsing them into one weighted score the way Step 6's GA does.
+  Picking a final winner from the front is left as a judgment call.
+- **13 — Walk-Forward-Aware GA** (`app/optimize/walkforward_ga.py`): the
+  same GA operators as Step 6, but every candidate's fitness is scored
+  *only* on chained out-of-sample fold data — never the training windows,
+  never the full dataset — so the search can't just curve-fit harder. Also
+  reports an "overfitting gap" (in-sample fitness vs. chained-OOS fitness
+  of the winning genome).
+
+Report generation for all six lives in `app/reports/validation_reports.py`
+(JSON + a focused, self-contained HTML page per feature, reusing
+`app/reports/charts.py`'s SVG chart helpers — including a 2D heatmap chart
+added specifically for Sensitivity). See **CLI reference** below for every
+flag; the desktop tabs expose the same functionality with live progress
+logs.
+
+**Known limitation, stated plainly**: `generate_signals(df)` (and its
+Manual/PineScript/MQL5 equivalents) is called once, statelessly, over the
+whole dataset before any P&L exists. None of the above — nor any strategy
+source — can implement its own account-state-dependent logic (today's
+running P&L, a consecutive-loss counter, a "phase" that auto-switches risk
+once a target is hit). That protection belongs at the engine level
+(`RiskConfig.daily_loss_limit_pct`, `RiskConfig.max_trades_per_day`, the
+Prop Rules tab), which is where T58 enforces it for every strategy
+uniformly — see `app/strategy/python.py`'s docstring for the full
+reasoning.
+
+## PineScript support (subset)
 
 Supported: `open/high/low/close/hl2/hlc3/ohlc4`, `input.int`/`input.float`,
 `ta.sma`/`ta.ema`/`ta.wma`/`ta.rsi`, `ta.crossover`/`ta.crossunder`, boolean
@@ -187,8 +351,13 @@ take-profit (Pine's own `strategy.exit()` uses absolute price offsets, which
 aren't a portable "pips" concept across instruments).
 Not supported: custom functions, arrays/matrices, `security()`/multi-timeframe
 requests, plotting/alerts, and any `ta.*` function beyond the list above.
+`input.int()`/`input.float()` values are usable as the *length* argument of a
+`ta.*` call, but not as a general numeric constant inside a comparison
+expression (e.g. `rsiVal < rsiThreshold`) — use a literal number there
+instead; only the four price columns, indicator outputs, and literal numbers
+are guaranteed to resolve inside a boolean expression.
 
-### MQL5 support (subset)
+## MQL5 support (subset)
 
 Supported: direct-value `iMA(...)` (`MODE_SMA`/`MODE_EMA`/`MODE_LWMA`) and
 `iRSI(...)` calls, C-style boolean conditions (`&& || ! > < >= <= == !=`),
@@ -197,9 +366,13 @@ Supported: direct-value `iMA(...)` (`MODE_SMA`/`MODE_EMA`/`MODE_LWMA`) and
 or OP_BUY/OP_SELL, ...)` for entries, `trade.PositionClose`/`OrderClose` for
 exits, and the same `// T58_SL_PIPS=` / `// T58_TP_PIPS=` directive comments.
 Not supported: `CopyBuffer()`-based indicator handles, custom indicators,
-arrays/structs, multi-symbol/multi-timeframe logic, and trailing stops.
+arrays/structs, multi-symbol/multi-timeframe logic, ATR or any indicator
+beyond iMA/iRSI, and trailing stops. `iMA()`'s `shift` argument is parsed
+but not used — there is no "previous bar's MA" available in this subset, so
+a true crossover *event* isn't expressible here (only sustained-state
+comparisons); write around this rather than relying on shift.
 (The Manual Builder's own trailing stop/break-even support, described above,
-is not subject to this limitation.)
+is not subject to any of this limitation.)
 
 ## Engines
 
@@ -208,7 +381,10 @@ is not subject to this limitation.)
   stop/target distances, a ratcheting ATR-based trailing stop, and
   break-even stop management — producing a trade list, equity curve, and
   the full statistics set from the spec (returns, win/loss, risk,
-  strategy-quality, risk-adjusted ratios).
+  strategy-quality, risk-adjusted ratios). Also home to
+  `run_holdout_comparison()` (a single chronological in-sample/out-of-
+  sample split, distinct from the fold-based Walk-Forward Optimization in
+  Step 8) and `app/strategy/lookahead_check.py`.
 - **Prop-firm simulator** (`app/prop/simulator.py`): walks a chronological
   trade P&L sequence through the configured rules, determining pass/fail,
   days to pass, payout events, and failure cause. This exact function is
@@ -222,16 +398,48 @@ is not subject to this limitation.)
   probability, first-payout probability, failure-before-payout, speed
   (days to pass/payout), financial outcome (expected/median payout), and
   risk (drawdown percentiles, risk of ruin, losing streaks).
-- **Report generator** (`app/reports/generator.py` + `app/reports/charts.py`):
-  combines everything into one report, exported as JSON, a flattened
-  summary CSV, a trades CSV, and a self-contained HTML report. The HTML
-  report includes inline SVG charts — no extra plotting dependency, no
-  external image files — covering the historical equity curve and, for the
-  Monte Carlo results, a histogram of simulated account returns and a
-  histogram of simulated max drawdown, each with median/P95 markers. HTML
-  was chosen over a PDF library dependency for the MVP — any browser can
-  print it to PDF with zero extra install burden; a dedicated PDF export
-  can be added later without changing the report data model.
+- **Optimization engines** (`app/optimize/`): the shared GA operators
+  (crossover/mutation/tournament selection/elitism/random immigrants) that
+  power Iterative Refinement, the Search Lab's Stage 2, the Walk-Forward-
+  Aware GA, and (via non-dominated sorting instead of scalar tournament)
+  Multi-Objective Optimization.
+- **Report generator** (`app/reports/generator.py` + `app/reports/charts.py`,
+  plus `refinement_report.py` and `validation_reports.py` for the
+  research-stack features above): combines everything into a report,
+  exported as JSON, a flattened summary CSV, a trades CSV, and a
+  self-contained HTML report. The HTML report includes inline SVG charts —
+  no extra plotting dependency, no external image files — covering the
+  historical equity curve, Monte Carlo return/drawdown histograms with
+  median/P95 markers, and (for the Validation Lab reports) chained
+  out-of-sample equity curves, Pareto-front convergence, and parameter
+  sensitivity heatmaps. HTML was chosen over a PDF library dependency for
+  the MVP — any browser can print it to PDF with zero extra install
+  burden.
+
+## CLI reference
+
+Every feature above a plain single-strategy run is also available headless
+via `python -m app.main --cli <flag> ...`. The base flags (`--csv`,
+`--output`, `--sims`) apply throughout; each feature's own flags are listed
+under its own heading. Run `python -m app.main --help` for the full,
+current list with defaults — this is a summary, not the source of truth.
+
+| Flag | Runs |
+|---|---|
+| `--refine` (+ `--refine-population/-generations/-metric/-seed`) | Iterative Refinement (Step 6) as part of the normal pipeline |
+| `--search` (+ `--search-mode/-family/-strategy-file/-grid-points/-max-candidates/-workers/-min-trades/-min-profit-factor/-stage1-top-n/-stage2-top-n/-ga-population/-ga-generations/-full-mc-sims/-walk-forward-folds/-robustness-neighbors/-metric/-seed/-db/-no-promote`) | Search Lab (Step 7), Stages 1-5 |
+| `--wfo` (+ `--wfo-folds/-window-mode/-train-frac/-population/-generations/-metric/-seed`) | Walk-Forward Optimization (Step 8) |
+| `--cpcv` (+ `--cpcv-groups/-test-groups/-metric/-max-paths`) | Combinatorial Purged Cross-Validation (Step 9) |
+| `--pbo` (+ `--pbo-groups/-test-groups/-metric/-max-paths/-candidates/-seed`) | Probability of Backtest Overfitting (Step 9) |
+| `--sensitivity` (+ `--sensitivity-metric/-pct-range/-steps/-heatmap`) | Parameter Sensitivity (Step 10) |
+| `--portfolio` (+ `--portfolio-csv` [repeatable, 2+ required] `/-balance/-correlation-strength`) | Multi-Asset Portfolio (Step 11) |
+| `--multi-objective` (+ `--mo-objectives/-population/-generations/-seed`) | Multi-Objective Optimization (Step 12) |
+| `--wfga` (+ `--wfga-folds/-window-mode/-population/-generations/-metric/-seed`) | Walk-Forward-Aware GA (Step 13) |
+
+Each of the eight `--wfo`/`--cpcv`/`--pbo`/`--sensitivity`/`--portfolio`/
+`--multi-objective`/`--wfga` runs is mutually exclusive with the others and
+with `--search`/plain `--cli`; pick one per invocation. All write their
+report(s) under `--output` (default `reports/`).
 
 ## MVP scope decisions
 
@@ -251,13 +459,24 @@ is not subject to this limitation.)
   iOS/Android build — this reuses the engine with zero duplication and
   needs no App Store/Play Store submission; it does need the Flask server
   running somewhere reachable (your own machine on Wi-Fi, or any small
-  cloud host).
+  cloud host). The Validation Lab (Steps 8-13) is desktop-only for now —
+  it's fully usable headlessly via the CLI in the meantime.
 - One open position at a time (consistent with the standardized long/flat/
-  short signal model); no partial fills or multi-leg positions in v1.
+  short signal model); no partial fills or multi-leg positions in v1. This
+  also means a strategy's own account-state-dependent logic (daily-loss
+  circuit breakers, consecutive-loss risk scaling, "phase" auto-switching)
+  cannot be expressed inside `generate_signals()` — see the Validation Lab
+  section above for why, and where that protection belongs instead.
 - Multi-timeframe analysis is implemented as an as-of merge onto the finest
   selected timeframe (see step 1 above) rather than running fully separate
   per-timeframe backtests — this keeps every strategy source (Manual,
   Python, PineScript, MQL5) working against one dataframe unchanged.
+- Multi-Asset Portfolio backtesting (Step 11) uses a static (whole-window)
+  correlation pass and combines legs by chronological trade-close time
+  rather than a fully unified multi-position margin engine — the right
+  model for "one account, one drawdown floor, several instruments," not
+  for a margin-constrained concurrent-position book. See
+  `app/portfolio/portfolio.py`'s docstring for the full reasoning.
 
 ## Project layout
 
@@ -265,36 +484,60 @@ is not subject to this limitation.)
 T58-Prop-Algo-Backtester/
 ├── run_app.py                  # PyInstaller entry point (repo root — see .exe section)
 ├── app/
-│   ├── main.py                # entry point (GUI, or --cli headless run)
+│   ├── main.py                 # entry point (GUI, or --cli headless run — see CLI reference)
 │   ├── ui/
-│   │   ├── main_window.py      # Tkinter desktop GUI (step wizard)
+│   │   ├── main_window.py      # Tkinter desktop GUI (13-step sidebar: Steps 1-7 core + 8-13 Validation Lab)
 │   │   └── condition_builder.py  # visual condition-row widget used by the Manual Builder
-│   ├── web/                   # Flask mobile/web app (same engine, new front end)
+│   ├── web/                    # Flask mobile/web app (same engine, new front end)
 │   │   ├── server.py
-│   │   ├── templates/index.html
+│   │   ├── templates/           # index, dashboard, search, search-job, and shared partials
 │   │   └── static/             # manifest.json, service worker, icons
 │   ├── data/
 │   │   ├── importer.py         # CSV import + validation
 │   │   ├── storage.py          # persists imported CSVs alongside the app/exe
-│   │   └── multi_timeframe.py  # merges multiple timeframes onto the finest one
-│   ├── strategy/               # manual / python / pinescript / mql5 adapters
-│   │   ├── indicators.py       # shared indicator math (SMA/EMA/WMA/RSI/MACD/ATR/Bollinger/etc.)
-│   │   ├── expr.py             # shared safe boolean-expression evaluator
-│   │   ├── manual.py           # visual-builder condition + risk-management engine
+│   │   ├── multi_timeframe.py  # merges multiple timeframes onto the finest one
+│   │   ├── alpaca_source.py    # optional Alpaca API data fetch (US equities/crypto)
+│   │   └── alpaca_credentials.py
+│   ├── strategy/                # manual / python / pinescript / mql5 adapters
+│   │   ├── indicators.py        # shared indicator math (SMA/EMA/WMA/RSI/MACD/ATR/Bollinger/etc.)
+│   │   ├── expr.py              # shared safe boolean-expression evaluator
+│   │   ├── manual.py            # visual-builder condition + risk-management engine
 │   │   ├── python.py / pinescript.py / mql5.py
-│   ├── backtest/                # execution engine, risk sizing, statistics
-│   ├── prop/simulator.py        # prop-firm rules + account simulator
+│   │   ├── mtf.py                # safe "last fully-closed HTF bar" helper (avoids the #1 real lookahead trap)
+│   │   ├── lookahead_check.py    # generic, code-agnostic lookahead-bias detector
+│   │   └── library.py            # persistent strategy library (save/load python/pinescript/mql5)
+│   ├── backtest/                 # execution engine, risk sizing, statistics, holdout comparison
+│   ├── optimize/
+│   │   ├── parameter_space.py / code_parameter_space.py   # shared gene discovery (all 4 strategy sources)
+│   │   ├── refinement.py         # Step 6: Iterative Refinement GA
+│   │   ├── multi_objective.py    # Step 12: NSGA-II Pareto-front optimization
+│   │   └── walkforward_ga.py     # Step 13: walk-forward-aware GA
+│   ├── validation/
+│   │   ├── walk_forward_opt.py   # Step 8: walk-forward optimization + fold splitting
+│   │   ├── cpcv.py                # Step 9: Combinatorial Purged CV + Probability of Backtest Overfitting
+│   │   └── sensitivity.py         # Step 10: 1D sweeps + 2D heatmaps
+│   ├── portfolio/portfolio.py     # Step 11: multi-asset portfolio backtesting
+│   ├── search/                    # Step 7: Search Lab (5-stage funnel)
+│   │   ├── strategy_space.py      # named-hypothesis families + candidate-spec builder
+│   │   ├── batch_runner.py        # Stages 1-5 orchestration
+│   │   ├── robustness.py          # walk-forward holdout, parameter-neighborhood robustness, Deflated Sharpe
+│   │   ├── results_db.py          # SQLite leaderboard storage
+│   │   └── search_report.py
+│   ├── prop/simulator.py          # prop-firm rules + account simulator
 │   ├── monte_carlo/engine.py
 │   └── reports/
-│       ├── generator.py         # JSON / CSV / HTML report export
-│       └── charts.py            # dependency-free SVG chart generation for the HTML report
+│       ├── generator.py           # JSON / CSV / HTML report export (single-strategy runs)
+│       ├── refinement_report.py   # Step 6 report
+│       ├── validation_reports.py  # Steps 8-13 reports (JSON + focused HTML per feature)
+│       └── charts.py              # dependency-free SVG chart generation, incl. 2D heatmaps
 ├── data/
-│   ├── examples/                # sample OHLCV dataset for immediate testing
-│   ├── raw/                     # dataset for common forex pairs (1min, 5min, 15min, 1hr, 4hr, and daily timeframes)
-├── tests/                        # pytest unit tests for every engine
+│   ├── examples/                  # sample OHLCV dataset for immediate testing
+│   ├── raw/                       # dataset for common forex pairs (1min, 5min, 15min, 1hr, 4hr, and daily timeframes)
+├── strategies/                    # persistent Strategy Library storage (python/pinescript/mql5 + metadata)
+├── tests/                         # pytest unit tests for every engine (~30 test files)
 └── .github/workflows/
-    ├── build.yml                 # runs pytest on push/PR
-    └── build-exe.yml             # builds & uploads the Windows .exe (entry point: run_app.py)
+    ├── build.yml                  # runs pytest on push/PR
+    └── build-exe.yml              # builds & uploads the Windows .exe (entry point: run_app.py)
 ```
 
 ## Tests

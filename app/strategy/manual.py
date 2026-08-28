@@ -95,8 +95,15 @@ class ManualStrategy(Strategy):
 
         if kind in {"ema", "sma", "wma", "rsi", "vwap", "macd", "macd_signal", "macd_histogram", "atr",
                     "bollinger_mid", "bollinger_upper", "bollinger_lower", "highest_high", "lowest_low",
-                    "average_volume", "candle_range", "percentage_change"}:
+                    "average_volume", "candle_range", "percentage_change", "relative_volume", "volume_delta",
+                    "pair_ratio", "pair_zscore"}:
             return build_indicator_series(work, kind, period=period, column=field, lookback=lookback)
+
+        if kind == "time_of_day":
+            ts = pd.to_datetime(work["timestamp"])
+            session_start = operand.get("session_start", "00:00")
+            session_end = operand.get("session_end", "23:59")
+            return self._session_mask(ts, session_start, session_end).astype(int)
 
         if kind == "candle_direction":
             bullish = work["close"] > work["open"]
@@ -239,19 +246,21 @@ class ManualStrategy(Strategy):
         return result.where(after_open).ffill()
 
     def _regime_series(self, work: pd.DataFrame, kind: str, period: int, operand: dict[str, Any]) -> pd.Series:
+        expansion_mult = float(operand.get("expansion_mult", 1.25) or 1.25)
+        contraction_mult = float(operand.get("contraction_mult", 0.75) or 0.75)
         atr = build_indicator_series(work, "atr", period, "close")
         if kind == "atr_regime":
             baseline = atr.rolling(max(period * 3, period + 1), min_periods=period).mean()
             out = pd.Series(0, index=work.index, dtype=int)
-            out[atr > baseline * 1.25] = 1
-            out[atr < baseline * 0.75] = -1
+            out[atr > baseline * expansion_mult] = 1
+            out[atr < baseline * contraction_mult] = -1
             return out
         returns = work["close"].pct_change()
         vol = returns.rolling(period, min_periods=period).std()
         baseline = vol.rolling(max(period * 3, period + 1), min_periods=period).mean()
         out = pd.Series(0, index=work.index, dtype=int)
-        out[vol > baseline * 1.25] = 1
-        out[vol < baseline * 0.75] = -1
+        out[vol > baseline * expansion_mult] = 1
+        out[vol < baseline * contraction_mult] = -1
         return out
 
     @staticmethod

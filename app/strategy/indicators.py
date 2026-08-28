@@ -96,6 +96,66 @@ def percentage_change(series: pd.Series, period: int = 1) -> pd.Series:
     return series.pct_change(_period(period)) * 100.0
 
 
+def relative_volume(frame: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Current bar's volume divided by its own trailing average -- >1 means
+    this bar traded on above-average participation. Falls back to a
+    constant 1.0 series when the data has no volume column (e.g. some FX
+    feeds), so a strategy that references it simply never fires rather
+    than crashing."""
+    if "volume" not in frame.columns:
+        return pd.Series(1.0, index=frame.index)
+    volume = frame["volume"]
+    avg = average_volume(volume, period)
+    return (volume / avg.replace(0, np.nan)).fillna(1.0)
+
+
+def volume_delta(frame: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Rolling sum of signed volume (candle-direction-signed: up-close bars
+    contribute +volume, down-close bars contribute -volume) over `period`
+    bars, normalized by the rolling sum of total volume so the result is a
+    dimensionless imbalance ratio in roughly [-1, 1] regardless of the
+    instrument's absolute volume scale. A simple, transparent proxy for
+    order-flow / buying-vs-selling pressure imbalance -- not a true
+    tick-level bid/ask delta (this app only has OHLCV bars, not trade-by-
+    trade prints), but directionally meaningful and, crucially, computed
+    only from already-closed bars (no lookahead)."""
+    if "volume" not in frame.columns:
+        return pd.Series(0.0, index=frame.index)
+    signed = frame["volume"].where(frame["close"] >= frame["open"], -frame["volume"])
+    p = _period(period)
+    signed_sum = signed.rolling(p, min_periods=p).sum()
+    total_sum = frame["volume"].rolling(p, min_periods=p).sum()
+    return (signed_sum / total_sum.replace(0, np.nan)).fillna(0.0)
+
+
+def pair_ratio(frame: pd.DataFrame, pair_column: str = "pair_close") -> pd.Series:
+    """Price ratio of this instrument's close to a second instrument's close
+    that has already been merged into `frame` as `pair_column` (see
+    app.data.pairs.merge_pair_series). Requires the merge step to have
+    happened first -- raises KeyError otherwise so a mis-set-up pairs
+    strategy fails loudly instead of silently trading on garbage."""
+    if pair_column not in frame.columns:
+        raise KeyError(
+            f"'{pair_column}' not found in market data -- a pairs/relative-value "
+            "strategy requires the second instrument's close to be merged in first "
+            "via app.data.pairs.merge_pair_series()."
+        )
+    return frame["close"] / frame[pair_column].replace(0, np.nan)
+
+
+def pair_zscore(frame: pd.DataFrame, period: int = 50, pair_column: str = "pair_close") -> pd.Series:
+    """Rolling z-score of the two-instrument price ratio -- the standard
+    statistical-arbitrage signal: how many standard deviations the current
+    ratio sits from its own trailing mean. A large positive/negative
+    z-score is the classic 'spread has stretched, bet on reversion' entry
+    trigger for a pairs strategy."""
+    ratio = pair_ratio(frame, pair_column)
+    p = _period(period)
+    mean = ratio.rolling(p, min_periods=p).mean()
+    std = ratio.rolling(p, min_periods=p).std(ddof=0)
+    return ((ratio - mean) / std.replace(0, np.nan)).fillna(0.0)
+
+
 def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
     return (a > b) & (a.shift(1) <= b.shift(1))
 
@@ -144,6 +204,14 @@ def build_indicator_series(frame: pd.DataFrame, kind: str, period: int = 14, col
         return candle_range(frame)
     if kind == "percentage_change":
         return percentage_change(source, p)
+    if kind == "relative_volume":
+        return relative_volume(frame, p)
+    if kind == "volume_delta":
+        return volume_delta(frame, p)
+    if kind == "pair_ratio":
+        return pair_ratio(frame)
+    if kind == "pair_zscore":
+        return pair_zscore(frame, p)
     raise KeyError(kind)
 
 

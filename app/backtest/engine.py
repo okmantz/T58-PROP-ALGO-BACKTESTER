@@ -6,7 +6,8 @@ Orchestrates: Dataset + Strategy + Risk/Execution Configuration
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import warnings as _warnings_module
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -24,6 +25,14 @@ class BacktestResult:
     equity_curve: pd.DataFrame
     statistics: BacktestStatistics
     initial_balance: float
+    warnings: list[str] = field(default_factory=list)
+    # ^ Execution-integrity warnings from app.backtest.execution.run_execution
+    # (fallback stops, forced daily-limit closes, pip-size/instrument
+    # mismatches, gap-through stop fills). run_execution raises these as
+    # ordinary Python RuntimeWarnings; nothing upstream was ever catching
+    # them, so on the desktop app (which doesn't surface stderr anywhere)
+    # they were silently invisible no matter how serious. Capturing them
+    # here, once, means every caller of run_backtest gets them for free.
 
 
 def run_holdout_comparison(
@@ -93,18 +102,21 @@ def run_backtest(
     """
     strat_result: StrategyResult = strategy.generate(df)
 
-    trades, equity_curve = run_execution(
-        df=df,
-        signals=strat_result.signals,
-        risk=risk,
-        stop_loss_pips=strat_result.stop_loss_pips,
-        take_profit_pips=strat_result.take_profit_pips,
-        stop_loss_distance=strat_result.stop_loss_distance,
-        take_profit_distance=strat_result.take_profit_distance,
-        trailing_stop_distance=strat_result.trailing_stop_distance,
-        breakeven_trigger_r=strat_result.breakeven_trigger_r,
-        adaptive_risk=adaptive_risk,
-    )
+    with _warnings_module.catch_warnings(record=True) as caught:
+        _warnings_module.simplefilter("always", RuntimeWarning)
+        trades, equity_curve = run_execution(
+            df=df,
+            signals=strat_result.signals,
+            risk=risk,
+            stop_loss_pips=strat_result.stop_loss_pips,
+            take_profit_pips=strat_result.take_profit_pips,
+            stop_loss_distance=strat_result.stop_loss_distance,
+            take_profit_distance=strat_result.take_profit_distance,
+            trailing_stop_distance=strat_result.trailing_stop_distance,
+            breakeven_trigger_r=strat_result.breakeven_trigger_r,
+            adaptive_risk=adaptive_risk,
+        )
+    execution_warnings = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
 
     stats = compute_statistics(trades, equity_curve, initial_balance=risk.initial_balance)
 
@@ -114,4 +126,5 @@ def run_backtest(
         equity_curve=equity_curve,
         statistics=stats,
         initial_balance=risk.initial_balance,
+        warnings=execution_warnings,
     )

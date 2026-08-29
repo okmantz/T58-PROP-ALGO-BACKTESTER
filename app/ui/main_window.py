@@ -5216,9 +5216,14 @@ class MainWindow:
             )
 
             self._log_fullpipeline(f"Starting Full Pipeline for '{_strategy_display_name(strategy)}'...\n")
+            instrument = (
+                os.path.basename(self.csv_paths[0])
+                if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
             result = run_full_pipeline(
                 df, strategy, risk, rules, OUTPUT_DIR / "full_pipeline", cfg,
-                progress_cb=self._log_fullpipeline,
+                progress_cb=self._log_fullpipeline, instrument=instrument,
             )
 
             self._last_fullpipeline_html_path = result.report_paths["html"]

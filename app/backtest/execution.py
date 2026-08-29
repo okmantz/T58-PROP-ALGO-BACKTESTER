@@ -97,6 +97,9 @@ def run_execution(
     trades_today: dict[pd.Timestamp, int] = {}
     pnl_today: dict[pd.Timestamp, float] = {}
     fallback_stop_count = 0
+    pip_scale_mismatch_count = 0
+    pip_scale_mismatch_worst_ratio = None  # smallest (stop_distance / entry_price) seen, for the warning
+    gap_loss_count = 0
     daily_limit_amount = (
         risk.initial_balance * (risk.daily_loss_limit_pct / 100.0)
         if risk.daily_loss_limit_pct is not None
@@ -246,6 +249,19 @@ def run_execution(
                     # certainly misconfigured.
                     pnl = 0.0
                     reason = f"{reason}_invalid_pnl_skipped"
+                if (
+                    reason == "stop_loss"
+                    and open_trade["initial_risk"]
+                    and abs(pnl) > 3 * open_trade["initial_risk"] * open_trade["size"]
+                ):
+                    # The stop fired, but the fill was still several times
+                    # worse than the risk this trade was sized for -- almost
+                    # always a genuine price gap jumping straight past the
+                    # resting stop in one bar, not a bug. Surfaced as a
+                    # warning below so a handful of outsized losses in an
+                    # otherwise-sane backtest don't get mistaken for a
+                    # broken engine.
+                    gap_loss_count += 1
                 equity += pnl
                 trades.append(Trade(
                     entry_time=open_trade["entry_time"],
@@ -337,7 +353,27 @@ def run_execution(
                     if bar_sl_distance:
                         stop_price = entry_price - direction * bar_sl_distance
                     elif stop_loss_pips:
-                        stop_price = entry_price - direction * stop_loss_pips * risk.pip_size
+                        fixed_stop_distance = stop_loss_pips * risk.pip_size
+                        stop_price = entry_price - direction * fixed_stop_distance
+                        # Sanity-check the fixed pip stop against this bar's
+                        # actual price level. A strategy's STOP_LOSS_PIPS is
+                        # only meaningful if risk.pip_size matches the
+                        # instrument it's being tested against (e.g. 0.0001
+                        # for 4-decimal FX pairs) -- testing an FX-calibrated
+                        # strategy against gold, an index, crypto, or a
+                        # differently-quoted instrument while pip_size stays
+                        # at its FX default silently turns a "25 pip" stop
+                        # into a wildly wrong fraction of price, producing
+                        # position sizes (and eventual losses) that bear no
+                        # relation to the intended risk. This never changes
+                        # behavior -- it only counts how often it happens so
+                        # a clear warning can be raised below.
+                        if raw_price:
+                            distance_ratio = abs(fixed_stop_distance) / abs(raw_price)
+                            if distance_ratio < 0.0002 or distance_ratio > 0.25:
+                                pip_scale_mismatch_count += 1
+                                if pip_scale_mismatch_worst_ratio is None or distance_ratio < pip_scale_mismatch_worst_ratio:
+                                    pip_scale_mismatch_worst_ratio = distance_ratio
                     if bar_tp_distance:
                         take_price = entry_price + direction * bar_tp_distance
                     elif take_profit_pips:
@@ -413,6 +449,39 @@ def run_execution(
             "was used instead purely for sane position sizing and account "
             "protection. Add a real stop loss / STOP_LOSS_PIPS to the "
             "strategy for accurate results.",
+            RuntimeWarning,
+        )
+
+    if pip_scale_mismatch_count:
+        import warnings
+        warnings.warn(
+            f"{pip_scale_mismatch_count} trade(s) had a fixed-pips stop "
+            f"whose price distance was an implausible fraction of this "
+            f"instrument's price (as small as {pip_scale_mismatch_worst_ratio:.5%} "
+            f"of price on the worst one). This almost always means the "
+            f"configured pip_size ({risk.pip_size}) doesn't match the "
+            "instrument actually being tested — e.g. an FX-calibrated "
+            "strategy (pip_size 0.0001) run against gold, an index, crypto, "
+            "or a JPY pair. Position sizing and every stop distance for "
+            "these trades is unreliable. Set pip_size to match the real "
+            "instrument (e.g. 0.01 for gold/JPY pairs) in the Risk "
+            "configuration before trusting this result.",
+            RuntimeWarning,
+        )
+
+    if gap_loss_count:
+        import warnings
+        warnings.warn(
+            f"{gap_loss_count} trade(s) hit their stop loss but filled at a "
+            "price more than 3x further away than the intended risk -- the "
+            "market gapped straight past the resting stop within a single "
+            "bar. This is a real, honestly-simulated gap-through fill (see "
+            "the 'honest fill' comment above), not an engine bug, but it "
+            "means a handful of trades lost far more than the strategy's "
+            "nominal per-trade risk. Worth checking whether this instrument/"
+            "timeframe is prone to large single-bar gaps (news events, "
+            "weekend opens, thin low-timeframe data) before trusting the "
+            "risk-of-ruin numbers.",
             RuntimeWarning,
         )
 

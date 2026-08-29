@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -815,7 +816,10 @@ def run_full_pipeline_cli(
     )
 
     print("Running Full Pipeline...")
-    result = run_full_pipeline(df, strategy, risk, rules, output_dir, cfg, progress_cb=print)
+    result = run_full_pipeline(
+        df, strategy, risk, rules, output_dir, cfg, progress_cb=print,
+        instrument=os.path.basename(csv_path),
+    )
     print(f"\nVerdict: {result.verdict}")
     for r in result.verdict_reasons:
         print(f"  - {r}")

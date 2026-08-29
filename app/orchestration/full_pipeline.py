@@ -212,6 +212,7 @@ def run_full_pipeline(
     output_dir: str | Path,
     cfg: FullPipelineConfig | None = None,
     progress_cb: ProgressCallback | None = None,
+    instrument: str = "unknown",
 ) -> FullPipelineResult:
     def log(msg: str) -> None:
         if progress_cb:
@@ -226,6 +227,9 @@ def run_full_pipeline(
     log(f"Step 1/6: Baseline run for '{display_name}'...")
     preflight_signal_check(df, strategy, risk, "Full Pipeline")
     baseline_bt = run_backtest(df, strategy, risk)
+    for w in baseline_bt.warnings:
+        log(f"  WARNING: {w}")
+        warnings.append(w)
 
     lookahead_summary = None
     if strategy.source_type in ("python", "pinescript", "mql5"):
@@ -313,6 +317,9 @@ def run_full_pipeline(
         # -- Step 3: final validation ------------------------------------
         log("Step 3/6: Final validation (full backtest, prop simulation, Monte Carlo)...")
         final_bt = run_backtest(df, final_strategy, risk)
+        for w in final_bt.warnings:
+            log(f"  WARNING: {w}")
+            warnings.append(w)
         if not final_bt.trades:
             # Should not happen (the GA never returns a worse-than-baseline
             # candidate, and baseline already passed preflight), but never
@@ -381,6 +388,7 @@ def run_full_pipeline(
             final_bt, final_single_run, final_mc, final_holdout,
             oos_validation, oos_skip_reason, verdict, verdict_reasons,
             df, prop_rules, risk, cfg, elapsed, warnings, log, output_dir,
+            instrument,
         )
     finally:
         if final_tmp_dir is not None:
@@ -394,6 +402,7 @@ def _finish(
     final_bt, final_single_run, final_mc, final_holdout,
     oos_validation, oos_skip_reason, verdict, verdict_reasons,
     df, prop_rules, risk, cfg, elapsed, warnings, log, output_dir,
+    instrument="unknown",
 ) -> FullPipelineResult:
     """Writes the report + (for code strategies) saves the winner into the
     Strategy Library. Split out of run_full_pipeline only to keep that
@@ -406,7 +415,7 @@ def _finish(
         output_dir=output_dir,
         strategy_name=final_strategy_name,
         strategy_source_type=final_source_type,
-        instrument="full-pipeline",
+        instrument=instrument,
         timeframe="unknown",
         backtest_period=period,
         backtest_result=final_bt,

@@ -94,6 +94,27 @@ def _relative_bounds(value: float) -> tuple[float, float]:
     return value - span, value + span
 
 
+# Some constant names have a real-world domain the generic multiplicative/
+# relative bounds heuristics above know nothing about -- most importantly
+# an hour-of-day, which is only ever meaningful in [0, 23]. Left unclamped,
+# a name like SESSION_END_HOUR = 18 gets multiplicative bounds up to 54,
+# and the GA is free to "discover" that a session filter ending at hour 32
+# scores well -- which it does, but only because hour 32 never matches
+# anything, silently disabling the entire session filter rather than
+# actually improving it. Confirmed via a real Full Pipeline run producing
+# exactly that: SESSION_END_HOUR patched to 32.
+_HOUR_NAME_RE = re.compile(r"HOUR", re.IGNORECASE)
+
+
+def _clamp_bounds_for_known_domains(name: str, lo: float, hi: float) -> tuple[float, float]:
+    if _HOUR_NAME_RE.search(name):
+        lo, hi = max(lo, 0.0), min(hi, 23.0)
+        if lo > hi:  # defensive: an already-out-of-range base value shouldn't invert the bounds
+            return 0.0, 23.0
+        return lo, hi
+    return lo, hi
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -144,6 +165,7 @@ def discover_python_parameters(file_path: str | Path) -> list[CodeGene]:
         value = float(literal)
         is_int = "." not in literal
         lo, hi = _multiplicative_bounds(value, is_int) if is_int else _relative_bounds(value)
+        lo, hi = _clamp_bounds_for_known_domains(name, lo, hi)
         span = (m.start(2), m.end(2))
         genes.append(CodeGene(
             name=name, kind="python_global", is_int=is_int, lo=lo, hi=hi,

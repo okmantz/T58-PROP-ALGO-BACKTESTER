@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 
 from app.ai.ollama_settings import OllamaSettings
 
-DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_N_SUGGESTIONS = 3
 
 

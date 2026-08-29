@@ -11,6 +11,7 @@ report workflows are preserved.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -254,6 +255,114 @@ class LabeledCheckbox(Frame):
 
     def get(self) -> bool:
         return bool(self.var.get())
+
+
+def _blend_hex(color_hex: str, toward_hex: str, t: float) -> str:
+    """Blends color_hex toward toward_hex by fraction t (0=color, 1=toward).
+    Standalone version of MainWindow._blend, usable by widgets that aren't
+    the main window itself."""
+    c = color_hex.lstrip("#")
+    b = toward_hex.lstrip("#")
+    cr, cg, cb = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    br, bg_, bb = int(b[0:2], 16), int(b[2:4], 16), int(b[4:6], 16)
+    r = round(cr + (br - cr) * t)
+    g = round(cg + (bg_ - cg) * t)
+    bl = round(cb + (bb - cb) * t)
+    return f"#{r:02x}{g:02x}{bl:02x}"
+
+
+class NeuralProgress(Canvas):
+    """An indeterminate progress indicator styled as a pulse of light
+    traveling through a short chain of connected nodes -- a quieter,
+    more purposeful alternative to a generic bouncing progress bar,
+    built from the same node/glow visual language as the Dashboard's
+    equity-curve and strategy-universe charts elsewhere in this app.
+
+    Drop-in replacement for `ttk.Progressbar(mode="indeterminate")`:
+    supports the same `.start(interval)` / `.stop()` calls (interval is
+    accepted for signature compatibility but this always animates at its
+    own fixed frame rate) and the same `.pack(...)` usage.
+    """
+
+    N_NODES = 7
+    FRAME_MS = 30           # ~33fps
+    SWEEP_SECONDS = 3.2     # time for one full left-to-right pass
+    GLOW_SIGMA = 0.16       # how wide the bright region around the pulse is, as a fraction of the bar's width
+
+    def __init__(self, parent, height: int = 26, **kwargs):
+        super().__init__(parent, height=height, bg=PANEL_2, highlightthickness=0, **kwargs)
+        self._height = height
+        self._phase = 0.0
+        self._running = False
+        self._after_id = None
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()  # resting state before the first start()
+
+    def start(self, interval=None):
+        if self._running:
+            return
+        self._running = True
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        self._phase = 0.0
+        self._draw(active=False)
+
+    def _tick(self):
+        if not self._running:
+            return
+        step = self.FRAME_MS / 1000.0 / self.SWEEP_SECONDS
+        self._phase = (self._phase + step) % 1.0
+        self._draw(active=True)
+        self._after_id = self.after(self.FRAME_MS, self._tick)
+
+    def _draw(self, active: bool = False):
+        self.delete("all")
+        width = max(self.winfo_width(), 40)
+        height = self._height
+        mid_y = height / 2
+        margin = 16
+        span = max(width - 2 * margin, 1)
+
+        positions = [margin + span * i / (self.N_NODES - 1) for i in range(self.N_NODES)]
+        pulse_x = margin + span * self._phase
+
+        def activation(x: float) -> float:
+            if not active:
+                return 0.0
+            dx = (x - pulse_x) / span
+            return math.exp(-(dx * dx) / (2 * self.GLOW_SIGMA * self.GLOW_SIGMA))
+
+        # Connections first (drawn under the nodes), brightness following
+        # whichever endpoint is closer to the current pulse position.
+        for i in range(self.N_NODES - 1):
+            x1, x2 = positions[i], positions[i + 1]
+            a = max(activation(x1), activation(x2))
+            color = _blend_hex(BORDER, ACCENT_HOVER, min(a * 1.4, 1.0))
+            self.create_line(x1, mid_y, x2, mid_y, fill=color, width=2)
+
+        # Soft glow halo around the pulse itself -- same "several fading
+        # concentric circles" trick used for the Dashboard's glow dots.
+        if active:
+            for radius, t in ((10, 0.85), (6.5, 0.6), (3.5, 0.35)):
+                self.create_oval(
+                    pulse_x - radius, mid_y - radius, pulse_x + radius, mid_y + radius,
+                    fill=_blend_hex(PANEL_2, ACCENT, t), outline="",
+                )
+
+        # Nodes on top, each brightening as the pulse passes through it.
+        for x in positions:
+            a = activation(x)
+            r = 2.6 + 2.0 * a
+            fill = _blend_hex(BORDER_LIGHT, ACCENT_HOVER, a)
+            self.create_oval(x - r, mid_y - r, x + r, mid_y + r, fill=fill, outline="")
 
 
 _ADAPTIVE_RISK_TRIGGERS = [
@@ -2844,9 +2953,7 @@ class MainWindow:
         self.apply_best_config_btn.config(state="disabled")
         self.apply_best_config_btn.pack(side="left", padx=8)
 
-        self.refine_progress = ttk.Progressbar(
-            f, mode="indeterminate", style="T58.Horizontal.TProgressbar",
-        )
+        self.refine_progress = NeuralProgress(f)
         self.refine_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Refinement output", "Live search log.")
@@ -3073,11 +3180,7 @@ class MainWindow:
         self.open_report_btn.config(state="disabled")
         self.open_report_btn.pack(side="left", padx=8)
 
-        self.progress = ttk.Progressbar(
-            f,
-            mode="indeterminate",
-            style="T58.Horizontal.TProgressbar",
-        )
+        self.progress = NeuralProgress(f)
         self.progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(
@@ -3544,9 +3647,7 @@ class MainWindow:
         self.open_champion_report_btn.config(state="disabled")
         self.open_champion_report_btn.pack(side="left", padx=8)
 
-        self.search_progress = ttk.Progressbar(
-            f, mode="indeterminate", style="T58.Horizontal.TProgressbar",
-        )
+        self.search_progress = NeuralProgress(f)
         self.search_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Search Lab output", "Live funnel log.")
@@ -4092,7 +4193,7 @@ class MainWindow:
         self.open_wfo_report_btn.config(state="disabled")
         self.open_wfo_report_btn.pack(side="left", padx=8)
 
-        self.wfo_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.wfo_progress = NeuralProgress(f)
         self.wfo_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Walk-forward output", "Live progress log.")
@@ -4227,7 +4328,7 @@ class MainWindow:
         self.open_pbo_report_btn.config(state="disabled")
         self.open_pbo_report_btn.pack(side="left", padx=8)
 
-        self.cpcv_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.cpcv_progress = NeuralProgress(f)
         self.cpcv_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "CPCV / PBO output", "Live progress log.")
@@ -4415,7 +4516,7 @@ class MainWindow:
         self.open_sens_report_btn.config(state="disabled")
         self.open_sens_report_btn.pack(side="left", padx=8)
 
-        self.sens_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.sens_progress = NeuralProgress(f)
         self.sens_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Sensitivity output", "Live progress log.")
@@ -4564,7 +4665,7 @@ class MainWindow:
         self.open_portfolio_report_btn.config(state="disabled")
         self.open_portfolio_report_btn.pack(side="left", padx=8)
 
-        self.portfolio_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.portfolio_progress = NeuralProgress(f)
         self.portfolio_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Portfolio output", "Live progress log.")
@@ -4711,7 +4812,7 @@ class MainWindow:
         self.open_multiobj_report_btn.config(state="disabled")
         self.open_multiobj_report_btn.pack(side="left", padx=8)
 
-        self.multiobj_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.multiobj_progress = NeuralProgress(f)
         self.multiobj_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Multi-objective output", "Live progress log.")
@@ -4820,7 +4921,7 @@ class MainWindow:
         self.open_wfga_report_btn.config(state="disabled")
         self.open_wfga_report_btn.pack(side="left", padx=8)
 
-        self.wfga_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.wfga_progress = NeuralProgress(f)
         self.wfga_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Walk-forward-aware GA output", "Live progress log.")
@@ -4965,7 +5066,7 @@ class MainWindow:
         self.open_ensemble_report_btn.config(state="disabled")
         self.open_ensemble_report_btn.pack(side="left", padx=8)
 
-        self.ensemble_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.ensemble_progress = NeuralProgress(f)
         self.ensemble_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Ensemble output", "Live progress log.")
@@ -5188,7 +5289,7 @@ class MainWindow:
         self.open_fullpipeline_report_btn.config(state="disabled")
         self.open_fullpipeline_report_btn.pack(side="left", padx=8)
 
-        self.fullpipeline_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.fullpipeline_progress = NeuralProgress(f)
         self.fullpipeline_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         verdict_section = self._section(f, "Verdict", "Filled in once a run completes.")

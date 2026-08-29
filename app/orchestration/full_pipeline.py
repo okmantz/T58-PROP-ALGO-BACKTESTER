@@ -296,7 +296,20 @@ def run_full_pipeline(
             "evaluation_profit_target_pct": prop_rules.evaluation_profit_target_pct,
         }
 
+        # Circuit breaker: a genuinely slow/unreachable/misconfigured
+        # Ollama would otherwise pay its full timeout on EVERY generation
+        # (confirmed via a real run: 7 straight "didn't respond in time"
+        # messages, one per generation, ~90s+ each wasted for nothing).
+        # After 2 consecutive failures, stop trying for the rest of this
+        # run and say so once -- the search still proceeds exactly as if
+        # AI assist were off.
+        consecutive_failures = 0
+        gave_up = False
+
         def ai_suggest_cb(genes: list) -> list:
+            nonlocal consecutive_failures, gave_up
+            if gave_up:
+                return []
             result = ollama_client.suggest_parameter_adjustments(
                 strategy_name=display_name,
                 source_type=strategy.source_type,
@@ -306,6 +319,13 @@ def run_full_pipeline(
             )
             if result.error:
                 log(f"  AI assist: {result.error}")
+                consecutive_failures += 1
+                if consecutive_failures >= 2:
+                    gave_up = True
+                    log("  AI assist: giving up after 2 consecutive failures -- "
+                        "continuing the search without it for the rest of this run.")
+                return []
+            consecutive_failures = 0
             return result.genomes
 
     try:

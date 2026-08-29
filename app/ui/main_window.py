@@ -437,6 +437,7 @@ class MainWindow:
             (None, None, None, None),  # divider — All-In-One
             ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline),
         ]
+        self._tab_frame_by_key = {k: frame for k, _icon, _label, frame in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
         self._build_sidebar_nav()
         self.active_page = "dashboard"
@@ -741,19 +742,23 @@ class MainWindow:
 
     def _scrollable(self, parent) -> Frame:
         """Wraps `parent` in a mouse-wheel-scrollable canvas and returns an
-        inner Frame to build content into. Used for tabs long enough to
-        overflow the window (the Manual Strategy Builder, the Iterative
-        Refinement builder).
+        inner Frame to build content into. Used for every tab in the app.
 
-        The wheel binding is done at the root level and dispatched by
-        cursor screen-position rather than the old Enter/Leave-on-canvas
-        approach: Tkinter fires Leave the instant the pointer moves onto a
-        child widget sitting inside the canvas (an Entry, Combobox, or
-        Button), which silently killed scrolling over almost all of the
-        actual form content and only worked in the bare margins. Binding
-        once at the root and checking which registered canvas's bounding
-        box contains the pointer fixes that regardless of which widget is
-        directly under the cursor.
+        Every tab frame (self.tab_dashboard, self.tab_data, ...) is
+        `.place()`-d on top of every other one at the exact same (x=0, y=0,
+        relwidth=1, relheight=1) rectangle within self.content, and
+        `_show_page` switches between them with `.lift()` -- so a hidden
+        tab's canvas is still `winfo_ismapped()` and reports the exact same
+        on-screen bounding box as whichever tab actually happens to be on
+        top. A wheel handler that dispatches by "which registered canvas's
+        bounding box contains the cursor" therefore always resolves to
+        whichever canvas was registered FIRST, regardless of which page is
+        actually visible -- it can never correctly reach any tab but that
+        one. Keying the dispatch off `self.active_page` (which `_show_page`
+        always keeps current) instead of screen geometry is correct for
+        this app's actual place()+lift() tab-switching, and also means the
+        cursor doesn't need to be over any particular widget for the wheel
+        to work -- anywhere over the content area scrolls the active tab.
         """
         outer = Frame(parent, bg=BG)
         outer.pack(fill="both", expand=True)
@@ -770,23 +775,18 @@ class MainWindow:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        if not hasattr(self, "_scroll_canvases"):
-            self._scroll_canvases = []
-        self._scroll_canvases.append(canvas)
+        if not hasattr(self, "_scroll_canvas_by_tab"):
+            self._scroll_canvas_by_tab = {}
+        self._scroll_canvas_by_tab[parent] = canvas
 
-        def _dispatch_wheel(event, delta):
-            x, y = event.x_root, event.y_root
-            for c in self._scroll_canvases:
+        def _dispatch_wheel(_event, delta):
+            frame = self._tab_frame_by_key.get(self.active_page)
+            target = self._scroll_canvas_by_tab.get(frame) if frame is not None else None
+            if target is not None:
                 try:
-                    if not c.winfo_ismapped():
-                        continue
-                    x1, y1 = c.winfo_rootx(), c.winfo_rooty()
-                    x2, y2 = x1 + c.winfo_width(), y1 + c.winfo_height()
-                    if x1 <= x <= x2 and y1 <= y <= y2:
-                        c.yview_scroll(int(delta), "units")
-                        return
+                    target.yview_scroll(int(delta), "units")
                 except Exception:
-                    continue
+                    pass
 
         if not getattr(self, "_wheel_bound", False):
             self._wheel_bound = True
@@ -887,11 +887,10 @@ class MainWindow:
         )
 
         # Uses the same shared _scrollable() helper every other tab uses, so
-        # this canvas is registered in self._scroll_canvases and responds to
-        # the mouse wheel the same way -- it previously built its own
-        # one-off Canvas/Scrollbar pair that was never registered there,
-        # so only the dashboard's scrollbar could be dragged; the wheel
-        # silently did nothing.
+        # this canvas is registered and responds to the mouse wheel the same
+        # way -- it previously built its own one-off Canvas/Scrollbar pair
+        # that was never registered there, so only the dashboard's
+        # scrollbar could be dragged; the wheel silently did nothing.
         scroll_frame = self._scrollable(f)
 
         self._dash_stats_row = Frame(scroll_frame, bg=BG)

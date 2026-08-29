@@ -41,6 +41,9 @@ def build_report(
     monte_carlo_result: MonteCarloResult,
     holdout_comparison: dict | None = None,
     risk_config: RiskConfig | None = None,
+    verdict: str | None = None,
+    verdict_reasons: list[str] | None = None,
+    final_parameters: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -52,6 +55,16 @@ def build_report(
             "backtest_period_start": backtest_period[0],
             "backtest_period_end": backtest_period[1],
         },
+        # Only ever populated by the Full Pipeline (see
+        # app.orchestration.full_pipeline) -- the READY/MARGINAL/NOT READY
+        # verdict and the reasons behind it used to be returned to the
+        # caller and logged to the live run console only, never written
+        # into the saved report itself. Someone reading the report after
+        # the fact (the artifact people actually keep and share) had no
+        # way to tell whether "this" was the strategy that passed.
+        "verdict": verdict,
+        "verdict_reasons": list(verdict_reasons) if verdict_reasons else None,
+        "final_parameters": dict(final_parameters) if final_parameters else None,
         # Every dollar figure in this report is a direct function of this
         # config (risk % per trade, spread/slippage/commission assumptions,
         # initial balance, max trades/day). Without it recorded here, a
@@ -72,6 +85,15 @@ def build_report(
             "initial_balance": backtest_result.initial_balance,
             "final_equity": float(backtest_result.equity_curve["equity"].iloc[-1]) if len(backtest_result.equity_curve) else backtest_result.initial_balance,
         },
+        # Execution-integrity warnings from app.backtest.execution.run_execution
+        # (fallback stops, pip-size/instrument-scale mismatches, gap-through
+        # stop fills). These used to only ever reach a live run console --
+        # if the console wasn't open or scrolled past by the time someone
+        # read the saved report, a warning that explained a wildly-off
+        # result was permanently lost. Surfacing it in the report itself
+        # (see _warnings_section in export_html) means the artifact people
+        # actually keep and share always carries its own explanation.
+        "execution_warnings": list(getattr(backtest_result, "warnings", []) or []),
         "concentration_check": compute_concentration_stats(backtest_result.trades),
         "cost_ladder": compute_cost_ladder(backtest_result.trades),
         "holdout_comparison": holdout_comparison,
@@ -203,6 +225,29 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .tab-btn.active {{ color: var(--accent-dark); border-bottom-color: var(--accent); }}
   .tab-panel {{ display:none; }}
   .tab-panel.active {{ display:block; }}
+  .warning-banner {{
+    background: #fff4e5; border: 1px solid #f0b429; border-left: 4px solid #f0b429;
+    border-radius: 6px; padding: 14px 18px; margin: 16px 0 20px;
+  }}
+  .warning-banner .warning-title {{
+    font-weight: 700; font-size: 12.5px; text-transform: uppercase; letter-spacing: .04em;
+    color: #92400e; margin-bottom: 8px;
+  }}
+  .warning-banner ul {{ margin: 0; padding-left: 18px; }}
+  .warning-banner li {{ font-size: 13px; color: #78350f; margin-bottom: 6px; }}
+  .warning-banner li:last-child {{ margin-bottom: 0; }}
+  .verdict-banner {{
+    border-radius: 6px; padding: 14px 18px; margin: 16px 0 20px; border-left: 4px solid;
+  }}
+  .verdict-banner.verdict-ready {{ background: #ecfdf3; border-color: #12b76a; }}
+  .verdict-banner.verdict-marginal {{ background: #fff4e5; border-color: #f0b429; }}
+  .verdict-banner.verdict-not-ready {{ background: #fef3f2; border-color: #f04438; }}
+  .verdict-banner .verdict-title {{
+    font-weight: 700; font-size: 14px; text-transform: uppercase; letter-spacing: .04em;
+    margin-bottom: 8px;
+  }}
+  .verdict-banner ul {{ margin: 0; padding-left: 18px; }}
+  .verdict-banner li {{ font-size: 13px; margin-bottom: 4px; }}
   @media print {{ .masthead {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }} }}
 </style>
 </head>
@@ -217,6 +262,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="content">
 <p class="meta">Generated {generated_at} &middot; Strategy: <b>{strategy_name}</b> ({source_type}) &middot;
 Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {period_start} → {period_end}</p>
+
+{warnings_section}
+
+{verdict_section}
 
 <div class="tabs">
   <button class="tab-btn active" data-tab="overview" type="button">Overview</button>
@@ -238,6 +287,8 @@ Instrument: {instrument} &middot; Timeframe: {timeframe} &middot; Period: {perio
   <div class="card"><div class="label">Risk of Ruin</div><div class="value">{risk_of_ruin:.1f}%</div></div>
 </div>
 <p class="muted">"Risk of Ruin" is the probability that max drawdown is breached at <b>some point</b> across the full simulated path -- including after passing the evaluation and collecting payouts -- not just during the evaluation phase. It will not generally match Evaluation Pass Probability, and a strategy can be likely to pass yet still likely to eventually blow the account well downstream. "Failure Before Payout" (above) is the more relevant number for "will this specific attempt work."</p>
+
+{final_parameters_section}
 
 <h2>Historical Backtest Statistics</h2>
 <p class="muted">Computed over the full, uninterrupted trade sequence with prop-firm rules (daily loss limit, max drawdown, etc.) <b>not</b> enforced. Compare against "Prop-Firm Single-Run Result" below, which walks these same trades forward and stops the account the moment a rule is actually breached -- a strategy can look profitable here and still fail outright there.</p>
@@ -340,6 +391,59 @@ def _cost_ladder_table(ladder: list[dict]) -> str:
             f"<td>{rung['win_rate']:.1f}%</td></tr>"
         )
     return f"<table>{header}{''.join(rows)}</table>"
+
+
+def _verdict_section(verdict: str | None, verdict_reasons: list[str] | None) -> str:
+    """Renders the Full Pipeline's READY/MARGINAL/NOT READY verdict (and
+    the reasons behind it) prominently in the saved report -- this used to
+    only ever reach the live run console and the return value handed back
+    to the UI, so the report itself (the thing people actually keep and
+    share) had no way to say whether the strategy in front of you passed.
+    Renders nothing for reports that never had a verdict (every non-Full-
+    Pipeline report), so this is fully backward compatible."""
+    if not verdict:
+        return ""
+    css_class = {"READY": "verdict-ready", "MARGINAL": "verdict-marginal"}.get(verdict, "verdict-not-ready")
+    reasons_html = "".join(f"<li>{r}</li>" for r in (verdict_reasons or []))
+    reasons_block = f"<ul>{reasons_html}</ul>" if reasons_html else ""
+    return (
+        f'<div class="verdict-banner {css_class}">'
+        f'<div class="verdict-title">Full Pipeline Verdict: {verdict}</div>'
+        f"{reasons_block}"
+        "</div>"
+    )
+
+
+def _final_parameters_section(final_parameters: dict[str, str] | None) -> str:
+    """Renders the exact parameter values the Full Pipeline's search
+    settled on (SL/TP pips, indicator periods, etc.) next to the metrics
+    that show whether that specific configuration passes -- without this,
+    the report showed final performance numbers with no way to see what
+    configuration actually produced them."""
+    if not final_parameters:
+        return ""
+    rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in final_parameters.items())
+    return (
+        "<h2>Final Parameters (Full Pipeline Search Result)</h2>"
+        '<p class="muted">The exact tunable values this report\'s numbers were produced with, after the walk-forward-aware search.</p>'
+        f"<table><tr><th>Parameter</th><th>Value</th></tr>{rows}</table>"
+    )
+
+
+def _warnings_section(warnings: list[str] | None) -> str:
+    """Renders execution-integrity warnings (fallback stops, pip-size/
+    instrument mismatches, gap-through stop fills) as a prominent banner
+    right under the report's header -- empty string (nothing rendered) when
+    there are none, so a clean run's report is unchanged."""
+    if not warnings:
+        return ""
+    items = "".join(f"<li>{w}</li>" for w in warnings)
+    return (
+        '<div class="warning-banner">'
+        '<div class="warning-title">⚠ Execution warnings -- read before trusting the numbers below</div>'
+        f"<ul>{items}</ul>"
+        "</div>"
+    )
 
 
 def _concentration_table(c: dict) -> str:
@@ -464,6 +568,9 @@ def export_html(
         period_start=report["strategy"]["backtest_period_start"],
         period_end=report["strategy"]["backtest_period_end"],
         generated_at=report["generated_at"],
+        warnings_section=_warnings_section(report.get("execution_warnings")),
+        verdict_section=_verdict_section(report.get("verdict"), report.get("verdict_reasons")),
+        final_parameters_section=_final_parameters_section(report.get("final_parameters")),
         risk_config_table=_risk_config_table(report.get("risk_config")),
         eval_pass=mc["evaluation_pass_probability"],
         first_payout=mc["first_payout_probability"],
@@ -505,6 +612,9 @@ def generate_full_report(
     holdout_comparison: dict | None = None,
     risk_config: RiskConfig | None = None,
     price_df: pd.DataFrame | None = None,
+    verdict: str | None = None,
+    verdict_reasons: list[str] | None = None,
+    final_parameters: dict[str, str] | None = None,
 ) -> dict[str, Path]:
     """Builds the report dict and writes JSON + summary CSV + trades CSV + HTML to output_dir.
 
@@ -513,11 +623,16 @@ def generate_full_report(
     Visualization" tab in the HTML report. Omitting it still produces a
     complete report; that tab just falls back to a short explanatory note
     instead of a chart.
+
+    verdict / verdict_reasons / final_parameters are only ever populated by
+    the Full Pipeline (see app.orchestration.full_pipeline) -- every other
+    caller omits them and gets exactly the same report as before.
     """
     report = build_report(
         strategy_name, strategy_source_type, instrument, timeframe, backtest_period,
         backtest_result, prop_rules, prop_single_run, monte_carlo_result,
         holdout_comparison=holdout_comparison, risk_config=risk_config,
+        verdict=verdict, verdict_reasons=verdict_reasons, final_parameters=final_parameters,
     )
     output_dir = Path(output_dir)
     paths = {

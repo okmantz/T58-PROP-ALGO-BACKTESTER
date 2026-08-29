@@ -411,6 +411,14 @@ def _finish(
 
     period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
     final_strategy_name = f"{display_name} (Full Pipeline)"
+
+    final_parameters = None
+    if ga_result is not None and ga_result.genes:
+        final_parameters = {
+            gene.label: (str(int(round(value))) if gene.is_int else f"{value:.4f}".rstrip("0").rstrip("."))
+            for gene, value in zip(ga_result.genes, ga_result.best.genome)
+        }
+
     report_paths = generate_full_report(
         output_dir=output_dir,
         strategy_name=final_strategy_name,
@@ -426,6 +434,9 @@ def _finish(
         holdout_comparison=final_holdout,
         risk_config=risk,
         price_df=df,
+        verdict=verdict,
+        verdict_reasons=verdict_reasons,
+        final_parameters=final_parameters,
     )
 
     saved_library_path = None

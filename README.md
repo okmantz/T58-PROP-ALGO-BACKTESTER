@@ -1,6 +1,12 @@
 # T58 Trading — Prop Algo Backtester
 
-Answers one question:
+The one-stop shop for taking a trading idea from "here's a script" to
+"here's a validated, prop-firm-ready strategy" — without leaving one app.
+Import or write a strategy in any of four formats, validate it against
+real prop-firm rules, search for a version that actually holds up
+out-of-sample, optionally let a local AI suggest parameters to try while
+that search runs, and walk away with one report that answers the only
+question that actually matters:
 
 > **"If I trade this strategy under these prop-firm rules, what is the probability that I pass the evaluation and reach my first payout?"**
 
@@ -18,10 +24,14 @@ Market Data + Strategy + Risk + Prop Rules
 On top of that core loop sits a full research stack for finding, tuning, and
 stress-testing strategies before you ever risk a real evaluation fee:
 **Iterative Refinement** (single-strategy GA tuning), the **Search Lab**
-(multi-strategy discovery across a 5-stage funnel), and the **Validation
+(multi-strategy discovery across a 5-stage funnel), the **Validation
 Lab** (walk-forward optimization, combinatorial purged cross-validation,
 parameter sensitivity, multi-asset portfolios, multi-objective search, and
-a walk-forward-aware GA) — all described below.
+a walk-forward-aware GA), and **Full Pipeline** (one button that runs the
+entire stack in order and hands back a single READY/MARGINAL/NOT READY
+verdict) — all described below. An optional local **AI Assist** can
+participate in that search too, suggesting parameters for a local Ollama
+model to try while Full Pipeline runs.
 
 Three ways to run it: a **Windows desktop app (.exe)**, a **local Python app**
 (any OS), or a **mobile-friendly web app** you open in a phone browser.
@@ -54,7 +64,11 @@ produces a broken `.exe` that crashes on launch with
 rebuild the workflow or the local build command by hand, keep the entry
 point as `run_app.py`.
 
-The `.exe` launches the same Tkinter desktop GUI described below.
+The `.exe` launches the same Tkinter desktop GUI described below. The
+9 example strategies under `strategies/` (Python, PineScript, and MQL5)
+ship bundled inside the `.exe` itself and self-seed into the Strategy
+Library the first time it runs, so the library isn't empty on a fresh
+install — no manual file copying required.
 
 ## 2. Local Python app (any OS)
 
@@ -219,7 +233,11 @@ From your phone's browser:
 
 4. **Configure Risk & Execution** — fixed-$ or %-of-equity risk per trade,
    max trades/day, commission, slippage, spread, pip size
-   (`app/backtest/risk.py::RiskConfig`).
+   (`app/backtest/risk.py::RiskConfig`). A **"Detect pip size from data"**
+   button suggests a starting value from whatever's loaded in Step 1 —
+   leaving pip size at its FX default (0.0001) against a non-FX instrument
+   (stocks, indices, crypto, JPY pairs) is the single most common cause of
+   a fixed-pips stop translating into a nonsensical position size.
 
 5. **Backtest -> Prop Simulation -> Monte Carlo -> Report** — one click in
    the GUI/web app's run step, or the `--cli` flag.
@@ -413,6 +431,72 @@ directly via the underlying modules.
   --ensemble-strategy path1.py --ensemble-strategy path2.pine
   --ensemble-mode blend|vote`.
 
+## Step 15 — Full Pipeline (one button, the whole workflow)
+
+Every other feature above is a separate tool: Run & Report backtests one
+fixed configuration, Iterative Refinement tunes it in-sample, the
+Walk-Forward-Aware GA tunes it against out-of-sample folds, the Validation
+Lab checks robustness after the fact. Getting from "here's a strategy
+file" to "here's the best, validated version of it, ready for a prop
+firm" means running several of those in the right order and carrying the
+winner from one into the next by hand. **Full Pipeline**
+(`app/orchestration/full_pipeline.py`) does that hand-off automatically,
+in six steps: baseline backtest + lookahead check → walk-forward-aware GA
+search (optionally AI-assisted, see below) → re-validated final report →
+out-of-sample fold check → holdout check → final report with a plain
+READY / MARGINAL / NOT READY verdict and the exact reasons behind it. For
+Python/PineScript/MQL5 strategies, the winning source is also saved
+straight into the Strategy Library, tagged `validated` by default.
+
+The report it produces carries everything needed to trust (or distrust)
+the numbers, front and center rather than buried in a console log:
+
+- **Execution-integrity warnings** — a pip-size/instrument-scale mismatch
+  (a strategy's fixed-pips stop translating to a nonsensical fraction of
+  the instrument's real price), or trades where the market gapped straight
+  past a resting stop — surfaced as a banner at the top of the report
+  itself, not just a line in a log that scrolled past.
+- **The verdict, in the report** — READY/MARGINAL/NOT READY and the exact
+  Monte Carlo thresholds it did or didn't clear, so the saved HTML file
+  answers "does this pass" on its own, without needing the live run
+  console open.
+- **The winning parameters, in the report** — the exact tunable values
+  (indicator periods, SL/TP, session hours, etc.) the search settled on,
+  in a table right next to the metrics they produced.
+
+Available on the desktop GUI (sidebar: **15 FULL PIPELINE**) and headlessly
+via `--full-pipeline` (see **CLI reference** below).
+
+## AI Assist (optional, local Ollama)
+
+Full Pipeline's walk-forward-aware GA search can optionally ask a local
+[Ollama](https://ollama.com) model for candidate parameter values to try
+— once per generation, while the search is actually running, not just a
+one-off suggestion at the start. Every suggestion still has to pass
+through the exact same backtest → prop-simulation → Monte Carlo pipeline
+as any other candidate the GA tries: the model only ever proposes numbers
+for a strategy's already-discovered tunable parameters (see the gene
+discovery described under Step 6 above) — it never writes or edits
+strategy code, and can never displace a genuinely better candidate the GA
+already found.
+
+**Setup is deliberately minimal:**
+
+1. Install Ollama and pull a model — free, runs entirely on your own
+   machine: **[ollama.com/download](https://ollama.com/download)**, then
+   `ollama pull llama3.1` (or any model you prefer) from a terminal.
+2. On the Full Pipeline tab, open **AI Assist**, check **Enable AI Assist
+   for this run**, and hit **Test Connection** to confirm it's reachable.
+3. Run Full Pipeline as normal — nothing else changes.
+
+Off by default, everywhere. Leaving it disabled (or never installing
+Ollama at all) runs Full Pipeline exactly as if this feature didn't exist.
+An unreachable, slow, or misconfigured Ollama degrades the same way: a
+couple of failed attempts and the search quietly continues without it,
+logged once, never blocking the run. An optional API key field supports
+pointing this at a remote/proxied Ollama endpoint behind auth instead of
+a local install, for anyone running it that way.
+
 ## PineScript support (subset)
 
 Supported: `open/high/low/close/hl2/hlc3/ohlc4`, `input.int`/`input.float`,
@@ -486,9 +570,12 @@ is not subject to any of this limitation.)
   historical equity curve, Monte Carlo return/drawdown histograms with
   median/P95 markers, and (for the Validation Lab reports) chained
   out-of-sample equity curves, Pareto-front convergence, and parameter
-  sensitivity heatmaps. HTML was chosen over a PDF library dependency for
-  the MVP — any browser can print it to PDF with zero extra install
-  burden.
+  sensitivity heatmaps. It also surfaces execution-integrity warnings
+  (pip-size/instrument mismatches, gap-through stop fills) and, for Full
+  Pipeline reports, the READY/MARGINAL/NOT READY verdict and winning
+  parameter values, as banners/tables at the top rather than only in a
+  live run log. HTML was chosen over a PDF library dependency for the MVP
+  — any browser can print it to PDF with zero extra install burden.
 
 ## CLI reference
 
@@ -510,6 +597,7 @@ current list with defaults — this is a summary, not the source of truth.
 | `--multi-objective` (+ `--mo-objectives/-population/-generations/-seed`) | Multi-Objective Optimization (Step 12) |
 | `--wfga` (+ `--wfga-folds/-window-mode/-population/-generations/-metric/-seed`) | Walk-Forward-Aware GA (Step 13) |
 | `--ensemble` (+ `--ensemble-strategy` [repeatable, 2+ required] `/-mode/-min-agreement/-balance/-correlation-strength`) | Multi-strategy ensemble, blend or vote (Step 14) |
+| `--full-pipeline` (+ `--fp-folds/-window-mode/-population/-generations/-metric/-final-mc-sims/-seed/-no-save-to-library`) | Full Pipeline (Step 15): baseline → GA → re-validated report → OOS/holdout checks → verdict |
 
 `--refine` and `--search` additionally accept `--refine-no-cost-stress` /
 `--refine-cost-stress-multiplier` / `--refine-cost-stress-weight` and
@@ -519,10 +607,13 @@ on by default). `--search` also accepts `--pair-csv <path>` to merge in a
 second instrument so the `stat_pairs` family can be searched. Plain `--cli`
 accepts `--adaptive-risk-rules '<json>'` (Step 14's adaptive risk layer).
 
-Each of the nine `--wfo`/`--cpcv`/`--pbo`/`--sensitivity`/`--portfolio`/
-`--multi-objective`/`--wfga`/`--ensemble` runs is mutually exclusive with
-the others and with `--search`/plain `--cli`; pick one per invocation. All
-write their report(s) under `--output` (default `reports/`).
+Each of the ten `--wfo`/`--cpcv`/`--pbo`/`--sensitivity`/`--portfolio`/
+`--multi-objective`/`--wfga`/`--ensemble`/`--full-pipeline` runs is mutually
+exclusive with the others and with `--search`/plain `--cli`; pick one per
+invocation. All write their report(s) under `--output` (default `reports/`).
+
+AI Assist (above) is currently desktop-GUI-only — `--full-pipeline` runs
+the same search headlessly without it.
 
 ## MVP scope decisions
 
@@ -561,6 +652,13 @@ write their report(s) under `--output` (default `reports/`).
   model for "one account, one drawdown floor, several instruments," not
   for a margin-constrained concurrent-position book. See
   `app/portfolio/portfolio.py`'s docstring for the full reasoning.
+- AI Assist (Step 15) is desktop-GUI-only for now, same as the Validation
+  Lab — `--full-pipeline` runs the identical search headlessly, just
+  without the optional AI-suggested candidates. It also only ever
+  proposes numeric values for a strategy's already-discovered tunable
+  parameters, deliberately never code — keeping the search's safety
+  properties (every candidate re-validated through the normal backtest/
+  prop-sim/Monte Carlo pipeline) unchanged whether AI Assist is on or off.
 
 ## Project layout
 
@@ -570,7 +668,7 @@ T58-Prop-Algo-Backtester/
 ├── app/
 │   ├── main.py                 # entry point (GUI, or --cli headless run — see CLI reference)
 │   ├── ui/
-│   │   ├── main_window.py      # Tkinter desktop GUI (14-step sidebar: Steps 1-7 core, 8-13 Validation Lab, 14 Ensemble)
+│   │   ├── main_window.py      # Tkinter desktop GUI (15-step sidebar: Steps 1-7 core, 8-13 Validation Lab, 14 Ensemble, 15 Full Pipeline)
 │   │   └── condition_builder.py  # visual condition-row widget used by the Manual Builder
 │   ├── web/                    # Flask mobile/web app (same engine, new front end)
 │   │   ├── server.py
@@ -594,6 +692,10 @@ T58-Prop-Algo-Backtester/
 │   ├── backtest/                 # execution engine, risk sizing, statistics, holdout comparison
 │   │   └── adaptive_risk.py      # Step 14: declarative consecutive-loss/daily-P&L/progress-to-target sizing rules
 │   ├── ensemble/ensemble.py       # Step 14: multi-strategy ensembles (blend or vote) on one instrument
+│   ├── orchestration/full_pipeline.py  # Step 15: one-button baseline -> GA -> re-validation -> OOS/holdout -> verdict
+│   ├── ai/                        # optional local-Ollama AI Assist (off by default)
+│   │   ├── ollama_client.py       # connection test + per-generation parameter-suggestion requests
+│   │   └── ollama_settings.py     # persisted host/model/API-key settings (keyring-backed)
 │   ├── optimize/
 │   │   ├── parameter_space.py / code_parameter_space.py   # shared gene discovery (all 4 strategy sources)
 │   │   ├── refinement.py         # Step 6: Iterative Refinement GA

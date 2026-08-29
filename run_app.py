@@ -22,7 +22,26 @@ Why this file exists:
 """
 from __future__ import annotations
 
+import multiprocessing
+
 from app.main import main
 
 if __name__ == "__main__":
+    # REQUIRED for the packaged .exe: Search Lab (app/search/batch_runner.py)
+    # spawns worker processes with concurrent.futures.ProcessPoolExecutor.
+    # On Windows, a frozen/PyInstaller build has no real `fork()` -- every
+    # worker process is started by re-launching this SAME .exe from
+    # scratch. Without freeze_support() called first, each of those
+    # re-launches falls through to `main()` again instead of running as a
+    # plain worker, so every worker process tries to boot a second copy of
+    # the whole Tkinter GUI, immediately conflicts with the already-running
+    # instance, and dies -- which is exactly what surfaces to the user as
+    # "concurrent.futures.process.BrokenProcessPool: A process in the
+    # process pool was terminated abruptly while the future was running or
+    # pending" as soon as Search Lab starts Stage 1. freeze_support() makes
+    # multiprocessing detect it's being called as a worker re-launch and
+    # skip straight to running the worker, instead of falling through to
+    # main(). This is a no-op (returns immediately) on macOS/Linux and when
+    # NOT frozen, so it's always safe to call first.
+    multiprocessing.freeze_support()
     main()

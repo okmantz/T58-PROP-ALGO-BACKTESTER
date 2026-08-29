@@ -15,7 +15,14 @@ up a QR code so a phone on the same Wi-Fi can open it too.
 """
 from __future__ import annotations
 
+import multiprocessing
+
 from app.web.launcher import main
 
 if __name__ == "__main__":
+    # See run_app.py for why this is required in a packaged .exe: Search
+    # Lab's ProcessPoolExecutor workers re-launch this frozen executable,
+    # and without freeze_support() each re-launch falls through to main()
+    # again instead of running as a worker.
+    multiprocessing.freeze_support()
     main()

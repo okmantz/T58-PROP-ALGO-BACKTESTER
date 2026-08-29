@@ -1,3 +1,8 @@
+**⚠ See `../SCREENING_RESULTS.md` first** — a 2026-08-29 screen of all 7
+files below against real XAUUSD 15m data found a negative edge on every
+one of them (0% Monte Carlo eval-pass probability across the board). "Ready
+to test" below means "loads and runs cleanly," not "has a validated edge."
+
 # Ported Strategies — Ready to Test in T58
 
 Seven Python strategy files, each following T58's `generate_signals(df) ->

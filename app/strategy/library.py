@@ -43,6 +43,7 @@ from __future__ import annotations
 import io
 import json
 import shutil
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,18 +107,56 @@ def _ensure_extension(filename: str, strategy_type: str) -> str:
     return name
 
 
+def _seed_bundled_strategies(base: Path) -> None:
+    """Copy strategy files embedded by PyInstaller into the persistent
+    strategies/ folder, once, on first run of a packaged .exe.
+
+    Mirrors app.data.storage._seed_bundled_raw_data exactly: a frozen build
+    only ever has whatever PyInstaller was told to --add-data into the
+    bundle (see the build-exe.yml / build-web-exe.yml workflows -- both
+    must pass "strategies;strategies" for this to have anything to copy).
+    Without this, get_strategy_library_dir() still creates the three
+    per-language subfolders (so the app doesn't crash), but they come up
+    empty in every packaged build -- the folders exist, nothing's in them.
+    Never overwrites a file the user already saved/edited locally.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if not bundle_root:
+        return
+    bundled_strategies = Path(bundle_root) / "strategies"
+    if not bundled_strategies.exists():
+        return
+    for t in STRATEGY_TYPES:
+        bundled_dir = bundled_strategies / t
+        if not bundled_dir.exists():
+            continue
+        dest_dir = base / t
+        for source in bundled_dir.iterdir():
+            if not source.is_file():
+                continue
+            destination = dest_dir / source.name
+            if not destination.exists():
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+                except OSError:
+                    continue
+
+
 def get_strategy_library_dir(strategy_type: str | None = None) -> Path:
     """Return the persistent strategies/ folder, creating it (and its three
-    per-language subfolders) as needed. Pass a strategy_type to get that
-    one subfolder directly."""
+    per-language subfolders) as needed, and seeding it from the bundled
+    strategies the first time a packaged .exe runs. Pass a strategy_type to
+    get that one subfolder directly."""
     base = get_app_base_dir() / "strategies"
+    for t in STRATEGY_TYPES:
+        (base / t).mkdir(parents=True, exist_ok=True)
+    _seed_bundled_strategies(base)
     if strategy_type is None:
-        for t in STRATEGY_TYPES:
-            (base / t).mkdir(parents=True, exist_ok=True)
         return base
-    d = base / _normalize_type(strategy_type)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return base / _normalize_type(strategy_type)
 
 
 def _metadata_path(directory: Path, filename: str) -> Path:

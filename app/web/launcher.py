@@ -50,19 +50,22 @@ def get_lan_ip() -> str:
 
 def _qr_image_path(url: str) -> Path | None:
     """Render a QR code PNG for `url` and return its path, or None if the
-    qrcode/Pillow libraries aren't available (server still works fine
-    without this -- the printed URL is always shown too)."""
+    qrcode/Pillow libraries aren't available or QR generation fails for any
+    other reason (server still works fine without this -- the printed URL
+    is always shown too). Deliberately broad: this is a nice-to-have, so a
+    missing optional dependency, a locked/unwritable home directory, or any
+    other environment quirk should never crash the launcher."""
     try:
         import qrcode
-    except ImportError:
-        return None
 
-    img = qrcode.make(url, box_size=10, border=2)
-    out_dir = Path.home() / ".t58-backtester"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "phone-qr-code.png"
-    img.save(out_path)
-    return out_path
+        img = qrcode.make(url, box_size=10, border=2)
+        out_dir = Path.home() / ".t58-backtester"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "phone-qr-code.png"
+        img.save(out_path)
+        return out_path
+    except Exception:
+        return None
 
 
 def _open_qr_image(path: Path) -> None:

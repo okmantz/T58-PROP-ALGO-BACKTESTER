@@ -192,3 +192,41 @@ def test_full_pipeline_ai_assist_disabled_by_default(tmp_path):
     logs = []
     run_full_pipeline(df, strategy, RiskConfig(), PropRules(), tmp_path, _cfg(), progress_cb=logs.append)
     assert not any("AI assist" in line for line in logs)
+
+
+def test_full_pipeline_ai_assist_gives_up_after_two_consecutive_failures(tmp_path, monkeypatch):
+    """A consistently failing/unreachable Ollama must not pay its timeout
+    on every single generation -- after 2 consecutive failures it should
+    stop trying for the rest of the run and say so once."""
+    from app.ai.ollama_settings import OllamaSettings
+    import app.ai.ollama_client as ollama_client_module
+
+    class _FakeResult:
+        def __init__(self):
+            self.genomes = []
+            self.error = "Ollama at http://localhost:11434 didn't respond in time."
+
+    call_count = {"n": 0}
+
+    class _FakeOllamaClient:
+        def __init__(self, settings):
+            pass
+
+        def suggest_parameter_adjustments(self, **kwargs):
+            call_count["n"] += 1
+            return _FakeResult()
+
+    monkeypatch.setattr(ollama_client_module, "OllamaClient", _FakeOllamaClient)
+
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    settings = OllamaSettings(enabled=True, host="http://localhost:11434", model="llama3.1")
+    cfg = _cfg(ga_generations=5)  # would be 6 calls (gen 0-5) without the circuit breaker
+
+    logs = []
+    run_full_pipeline(
+        df, strategy, RiskConfig(), PropRules(), tmp_path, cfg,
+        progress_cb=logs.append, ollama_settings=settings,
+    )
+    assert call_count["n"] == 2  # stopped after exactly 2 consecutive failures
+    assert any("giving up after 2 consecutive failures" in line for line in logs)

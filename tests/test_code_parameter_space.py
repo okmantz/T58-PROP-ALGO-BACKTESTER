@@ -111,3 +111,30 @@ def test_mql5_discovery_unaffected_by_pinescript_change():
     genes = discover_mql5_parameters(code)
     kinds = {g.kind for g in genes}
     assert {"mql5_ma_period", "mql5_rsi_period", "mql5_sl_pips", "mql5_tp_pips"} <= kinds
+
+
+def test_hour_named_constants_are_clamped_to_a_valid_hour_range(tmp_path):
+    """A *_HOUR constant's search bounds must never exceed [0, 23] -- the
+    generic multiplicative-bounds heuristic alone (0.3x-3x) would let an
+    hour-of-day field like SESSION_END_HOUR = 18 search up to 54, and the
+    GA can and does 'discover' that a session filter ending at an
+    impossible hour scores well, purely because it silently disables the
+    filter rather than improving it (confirmed via a real Full Pipeline
+    run that patched SESSION_END_HOUR to 32)."""
+    from app.optimize.code_parameter_space import discover_python_parameters
+
+    src = (
+        "SESSION_START_HOUR = 9\n"
+        "SESSION_END_HOUR = 18\n"
+        "EMA_TREND_PERIOD = 200\n"
+    )
+    path = tmp_path / "strategy.py"
+    path.write_text(src, encoding="utf-8")
+    genes = {g.name: g for g in discover_python_parameters(path)}
+
+    assert genes["SESSION_START_HOUR"].lo >= 0
+    assert genes["SESSION_START_HOUR"].hi <= 23
+    assert genes["SESSION_END_HOUR"].lo >= 0
+    assert genes["SESSION_END_HOUR"].hi <= 23
+    # A non-hour constant must be completely unaffected by this change.
+    assert genes["EMA_TREND_PERIOD"].hi == 600.0

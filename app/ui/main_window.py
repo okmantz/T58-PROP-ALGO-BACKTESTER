@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from concurrent.futures.process import BrokenProcessPool
@@ -288,45 +289,69 @@ def _blend_hex(color_hex: str, toward_hex: str, t: float) -> str:
 
 
 class NeuralProgress(Canvas):
-    """An indeterminate progress indicator styled as a signal spreading
-    outward through a small neural mesh -- a diamond of layers (1 -> 3 -> 3
-    -> 3 -> 1 nodes) with a wave of activation that washes through the
-    whole network left to right, each node rippling on with a slight
-    per-node offset instead of a single dot sliding down a line. Built from
-    the same node/glow visual language as the Dashboard's equity-curve and
-    strategy-universe charts elsewhere in this app, just spread across two
-    dimensions instead of one.
+    """A glowing neon loading bar -- a rounded, softly-lit track with an
+    animated cyan fill, a "LOADING…." label, and a live percentage
+    readout, in the same visual family as this app's reference neon-dark
+    mockups. Most call sites in this app are indeterminate (a Search Lab
+    generation, a Monte Carlo run, a full pipeline stage -- none report a
+    real 0-100% completion), so while running this shows a smoothly
+    rising ESTIMATED percentage that eases toward (but never reaches)
+    ~96% -- honest about being an estimate, while still giving a much
+    more readable sense of "this is progressing" than a bar that just
+    bounces back and forth.
 
     Drop-in replacement for `ttk.Progressbar(mode="indeterminate")`:
     supports the same `.start(interval)` / `.stop()` calls (interval is
     accepted for signature compatibility but this always animates at its
-    own fixed frame rate) and the same `.pack(...)` usage -- every existing
-    call site swaps in unchanged.
+    own fixed frame rate) and the same `.pack(...)` usage -- every
+    existing call site swaps in unchanged. Call `.set_progress(pct)`
+    instead of/in addition to `.start()` for the rare call site that DOES
+    know a real percentage (e.g. "fold 3 of 8") -- it freezes the
+    estimate and shows the real number until `.start()` or `.stop()` is
+    called again.
     """
 
-    LAYER_SIZES = (1, 3, 3, 3, 1)     # input -> hidden -> hidden -> hidden -> output
-    FRAME_MS = 22                      # ~45fps -- smoother than a generic indeterminate bar
-    SWEEP_SECONDS = 2.6                # time for one full wave to cross the mesh
-    WAVE_SIGMA = 0.62                  # how many "layers wide" the bright band of the wave is
-    RIPPLE_SPREAD = 0.16               # per-node timing offset within a layer, in layer-units
-    IDLE_GLOW = 0.05                   # faint resting brightness so the mesh never looks fully dead
+    FRAME_MS = 33                     # ~30fps -- smooth without burning CPU on a purely decorative animation
+    ESTIMATE_CEILING_PCT = 96.0        # never implies completion on its own -- only stop() does that
+    ESTIMATE_TAU_SECONDS = 14.0        # how quickly the estimate eases toward the ceiling
+    SWEEP_SECONDS = 1.8                # time for one highlight streak to cross the filled portion
+    CORNER_RADIUS = 7
 
-    def __init__(self, parent, height: int = 26, **kwargs):
+    def __init__(self, parent, height: int = 30, **kwargs):
         super().__init__(parent, height=height, bg=PANEL_2, highlightthickness=0, **kwargs)
         self._height = height
-        self._phase = 0.0
         self._running = False
         self._after_id = None
-        self._nodes = []       # [(layer_idx, node_idx, x, y, ripple_offset), ...]
-        self._edges = []       # [(node_a_index_in_self._nodes, node_b_index_in_self._nodes), ...]
-        self.bind("<Configure>", lambda _e: self._layout_and_draw())
-        self._layout_and_draw()  # resting state before the first start()
+        self._t0 = 0.0
+        self._sweep_phase = 0.0
+        self._manual_pct: float | None = None   # set via set_progress(); None means "use the eased estimate"
+        self._label = "LOADING...."
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()  # resting state before the first start()
 
     def start(self, interval=None):
         if self._running:
             return
         self._running = True
+        self._manual_pct = None
+        self._t0 = time.monotonic()
+        self._sweep_phase = 0.0
         self._tick()
+
+    def set_progress(self, pct: float, label: str | None = None):
+        """For the rare call site that knows a real percentage (e.g. fold
+        N of M). Freezes the animated estimate at this exact value until
+        the next start()/stop(). Starts the sweep animation if not
+        already running."""
+        self._manual_pct = max(0.0, min(100.0, pct))
+        if label is not None:
+            self._label = label
+        if not self._running:
+            self._running = True
+            self._sweep_phase = 0.0
+            self._tick()
+        else:
+            self._draw()
 
     def stop(self):
         self._running = False
@@ -336,112 +361,94 @@ class NeuralProgress(Canvas):
             except Exception:
                 pass
             self._after_id = None
-        self._phase = 0.0
-        self._draw(active=False)
+        self._manual_pct = None
+        self._label = "LOADING...."
+        self._draw()
+
+    def _current_pct(self) -> float:
+        if self._manual_pct is not None:
+            return self._manual_pct
+        elapsed = max(0.0, time.monotonic() - self._t0)
+        return self.ESTIMATE_CEILING_PCT * (1.0 - math.exp(-elapsed / self.ESTIMATE_TAU_SECONDS))
 
     def _tick(self):
         if not self._running:
             return
-        step = self.FRAME_MS / 1000.0 / self.SWEEP_SECONDS
-        self._phase = (self._phase + step) % 1.0
-        self._draw(active=True)
+        self._sweep_phase = (self._sweep_phase + self.FRAME_MS / 1000.0 / self.SWEEP_SECONDS) % 1.0
+        self._draw()
         self._after_id = self.after(self.FRAME_MS, self._tick)
 
-    def _layout_and_draw(self):
-        """Recomputes node positions (only needed on resize) and the fixed
-        mesh adjacency, then draws the resting frame."""
-        width = max(self.winfo_width(), 60)
-        height = self._height
-        margin_x = 16
-        margin_y = max(5, height * 0.18)
-        n_layers = len(self.LAYER_SIZES)
-        span_x = max(width - 2 * margin_x, 1)
-        span_y = max(height - 2 * margin_y, 1)
+    def _rounded_rect_points(self, x0, y0, x1, y1, r):
+        r = max(0.0, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+        return [
+            x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
+            x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+            x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
+        ]
 
-        self._nodes = []
-        layer_node_indices = []  # for building adjacency: layer_node_indices[layer] = [index into self._nodes]
-        for li, count in enumerate(self.LAYER_SIZES):
-            x = margin_x + span_x * (li / (n_layers - 1))
-            indices = []
-            for ni in range(count):
-                # Centered vertically; a lone node (input/output) sits on the midline.
-                y = margin_y + span_y * ((ni + 0.5) / count) if count > 1 else margin_y + span_y / 2
-                ripple_offset = (ni - (count - 1) / 2) * self.RIPPLE_SPREAD
-                indices.append(len(self._nodes))
-                self._nodes.append([li, x, y, ripple_offset])
-            layer_node_indices.append(indices)
-
-        self._edges = []
-        for li in range(n_layers - 1):
-            left, right = layer_node_indices[li], layer_node_indices[li + 1]
-            # Every node connects to every node in the next layer when at
-            # least one side is a single input/output node (fans out/in
-            # cleanly); otherwise each hidden node connects to its two
-            # nearest neighbors in the next layer, which reads as a real
-            # mesh without turning into a dense, illegible tangle.
-            if len(left) == 1 or len(right) == 1:
-                for a in left:
-                    for b in right:
-                        self._edges.append((a, b))
-            else:
-                for i, a in enumerate(left):
-                    frac = i / max(len(left) - 1, 1)
-                    center = frac * (len(right) - 1)
-                    for b_off in (-1, 0, 1):
-                        j = round(center) + b_off
-                        if 0 <= j < len(right):
-                            self._edges.append((a, right[j]))
-
-        self._draw(active=self._running)
-
-    def _draw(self, active: bool = False):
+    def _draw(self):
         self.delete("all")
-        if not self._nodes:
-            return
-        n_layers = len(self.LAYER_SIZES)
-        # Wave position in "layer units", padded so it eases in from before
-        # layer 0 and out past the last layer instead of snapping on/off.
-        pad = 1.3
-        wave_pos = self._phase * ((n_layers - 1) + 2 * pad) - pad
+        width = max(self.winfo_width(), 80)
+        height = self._height
+        pad = 3
+        x0, y0, x1, y1 = pad, pad, width - pad, height - pad
+        r = self.CORNER_RADIUS
+        active = self._running
 
-        def activation(layer_idx: float) -> float:
-            base = self.IDLE_GLOW
-            if not active:
-                return base
-            dx = layer_idx - wave_pos
-            return min(base + math.exp(-(dx * dx) / (2 * self.WAVE_SIGMA * self.WAVE_SIGMA)), 1.0)
-
-        node_activation = [activation(li + off) for li, _x, _y, off in self._nodes]
-
-        # Edges first, brightness following the brighter of its two endpoints.
-        for a, b in self._edges:
-            _, xa, ya, _ = self._nodes[a]
-            _, xb, yb, _ = self._nodes[b]
-            act = max(node_activation[a], node_activation[b])
-            color = _blend_hex(BORDER, ACCENT_HOVER, min(act * 1.3, 1.0))
-            width = 1 + (1.4 if act > 0.5 else 0)
-            self.create_line(xa, ya, xb, yb, fill=color, width=width)
-
-        # Soft glow halo under every sufficiently-bright node -- several
-        # nodes can glow at once as the wave spreads across a whole layer
-        # and its ripple-offset neighbors, which is the whole point versus
-        # a single traveling dot.
+        # Outer glow halo behind the track -- same nested-shrinking-alpha
+        # trick GlowCard/RingProgress use elsewhere, muted to almost
+        # nothing when idle so a bank of a dozen of these on one tab
+        # doesn't read as a wall of neon.
         if active:
-            for (_li, x, y, _off), act in zip(self._nodes, node_activation):
-                if act < 0.35:
-                    continue
-                t = (act - 0.35) / 0.65
-                for radius, alpha in ((9, 0.55), (5.5, 0.4), (3, 0.28)):
-                    self.create_oval(
-                        x - radius, y - radius, x + radius, y + radius,
-                        fill=_blend_hex(PANEL_2, ACCENT, t * alpha), outline="",
-                    )
+            for i, alpha in ((3, 0.05), (2, 0.10), (1, 0.18)):
+                self.create_polygon(
+                    self._rounded_rect_points(x0 - i, y0 - i, x1 + i, y1 + i, r + i),
+                    smooth=True, fill="", outline=_blend_hex(PANEL_2, NEON_CYAN, alpha), width=1.4,
+                )
 
-        # Nodes on top.
-        for (_li, x, y, _off), act in zip(self._nodes, node_activation):
-            r = 2.2 + 2.2 * act
-            fill = _blend_hex(BORDER_LIGHT, ACCENT_HOVER, act)
-            self.create_oval(x - r, y - r, x + r, y + r, fill=fill, outline="")
+        track_color = _blend_hex(PANEL_2, NEON_CYAN, 0.06)
+        border_color = _blend_hex(PANEL_2, NEON_CYAN, 0.85 if active else 0.35)
+        self.create_polygon(self._rounded_rect_points(x0, y0, x1, y1, r), smooth=True,
+                             fill=track_color, outline=border_color, width=1.4)
+
+        pct = self._current_pct() if active else 0.0
+        inner_x0, inner_y0, inner_x1, inner_y1 = x0 + 2, y0 + 2, x1 - 2, y1 - 2
+        fill_w = max(0.0, (inner_x1 - inner_x0) * (pct / 100.0))
+        if fill_w > 1:
+            fx1 = inner_x0 + fill_w
+            fill_r = min(r - 1, fill_w / 2, (inner_y1 - inner_y0) / 2)
+            # Soft glow bleeding just past the fill's own edge, then the
+            # solid glowing fill itself.
+            for i, alpha in ((4, 0.10), (2, 0.22)):
+                self.create_polygon(
+                    self._rounded_rect_points(inner_x0 - i, inner_y0 - i, fx1 + i, inner_y1 + i, fill_r + i),
+                    smooth=True, fill=_blend_hex(track_color, NEON_CYAN, alpha), outline="",
+                )
+            self.create_polygon(
+                self._rounded_rect_points(inner_x0, inner_y0, fx1, inner_y1, fill_r),
+                smooth=True, fill=_blend_hex(PANEL_2, NEON_CYAN, 0.75), outline="",
+            )
+            # A brighter highlight streak sliding smoothly through the
+            # filled region -- the "make it look smooth" motion cue,
+            # independent of the estimate's own (slow, easing) growth.
+            streak_w = max(18.0, fill_w * 0.22)
+            streak_center = inner_x0 + self._sweep_phase * (fill_w + streak_w) - streak_w / 2
+            sx0 = max(inner_x0, streak_center - streak_w / 2)
+            sx1 = min(fx1, streak_center + streak_w / 2)
+            if sx1 > sx0:
+                self.create_polygon(
+                    self._rounded_rect_points(sx0, inner_y0, sx1, inner_y1, fill_r),
+                    smooth=True, fill=_blend_hex(PANEL_2, METAL_BRIGHT, 0.55), outline="",
+                )
+
+        label_color = TEXT if active else TEXT_DIM
+        self.create_text(x0 + 10, height / 2, text=self._label, fill=label_color,
+                          font=_safe_font(8, "bold"), anchor="w")
+        pct_text = f"{pct:.0f}%" if active else ""
+        if pct_text:
+            self.create_text(x1 - 10, height / 2, text=pct_text, fill=NEON_CYAN,
+                              font=_safe_font(8, "bold"), anchor="e")
+
 
 
 class GlowCard(Canvas):
@@ -710,30 +717,30 @@ class MainWindow:
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
         self._nav_items = [
-            ("dashboard", "\u25A3", "DASHBOARD", self.tab_dashboard),
-            (None, None, None, None),  # divider
-            ("data", "\u25A4", "01  DATA", self.tab_data),
-            ("strategy", "\u2699", "02  STRATEGY", self.tab_strategy),
-            ("prop", "\u2696", "03  PROP RULES", self.tab_prop),
-            ("risk", "\u25C8", "04  RISK", self.tab_risk),
-            ("run", "\u25B6", "05  RUN & REPORT", self.tab_run),
-            ("refine", "\u21BB", "06  REFINEMENT", self.tab_refine),
-            ("search", "\u25A6", "07  SEARCH LAB", self.tab_search),
-            (None, None, None, None),  # divider — Validation Lab group
-            ("wfo", "\u21C6", "08  WALK-FORWARD OPT", self.tab_wfo),
-            ("cpcv", "\u25C9", "09  CPCV / PBO", self.tab_cpcv),
-            ("sensitivity", "\u2AF6", "10  SENSITIVITY", self.tab_sensitivity),
-            ("portfolio", "\u25C7", "11  PORTFOLIO", self.tab_portfolio),
-            ("multiobj", "\u2696", "12  MULTI-OBJECTIVE", self.tab_multiobj),
-            ("wfga", "\u21BB", "13  WALK-FORWARD GA", self.tab_wfga),
-            (None, None, None, None),  # divider — Finding an Edge group
-            ("ensemble", "\u25C6", "14  ENSEMBLE", self.tab_ensemble),
-            (None, None, None, None),  # divider — All-In-One
-            ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline),
-            (None, None, None, None),  # divider — going live
-            ("forwardtest", "\u25D4", "16  FORWARD TEST", self.tab_forwardtest),
+            ("dashboard", "\u25A3", "DASHBOARD", self.tab_dashboard, NEON_VIOLET),
+            (None, None, None, None, None),  # divider
+            ("data", "\u25A4", "01  DATA", self.tab_data, NEON_CYAN),
+            ("strategy", "\u2699", "02  STRATEGY", self.tab_strategy, NEON_CYAN),
+            ("prop", "\u2696", "03  PROP RULES", self.tab_prop, NEON_CYAN),
+            ("risk", "\u25C8", "04  RISK", self.tab_risk, NEON_CYAN),
+            ("run", "\u25B6", "05  RUN & REPORT", self.tab_run, NEON_CYAN),
+            ("refine", "\u21BB", "06  REFINEMENT", self.tab_refine, NEON_CYAN),
+            ("search", "\u25A6", "07  SEARCH LAB", self.tab_search, NEON_CYAN),
+            (None, None, None, None, None),  # divider — Validation Lab group
+            ("wfo", "\u21C6", "08  WALK-FORWARD OPT", self.tab_wfo, BLUE),
+            ("cpcv", "\u25C9", "09  CPCV / PBO", self.tab_cpcv, BLUE),
+            ("sensitivity", "\u2AF6", "10  SENSITIVITY", self.tab_sensitivity, BLUE),
+            ("portfolio", "\u25C7", "11  PORTFOLIO", self.tab_portfolio, BLUE),
+            ("multiobj", "\u2696", "12  MULTI-OBJECTIVE", self.tab_multiobj, BLUE),
+            ("wfga", "\u21BB", "13  WALK-FORWARD GA", self.tab_wfga, BLUE),
+            (None, None, None, None, None),  # divider — Finding an Edge group
+            ("ensemble", "\u25C6", "14  ENSEMBLE", self.tab_ensemble, NEON_MAGENTA),
+            (None, None, None, None, None),  # divider — All-In-One
+            ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline, NEON_AMBER),
+            (None, None, None, None, None),  # divider — going live
+            ("forwardtest", "\u25D4", "16  FORWARD TEST", self.tab_forwardtest, NEON_LIME),
         ]
-        self._tab_frame_by_key = {k: frame for k, _icon, _label, frame in self._nav_items if k}
+        self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
         self._build_sidebar_nav()
         self.active_page = "dashboard"
@@ -759,43 +766,83 @@ class MainWindow:
         self._show_page("dashboard")
 
     def _build_sidebar_nav(self):
-        for key, icon, label, frame in self._nav_items:
+        for key, icon, label, frame, color in self._nav_items:
             if key is None:
                 Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
                 continue
             row = Frame(self.sidebar, bg=PANEL, cursor="hand2")
             row.pack(fill="x", padx=8, pady=2)
-            accent_bar = Frame(row, bg=PANEL, width=3)
-            accent_bar.pack(side="left", fill="y")
+            accent = Canvas(row, bg=PANEL, width=8, highlightthickness=0)
+            accent.pack(side="left", fill="y")
+            accent.bind("<Configure>", lambda _e, k=key: self._draw_nav_accent(k))
             lbl = Label(
                 row, text=f"  {icon}   {label}", bg=PANEL, fg=TEXT_MUTED,
                 font=_safe_font(9, "bold"), anchor="w", padx=6, pady=9,
             )
             lbl.pack(side="left", fill="x", expand=True)
-            for widget in (row, accent_bar, lbl):
+            for widget in (row, accent, lbl):
                 widget.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
                 widget.bind("<Enter>", lambda _e, k=key: self._on_nav_hover(k, True))
                 widget.bind("<Leave>", lambda _e, k=key: self._on_nav_hover(k, False))
-            self._nav_buttons[key] = (row, accent_bar, lbl)
+            self._nav_buttons[key] = (row, accent, lbl, color)
+
+    def _draw_nav_accent(self, key: str, state: str | None = None):
+        """Paints one sidebar row's accent strip -- a soft, per-tab-colored
+        glow bar rather than one flat purple line for every tab. `state`
+        is "idle" / "hover" / "active"; omitted (e.g. on a <Configure>
+        resize event) means "whatever this row's current state already
+        is," re-derived from self.active_page.
+        """
+        if key not in self._nav_buttons:
+            return
+        row, accent, _lbl, color = self._nav_buttons[key]
+        if state is None:
+            state = "active" if key == getattr(self, "active_page", "dashboard") else "idle"
+        accent.delete("all")
+        w = max(accent.winfo_width(), 8)
+        h = max(accent.winfo_height(), 24)
+        bg = str(row.cget("bg"))
+        accent.configure(bg=bg)
+        cx = w / 2
+
+        if state == "active":
+            # A soft outward halo (matching the GlowCard/NeuralProgress
+            # glow technique elsewhere in this app) behind a solid,
+            # full-brightness core bar -- reads as "this tab is lit up in
+            # its own color," not just "there's a purple line here."
+            for half_width, alpha in ((3.6, 0.12), (2.6, 0.22), (1.8, 0.4)):
+                accent.create_rectangle(
+                    cx - half_width, 2, cx + half_width, h - 2,
+                    fill=_blend_hex(bg, color, alpha), outline="",
+                )
+            accent.create_rectangle(cx - 1.4, 3, cx + 1.4, h - 3, fill=color, outline="")
+        elif state == "hover":
+            accent.create_rectangle(cx - 2.2, 3, cx + 2.2, h - 3, fill=_blend_hex(bg, color, 0.55), outline="")
+        else:
+            # Idle rows still carry a faint, permanent tint of their own
+            # color instead of going fully gray -- enough to give each
+            # section of the sidebar its own quiet identity at a glance,
+            # without competing with whichever tab is actually active.
+            accent.create_rectangle(cx - 1.0, 4, cx + 1.0, h - 4, fill=_blend_hex(bg, color, 0.32), outline="")
 
     def _on_nav_hover(self, key, entering):
         if key == self.active_page:
             return
-        row, accent_bar, lbl = self._nav_buttons[key]
+        row, accent, lbl, color = self._nav_buttons[key]
         bg = PANEL_3 if entering else PANEL
         row.configure(bg=bg)
-        accent_bar.configure(bg=bg)
-        lbl.configure(bg=bg, fg=TEXT if entering else TEXT_MUTED)
+        lbl.configure(bg=bg, fg=_blend_hex(TEXT_MUTED, color, 0.7) if entering else TEXT_MUTED)
+        self._draw_nav_accent(key, "hover" if entering else "idle")
 
     def _show_page(self, key: str):
         self.active_page = key
-        for k, (row, accent_bar, lbl) in self._nav_buttons.items():
+        for k, (row, accent, lbl, color) in self._nav_buttons.items():
             active = k == key
             bg = PANEL_2 if active else PANEL
             row.configure(bg=bg)
-            accent_bar.configure(bg=ACCENT if active else PANEL)
-            lbl.configure(bg=bg, fg=ACCENT_HOVER if active else TEXT_MUTED)
-        for k, _icon, _label, frame in self._nav_items:
+            lbl.configure(bg=bg, fg=color if active else TEXT_MUTED)
+            self._draw_nav_accent(k, "active" if active else "idle")
+        for k, _icon, _label, frame, _color in self._nav_items:
             if k == key:
                 frame.lift()
         if key == "dashboard":
@@ -1213,6 +1260,14 @@ class MainWindow:
         self._dash_stats_row = Frame(scroll_frame, bg=BG)
         self._dash_stats_row.pack(fill="x", padx=24, pady=(4, 14))
 
+        hero_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=NEON_CYAN)
+        hero_wrap.pack(fill="x", padx=24, pady=(0, 14))
+        Label(hero_wrap, text="● PORTFOLIO EQUITY — BEST STRATEGY", bg=PANEL, fg=NEON_CYAN, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=14, pady=(10, 4)
+        )
+        self._dash_hero_canvas = Canvas(hero_wrap, bg=PANEL, height=200, highlightthickness=0)
+        self._dash_hero_canvas.pack(fill="x", padx=14, pady=(0, 14))
+
         library_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=NEON_VIOLET)
         library_wrap.pack(fill="x", padx=24, pady=(0, 14))
         Label(library_wrap, text="● MARKET DATA LIBRARY — data/raw, BY INSTRUMENT", bg=PANEL, fg=NEON_VIOLET, font=_safe_font(8, "bold")).pack(
@@ -1316,6 +1371,7 @@ class MainWindow:
         self._paint_data_library()
 
         self.root.after(30, lambda: self._paint_universe(data["graph"]))
+        self.root.after(30, lambda: self._paint_hero_equity(data["equity_series"]))
         self.root.after(30, lambda: self._paint_equity(data["equity_series"]))
         self.root.after(30, lambda: self._paint_heatmap(data["heatmap"]))
 
@@ -1445,6 +1501,121 @@ class MainWindow:
             c.create_oval(legend_x, h - 16, legend_x + 8, h - 8, fill=color, outline="")
             c.create_text(legend_x + 14, h - 12, text=name, fill=TEXT_MUTED, font=_safe_font(7), anchor="w")
             legend_x += 14 + len(name) * 6 + 14
+
+    def _catmull_rom_points(self, xs: list[float], ys: list[float], samples_per_seg: int = 10) -> list[float]:
+        """Densifies a polyline into a smooth Catmull-Rom spline through
+        the same original points -- genuinely curved between data points
+        rather than relying on Tkinter's own `smooth=True` (a quadratic
+        bezier approximation that still visibly kinks with few, unevenly-
+        spaced points, which equity curves from real trade data usually
+        are). Falls back to the raw points unchanged for fewer than 3
+        points, where a spline isn't meaningful anyway."""
+        n = len(xs)
+        if n < 3:
+            out = []
+            for x, y in zip(xs, ys):
+                out.extend([x, y])
+            return out
+
+        def pt(i):
+            i = max(0, min(n - 1, i))
+            return xs[i], ys[i]
+
+        out = []
+        for i in range(n - 1):
+            p0, p1, p2, p3 = pt(i - 1), pt(i), pt(i + 1), pt(i + 2)
+            for s in range(samples_per_seg):
+                t = s / samples_per_seg
+                t2, t3 = t * t, t * t * t
+                x = 0.5 * (
+                    (2 * p1[0]) + (-p0[0] + p2[0]) * t
+                    + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+                    + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+                )
+                y = 0.5 * (
+                    (2 * p1[1]) + (-p0[1] + p2[1]) * t
+                    + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+                    + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+                )
+                out.extend([x, y])
+        out.extend([xs[-1], ys[-1]])
+        return out
+
+    def _paint_hero_equity(self, series):
+        """The dashboard's featured chart: the single best strategy's
+        equity curve, drawn full-width and taller than the small
+        multi-strategy comparison chart below, with a genuinely smooth
+        Catmull-Rom curve, a soft glow, and a gradient fill under the
+        line -- the "make it glow and look smooth" upgrade on top of the
+        existing (still useful, more compact) multi-strategy comparison."""
+        c = self._dash_hero_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 400)
+        h = max(c.winfo_height(), 160)
+        pad_x, pad_top, pad_bottom = 20, 16, 28
+        if not series:
+            c.create_text(w / 2, h / 2, text="No completed runs yet -- run a backtest to populate this chart.",
+                           fill=TEXT_DIM, font=_safe_font(9))
+            return
+
+        # Feature whichever series is passing (or, failing that, the
+        # first available) -- this chart tells one clear story rather
+        # than overlaying everything the smaller comparison chart below
+        # already shows.
+        best_series = next((s for s in series if s.get("passed")), series[0])
+        values = best_series["values"]
+        if len(values) < 2:
+            c.create_text(w / 2, h / 2, text="Not enough closed trades yet for an equity curve.",
+                           fill=TEXT_DIM, font=_safe_font(9))
+            return
+
+        lo, hi = min(values), max(values)
+        rng = (hi - lo) or 1
+        n = len(values)
+        xs = [pad_x + (i / (n - 1)) * (w - 2 * pad_x) for i in range(n)]
+        ys = [h - pad_bottom - ((v - lo) / rng) * (h - pad_top - pad_bottom) for v in values]
+
+        # Gridlines first, underneath everything.
+        for frac in (0.0, 0.5, 1.0):
+            gy = pad_top + frac * (h - pad_top - pad_bottom)
+            c.create_line(pad_x, gy, w - pad_x, gy, fill=BORDER, dash=(2, 3))
+        c.create_text(pad_x, pad_top - 8, text=f"${hi:,.0f}", fill=TEXT_DIM, font=_safe_font(7), anchor="sw")
+        c.create_text(pad_x, h - pad_bottom + 16, text=f"${lo:,.0f}", fill=TEXT_DIM, font=_safe_font(7), anchor="nw")
+
+        smooth_points = self._catmull_rom_points(xs, ys, samples_per_seg=12)
+        color = GREEN if best_series.get("passed") else RED
+
+        # Gradient area fill under the curve -- several stacked bands
+        # fading from a visible tint near the line down to nearly nothing
+        # at the baseline, faking a vertical gradient the same way every
+        # other glow effect in this app fakes soft alpha falloff (Tkinter
+        # has no real alpha compositing).
+        baseline_y = h - pad_bottom
+        n_bands = 10
+        for band in range(n_bands, 0, -1):
+            frac = band / n_bands
+            band_alpha = 0.22 * frac
+            poly = []
+            for i in range(0, len(smooth_points), 2):
+                poly.extend([smooth_points[i], smooth_points[i + 1]])
+            top_of_band_scale = frac
+            scaled = []
+            for i in range(0, len(poly), 2):
+                x, y = poly[i], poly[i + 1]
+                y_scaled = baseline_y - (baseline_y - y) * top_of_band_scale
+                scaled.extend([x, y_scaled])
+            polygon_points = scaled + [smooth_points[-2], baseline_y, smooth_points[0], baseline_y]
+            c.create_polygon(polygon_points, fill=_blend_hex(PANEL, color, band_alpha), outline="")
+
+        self._glow_line(c, smooth_points, color, width=2.2)
+
+        # A glowing dot on the final (most recent) point -- draws the eye
+        # to "where this strategy stands right now."
+        self._glow_dot(c, xs[-1], ys[-1], 4.5, color, ring_color=METAL_BRIGHT)
+
+        label = f"{best_series['name']} — {'PASSING' if best_series.get('passed') else 'FAILING'}"
+        c.create_oval(w - pad_x - 90, pad_top - 4, w - pad_x - 84, pad_top + 2, fill=color, outline="")
+        c.create_text(w - pad_x - 78, pad_top - 1, text=label, fill=TEXT_MUTED, font=_safe_font(7, "bold"), anchor="w")
 
     def _paint_equity(self, series):
         c = self._dash_equity_canvas
@@ -5774,6 +5945,13 @@ class MainWindow:
         self.ft_terminal_path = LabeledEntry(
             account_section, "Terminal path (optional, only if auto-detect fails)", saved_mt5.terminal_path,
         )
+        terminal_btn_row = Frame(account_section, bg=PANEL)
+        terminal_btn_row.pack(anchor="w", padx=18, pady=(0, 8))
+        Label(
+            terminal_btn_row, text="", width=31, bg=PANEL,
+        ).pack(side="left")  # spacer matching LabeledEntry's label column so buttons line up under the field
+        self._button(terminal_btn_row, "AUTO-DETECT", self._ft_auto_detect_terminal).pack(side="left")
+        self._button(terminal_btn_row, "BROWSE...", self._ft_browse_terminal).pack(side="left", padx=(6, 0))
         conn_row = Frame(account_section, bg=PANEL)
         conn_row.pack(anchor="w", padx=18, pady=(2, 10))
         self.ft_test_conn_btn = self._button(conn_row, "SAVE & TEST CONNECTION", self._ft_test_connection, primary=True)
@@ -5885,6 +6063,39 @@ class MainWindow:
         except Exception:
             pass
 
+    def _ft_browse_terminal(self):
+        path = filedialog.askopenfilename(
+            title="Locate your MT5 terminal64.exe",
+            filetypes=[("MT5 terminal", "terminal64.exe"), ("All files", "*.*")],
+        )
+        if path:
+            self.ft_terminal_path.var.set(path)
+            self.ft_conn_status.config(
+                text=f"Terminal path set to {path}. Click Save & Test Connection to verify it.", fg=TEXT_MUTED,
+            )
+
+    def _ft_auto_detect_terminal(self):
+        if not mt5_connector_module.is_available():
+            self.ft_conn_status.config(text=mt5_connector_module.unavailable_reason(), fg=AMBER)
+            return
+        self.ft_conn_status.config(text="Searching common install locations for terminal64.exe...", fg=AMBER)
+        self.root.update_idletasks()
+        candidates = mt5_connector_module.find_terminal_candidates()
+        if not candidates:
+            self.ft_conn_status.config(
+                text="Couldn't find terminal64.exe in any common install location (Program Files, "
+                     "AppData\\MetaQuotes). If MT5 is installed somewhere else, use Browse... to "
+                     "point at it directly -- or install it fresh from your broker's site if it "
+                     "isn't installed at all.",
+                fg=AMBER,
+            )
+            return
+        self.ft_terminal_path.var.set(candidates[0])
+        extra = f" ({len(candidates) - 1} other install(s) also found -- this is the most recently used.)" if len(candidates) > 1 else ""
+        self.ft_conn_status.config(
+            text=f"Found: {candidates[0]}{extra} Click Save & Test Connection to verify it.", fg=GREEN,
+        )
+
     def _ft_save_mt5_settings(self) -> MT5Settings:
         settings = MT5Settings(
             login=self.ft_login.get_str().strip(),
@@ -5912,6 +6123,15 @@ class MainWindow:
             if result.ok:
                 msg = (f"Connected: account {result.account_login} @ {result.account_server} — "
                        f"balance {result.balance:,.2f} {result.currency}, equity {result.equity:,.2f}.")
+                # Auto-detection may have found a working terminal path this
+                # session even though the field was left blank -- persist
+                # it now so future connections (and the Forward Test
+                # session itself) don't have to rediscover it every time.
+                if result.resolved_terminal_path and not settings.terminal_path:
+                    settings.terminal_path = result.resolved_terminal_path
+                    mt5_settings_module.save_settings(settings)
+                    self.root.after(0, lambda: self.ft_terminal_path.var.set(result.resolved_terminal_path))
+                    msg += f" (auto-detected and saved terminal path: {result.resolved_terminal_path})"
                 connector.disconnect()
             else:
                 msg = result.message

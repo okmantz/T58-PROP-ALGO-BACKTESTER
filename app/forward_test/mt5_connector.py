@@ -49,6 +49,93 @@ def unavailable_reason() -> str:
     return f"MetaTrader5 package failed to load: {_MT5_IMPORT_ERROR}"
 
 
+# Human-readable explanations for the MT5 error codes this app's users
+# actually hit in practice, keyed off mt5.last_error()'s numeric code.
+# -10003 in particular ("IPC initialize failed") is NOT a login/credential
+# problem -- it means the MetaTrader5 Python package could not find or
+# start an actual MT5 terminal executable on this machine at all, so no
+# login was ever attempted. The generic message the package itself
+# returns for this doesn't say any of that, which is why it reads as
+# mysterious.
+_MT5_ERROR_EXPLANATIONS = {
+    -10003: (
+        "MT5 terminal not found/started (IPC initialize failed). This means the MetaTrader5 "
+        "Python package couldn't locate or launch an actual MT5 terminal on this machine -- it "
+        "never got as far as trying your login. Most common causes, in order: (1) the MT5 "
+        "terminal isn't installed at all -- download it from your broker's site and log into "
+        "your demo account in it at least once; (2) it IS installed, but not where this package "
+        "auto-detects -- enter the exact path to terminal64.exe in 'Terminal path' below (use "
+        "Browse/Auto-detect); (3) a 32-bit-only terminal build, which the MetaTrader5 Python "
+        "package cannot drive -- reinstall the 64-bit terminal from your broker."
+    ),
+    -10004: "MT5 terminal found but not responding in time -- it may still be starting up. Try again in a few seconds.",
+    -10005: "MT5 IPC timeout -- the terminal didn't respond in time. Make sure it isn't showing a blocking dialog (e.g. a Windows update prompt) and try again.",
+    -2: "Invalid MT5 login/password/server combination -- double-check them against your broker's demo account details.",
+    -6: "MT5 authorization failed -- the account number, password, or server name is wrong, or this account has been disabled.",
+    -1: "MT5 returned a generic internal failure -- try restarting the MT5 terminal, then Save & Test Connection again.",
+}
+
+
+def describe_mt5_error(code: int, desc: str) -> str:
+    """Turns an mt5.last_error() (code, desc) pair into an actionable
+    explanation for whichever specific failure this app's users have
+    actually hit, falling back to the package's own description
+    unembellished for anything not in the table above."""
+    explanation = _MT5_ERROR_EXPLANATIONS.get(code)
+    if explanation:
+        return f"MT5 connection failed ({code}): {desc}\n\n{explanation}"
+    return f"MT5 connection failed ({code}): {desc}"
+
+
+def find_terminal_candidates() -> list[str]:
+    """Best-effort search of the handful of places a Windows MT5 install
+    actually lands, for when auto-detection inside the MetaTrader5 package
+    itself fails (the -10003 case). Returns existing terminal64.exe paths
+    only, most-recently-modified first so a freshly (re)installed terminal
+    sorts ahead of stale leftovers from an old broker. Silently returns an
+    empty list on any non-Windows platform or permission error -- this is
+    a convenience for the UI's 'Auto-detect' button, never something a
+    caller should treat as authoritative."""
+    import glob
+    import os
+
+    if os.name != "nt":
+        return []
+
+    patterns: list[str] = []
+    program_files = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                      os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+    for pf in program_files:
+        if pf:
+            patterns.append(os.path.join(pf, "*", "terminal64.exe"))
+            patterns.append(os.path.join(pf, "*", "*", "terminal64.exe"))
+    # The far more common location in practice: MetaQuotes/brokers install
+    # per-user under AppData\Roaming\MetaQuotes\Terminal\<hash>\, not
+    # Program Files at all.
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        patterns.append(os.path.join(appdata, "MetaQuotes", "Terminal", "*", "terminal64.exe"))
+
+    found: list[str] = []
+    for pattern in patterns:
+        try:
+            found.extend(glob.glob(pattern))
+        except Exception:
+            continue
+
+    seen = set()
+    unique = []
+    for path in found:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    try:
+        unique.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    except Exception:
+        pass
+    return unique
+
+
 # Maps this app's timeframe-in-minutes convention (matching the data/raw/
 # CSV naming, e.g. XAUUSD15.csv = 15 minutes) to MT5's TIMEFRAME_* constants.
 _TIMEFRAME_MAP = {
@@ -75,6 +162,7 @@ class ConnectionResult:
     balance: float | None = None
     equity: float | None = None
     currency: str | None = None
+    resolved_terminal_path: str | None = None  # set only when auto-detection found a working path the caller didn't supply
 
 
 @dataclass
@@ -125,9 +213,27 @@ class MT5Connector:
         if self.terminal_path:
             kwargs["path"] = self.terminal_path
         ok = mt5.initialize(login=login_int, password=self.password, server=self.server, **kwargs)
+
         if not ok:
             code, desc = mt5.last_error()
-            return ConnectionResult(ok=False, message=f"MT5 connection failed ({code}): {desc}")
+            # The one failure worth retrying automatically: "terminal not
+            # found" with no explicit path given. If a real terminal64.exe
+            # turns up in one of the common install locations, try it once
+            # before giving up -- this is exactly the fix for the
+            # -10003/"MetaTrader 5 x64 not found" case with an empty
+            # Terminal path field.
+            if code == -10003 and not self.terminal_path:
+                for candidate in find_terminal_candidates():
+                    retry_ok = mt5.initialize(
+                        login=login_int, password=self.password, server=self.server, path=candidate,
+                    )
+                    if retry_ok:
+                        ok = True
+                        self.terminal_path = candidate  # remembered so the caller can persist it
+                        break
+            if not ok:
+                code, desc = mt5.last_error()
+                return ConnectionResult(ok=False, message=describe_mt5_error(code, desc))
 
         info = mt5.account_info()
         if info is None:
@@ -137,9 +243,10 @@ class MT5Connector:
 
         self._connected = True
         return ConnectionResult(
-            ok=True, message="Connected.",
+            ok=True, message="Connected." if not self.terminal_path else f"Connected (using terminal at {self.terminal_path}).",
             account_login=info.login, account_server=info.server,
             balance=info.balance, equity=info.equity, currency=info.currency,
+            resolved_terminal_path=self.terminal_path or None,
         )
 
     def disconnect(self) -> None:

@@ -48,11 +48,23 @@ def _build_prompt(
     baseline_stats: dict,
     prop_rules_summary: dict,
     n_suggestions: int,
+    failure_analysis_lines: list[str] | None = None,
 ) -> str:
     """Pure function: describes the strategy's tunable parameters and how
     it's currently performing, and asks for a strict-JSON response. Kept
     separate from any network code so this can be tested without Ollama
-    installed."""
+    installed.
+
+    failure_analysis_lines: optional, pre-computed (systematic, non-AI --
+    see app.optimize.gene_fitness_analysis) summary of which parameter
+    regions have already scored well or badly in the search so far. This
+    is the "Stage 4 analysis and feedback" step from the quant loop
+    framework: the ANALYSIS itself is plain statistics computed once per
+    generation for free, and only the resulting short summary is spent as
+    prompt tokens -- the model's job stays limited to turning "avoid this
+    region, lean into that one" into concrete next candidates, never to
+    doing the analysis itself.
+    """
     gene_lines = "\n".join(
         f'  - "{g.label}": currently {g.base_value} (allowed range {g.lo} to {g.hi}, '
         f'{"integer" if g.is_int else "decimal"})'
@@ -60,6 +72,15 @@ def _build_prompt(
     )
     stats_lines = "\n".join(f"  - {k}: {v}" for k, v in baseline_stats.items())
     rules_lines = "\n".join(f"  - {k}: {v}" for k, v in prop_rules_summary.items())
+
+    feedback_section = ""
+    if failure_analysis_lines:
+        feedback_body = "\n".join(failure_analysis_lines)
+        feedback_section = f"""
+Patterns already observed in this search (from candidates already tried -- \
+avoid repeating the poorly-scoring regions, lean toward the promising ones):
+{feedback_body}
+"""
 
     return f"""You are helping tune the numeric parameters of an existing algorithmic \
 trading strategy called "{strategy_name}" ({source_type}). You are NOT being asked to \
@@ -74,7 +95,7 @@ Current (baseline) backtest performance:
 
 Prop-firm rules this strategy must pass:
 {rules_lines}
-
+{feedback_section}
 Propose {n_suggestions} different candidate parameter sets you think are worth trying \
 to improve profitability and the odds of passing evaluation and reaching payout. Each \
 candidate must give a value for every parameter listed above, in the same order, \
@@ -182,17 +203,29 @@ class OllamaClient:
         baseline_stats: dict,
         prop_rules_summary: dict,
         n_suggestions: int = DEFAULT_N_SUGGESTIONS,
+        failure_analysis_lines: list[str] | None = None,
     ) -> AISuggestionResult:
         """Asks the model for `n_suggestions` candidate genomes. Returns an
         empty, non-fatal result (with `.error` explaining why) on any
         failure -- callers should treat that exactly like AI assist being
-        disabled and continue with their normal search."""
+        disabled and continue with their normal search.
+
+        failure_analysis_lines: optional pre-computed (non-AI) summary of
+        which parameter regions have scored well/badly so far this search
+        -- see app.optimize.gene_fitness_analysis.PopulationAnalysis.
+        summary_lines(). Passing this turns each call into the loop
+        framework's Stage 4 feedback step; omitting it (the default)
+        behaves exactly as before this parameter existed.
+        """
         import requests
 
         if not genes:
             return AISuggestionResult(error="Strategy has no tunable parameters for the AI to suggest values for.")
 
-        prompt = _build_prompt(strategy_name, source_type, genes, baseline_stats, prop_rules_summary, n_suggestions)
+        prompt = _build_prompt(
+            strategy_name, source_type, genes, baseline_stats, prop_rules_summary, n_suggestions,
+            failure_analysis_lines=failure_analysis_lines,
+        )
         host = (self.settings.host or "").rstrip("/")
         try:
             resp = requests.post(

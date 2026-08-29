@@ -77,6 +77,7 @@ from app.search.strategy_space import build_strategy_from_spec
 from app.strategy.base import Strategy
 from app.strategy.library import StrategyAlreadyExists, save_strategy_text, set_strategy_status, \
     record_backtest_result
+from app.validation.icir import ICIRGateResult, run_icir_gate_from_backtest
 
 ProgressCallback = Callable[[str], None]
 
@@ -125,6 +126,9 @@ class FullPipelineResult:
     oos_validation: WalkForwardResult | None
     oos_validation_skip_reason: str | None
 
+    icir_gate: "ICIRGateResult | None"
+    icir_gate_skip_reason: str | None
+
     verdict: str                # "READY" | "MARGINAL" | "NOT READY"
     verdict_reasons: list[str]
 
@@ -158,6 +162,7 @@ def _spec_for_code(source_type: str, code_text: str, extension: str) -> dict:
 
 def _make_verdict(
     final_mc: MonteCarloResult, oos_validation: WalkForwardResult | None,
+    icir_gate: "ICIRGateResult | None" = None,
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
     eval_pass = final_mc.evaluation_pass_probability
@@ -195,9 +200,22 @@ def _make_verdict(
             f"below the {oos_validation.stability_threshold:.2f} stability threshold)."
         )
 
-    if score >= 4:
+    if icir_gate is None:
+        reasons.append(
+            "ICIR / signal-decay / Bonferroni-corrected significance gate couldn't run -- "
+            "treat this as UNPROVEN, not passing."
+        )
+    elif icir_gate.ok:
+        score += 1
+        reasons.append("Passed the ICIR / signal-decay / Bonferroni-corrected significance gate: " +
+                        " ".join(icir_gate.reasons))
+    else:
+        reasons.append("Did NOT pass the ICIR / signal-decay / Bonferroni-corrected significance gate: " +
+                        " ".join(icir_gate.reasons))
+
+    if score >= 5:
         verdict = "READY"
-    elif score >= 2:
+    elif score >= 3:
         verdict = "MARGINAL"
     else:
         verdict = "NOT READY"
@@ -239,7 +257,7 @@ def run_full_pipeline(
     display_name = _display_name(strategy)
 
     # -- Step 1: baseline -----------------------------------------------
-    log(f"Step 1/6: Baseline run for '{display_name}'...")
+    log(f"Step 1/7: Baseline run for '{display_name}'...")
     preflight_signal_check(df, strategy, risk, "Full Pipeline")
     baseline_bt = run_backtest(df, strategy, risk)
     for w in baseline_bt.warnings:
@@ -266,7 +284,7 @@ def run_full_pipeline(
     )
 
     # -- Step 2: robust (walk-forward-aware) optimization ----------------
-    log("Step 2/6: Searching for a more robust configuration (walk-forward-aware GA)...")
+    log("Step 2/7: Searching for a more robust configuration (walk-forward-aware GA)...")
     refinement_ran = False
     refinement_skip_reason = None
     ga_result: WalkforwardGAResult | None = None
@@ -279,6 +297,7 @@ def run_full_pipeline(
     ai_suggest_cb = None
     if ollama_settings is not None and ollama_settings.is_usable:
         from app.ai.ollama_client import OllamaClient
+        from app.optimize.gene_fitness_analysis import analyze_gene_fitness_correlation
 
         ollama_client = OllamaClient(ollama_settings)
         # Captures Step 1's baseline stats once -- good enough context for
@@ -306,16 +325,25 @@ def run_full_pipeline(
         consecutive_failures = 0
         gave_up = False
 
-        def ai_suggest_cb(genes: list) -> list:
+        def ai_suggest_cb(genes: list, population: list) -> list:
             nonlocal consecutive_failures, gave_up
             if gave_up:
                 return []
+            # Stage 4 of the quant loop framework ("analyze why the losers
+            # failed, feed that back into generation") computed as plain
+            # statistics over the population the GA already evaluated --
+            # no extra backtests, no AI call. Only the resulting few lines
+            # of text are spent as prompt tokens below, which is what
+            # keeps this "systematic first, AI only where it must be."
+            analysis = analyze_gene_fitness_correlation(genes, population)
+            feedback_lines = analysis.summary_lines(top_n=3)
             result = ollama_client.suggest_parameter_adjustments(
                 strategy_name=display_name,
                 source_type=strategy.source_type,
                 genes=genes,
                 baseline_stats=baseline_stats_summary,
                 prop_rules_summary=prop_rules_summary,
+                failure_analysis_lines=feedback_lines,
             )
             if result.error:
                 log(f"  AI assist: {result.error}")
@@ -326,6 +354,8 @@ def run_full_pipeline(
                         "continuing the search without it for the rest of this run.")
                 return []
             consecutive_failures = 0
+            if feedback_lines and not analysis.note:
+                log(f"  AI assist: seeded with {len(feedback_lines)} observed parameter pattern(s) from this search.")
             return result.genomes
 
     try:
@@ -383,7 +413,7 @@ def run_full_pipeline(
         final_strategy = build_strategy_from_spec(final_spec, final_tmp_dir)
 
         # -- Step 3: final validation ------------------------------------
-        log("Step 3/6: Final validation (full backtest, prop simulation, Monte Carlo)...")
+        log("Step 3/7: Final validation (full backtest, prop simulation, Monte Carlo)...")
         final_bt = run_backtest(df, final_strategy, risk)
         for w in final_bt.warnings:
             log(f"  WARNING: {w}")
@@ -417,7 +447,7 @@ def run_full_pipeline(
         )
 
         # -- Step 4: out-of-sample fold check (no re-tuning) --------------
-        log("Step 4/6: Out-of-sample fold check (same configuration, no further tuning)...")
+        log("Step 4/7: Out-of-sample fold check (same configuration, no further tuning)...")
         oos_validation = None
         oos_skip_reason = None
         try:
@@ -437,16 +467,44 @@ def run_full_pipeline(
             log(f"  {oos_skip_reason}")
 
         # -- Step 5: holdout check ----------------------------------------
-        log("Step 5/6: Out-of-sample holdout check...")
+        log("Step 5/7: Out-of-sample holdout check...")
         try:
             final_holdout = run_holdout_comparison(df, final_strategy, risk, holdout_frac=cfg.holdout_frac)
         except Exception:
             final_holdout = None
             log("  Holdout check skipped (not enough data to split).")
 
-        # -- Step 6: report + save -----------------------------------------
-        log("Step 6/6: Generating final report...")
-        verdict, verdict_reasons = _make_verdict(final_mc, oos_validation)
+        # -- Step 6: ICIR / signal-decay / Bonferroni-corrected gate ------
+        # The quant loop framework's "out-of-sample gate": scores the
+        # strategy's directional signal with the standard IC/ICIR metric,
+        # checks whether its predictive power decays too fast to trade,
+        # and requires the result to still be statistically significant
+        # after correcting for how many candidates the GA actually tried
+        # (Bonferroni). All pure arithmetic over trades already produced
+        # above -- no AI, no extra network calls, no extra backtests
+        # beyond the same in-sample/holdout split run_holdout_comparison
+        # just used. See app.validation.icir.
+        log("Step 6/7: ICIR / signal-decay / Bonferroni-corrected significance gate...")
+        icir_gate = None
+        icir_gate_skip_reason = None
+        try:
+            n_candidates_tested = 1  # the baseline itself always counts as one candidate tried
+            if refinement_ran and ga_result is not None:
+                n_candidates_tested = cfg.ga_population * (cfg.ga_generations + 1)
+            icir_gate = run_icir_gate_from_backtest(
+                df, final_strategy, risk, n_tests=n_candidates_tested, holdout_frac=cfg.holdout_frac,
+            )
+            log(f"  {'PASSED' if icir_gate.ok else 'DID NOT PASS'} "
+                f"(Bonferroni-corrected for {n_candidates_tested} candidate(s) tried).")
+            for reason in icir_gate.reasons:
+                log(f"    {reason}")
+        except Exception as exc:  # noqa: BLE001 -- best-effort validation step
+            icir_gate_skip_reason = f"ICIR gate failed to run: {exc}"
+            log(f"  {icir_gate_skip_reason}")
+
+        # -- Step 7: report + save -----------------------------------------
+        log("Step 7/7: Generating final report...")
+        verdict, verdict_reasons = _make_verdict(final_mc, oos_validation, icir_gate)
 
         elapsed = time.time() - t0
         return _finish(
@@ -454,7 +512,7 @@ def run_full_pipeline(
             refinement_ran, refinement_skip_reason, ga_result,
             final_source_type, final_config, final_code_text, final_code_ext,
             final_bt, final_single_run, final_mc, final_holdout,
-            oos_validation, oos_skip_reason, verdict, verdict_reasons,
+            oos_validation, oos_skip_reason, icir_gate, icir_gate_skip_reason, verdict, verdict_reasons,
             df, prop_rules, risk, cfg, elapsed, warnings, log, output_dir,
             instrument,
         )
@@ -468,7 +526,7 @@ def _finish(
     refinement_ran, refinement_skip_reason, ga_result,
     final_source_type, final_config, final_code_text, final_code_ext,
     final_bt, final_single_run, final_mc, final_holdout,
-    oos_validation, oos_skip_reason, verdict, verdict_reasons,
+    oos_validation, oos_skip_reason, icir_gate, icir_gate_skip_reason, verdict, verdict_reasons,
     df, prop_rules, risk, cfg, elapsed, warnings, log, output_dir,
     instrument="unknown",
 ) -> FullPipelineResult:
@@ -564,6 +622,8 @@ def _finish(
         final_holdout=final_holdout,
         oos_validation=oos_validation,
         oos_validation_skip_reason=oos_skip_reason,
+        icir_gate=icir_gate,
+        icir_gate_skip_reason=icir_gate_skip_reason,
         verdict=verdict,
         verdict_reasons=verdict_reasons,
         saved_library_path=saved_library_path,

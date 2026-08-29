@@ -31,6 +31,7 @@ tacked on at the end.
 """
 from __future__ import annotations
 
+import inspect
 import math
 import random
 import shutil
@@ -124,15 +125,39 @@ def run_walkforward_aware_refinement(
     callback raises, or an empty list, is treated exactly like AI assist
     being off: the generation proceeds with its normal random/bred
     population, unchanged.
+
+    Callbacks may optionally accept a SECOND argument: the prior
+    generation's already-evaluated population as `[(genome, fitness), ...]`
+    (an empty list for generation 0, before anything has been evaluated).
+    This is the systematic "Stage 4 analysis and feedback" hook from the
+    quant loop framework -- see app.optimize.gene_fitness_analysis, which
+    a two-argument callback can run itself (pure statistics, no extra
+    backtests, no AI call) to tell an AI assistant which parameter regions
+    are already known to score well or badly before asking it for new
+    candidates. Detected via the callback's signature so existing
+    single-argument callbacks (including every one in this app's own test
+    suite) keep working unchanged.
     """
     def log(msg: str) -> None:
         if progress_cb:
             progress_cb(msg)
 
-    def ai_genomes(genes_for_cb: list) -> list[list[float]]:
+    _ai_cb_wants_population = False
+    if ai_suggest_cb is not None:
+        try:
+            params = list(inspect.signature(ai_suggest_cb).parameters.values())
+            _ai_cb_wants_population = len(params) >= 2 or any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
+            )
+        except (TypeError, ValueError):
+            _ai_cb_wants_population = False
+
+    def ai_genomes(genes_for_cb: list, population_for_cb: list | None = None) -> list[list[float]]:
         if ai_suggest_cb is None:
             return []
         try:
+            if _ai_cb_wants_population:
+                return ai_suggest_cb(genes_for_cb, population_for_cb or []) or []
             return ai_suggest_cb(genes_for_cb) or []
         except Exception:
             return []
@@ -232,7 +257,10 @@ def run_walkforward_aware_refinement(
 
         baseline = make([g.base_value for g in genes])
         population = [baseline]
-        for ai_genome in ai_genomes(genes):
+        # Generation 0: nothing evaluated yet, so the population snapshot
+        # a two-argument callback receives is empty -- it has only the
+        # gene definitions to work with, same as before this hook existed.
+        for ai_genome in ai_genomes(genes, []):
             if len(ai_genome) == len(genes) and len(population) < cfg.population_size:
                 population.append(make(ai_genome))
         if len(population) > 1:
@@ -267,7 +295,13 @@ def run_walkforward_aware_refinement(
             remaining = cfg.population_size - len(next_pop)
             ai_added = 0
             if remaining > 0:
-                for ai_genome in ai_genomes(genes):
+                # `population` here is still the PRIOR generation's fully
+                # evaluated set (before this generation's next_pop
+                # replaces it below), so this is exactly the "population
+                # this callback should analyze" snapshot for its optional
+                # second argument.
+                prior_population_snapshot = [(c.genome, c.fitness) for c in population]
+                for ai_genome in ai_genomes(genes, prior_population_snapshot):
                     if ai_added >= n_immigrants or len(next_pop) >= cfg.population_size:
                         break
                     if len(ai_genome) == len(genes):

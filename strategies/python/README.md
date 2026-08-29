@@ -90,7 +90,13 @@ faked — they're just not in the file:
 `multi-confluence-strategy.pine` (not ported) has a genuine lookahead bug
 — its HTF bias function is commented "ANTI-REPAINT" but calls
 `request.security(..., barmerge.lookahead_on)`, which does the opposite.
-`smc_quant_engine.py`'s HTF filter here was deliberately built the safe
-way (resample + shift before reindexing) specifically to avoid that same
-trap — worth comparing if you're curious what the fix looks like in
-practice.
+## Loading these in the app
+
+You don't need to browse for these files each time — they live right here
+in the repo's `strategies/python/` folder, which the app's Strategy
+Library (`app/strategy/library.py`) reads directly when you run it from
+source (`python -m app.web.server` / `python run_app.py`). In a packaged
+`.exe` build, these same files are bundled in and copied into the app's
+persistent library the first time it runs, so they show up in the
+Strategy Library there too without any manual copying.
+

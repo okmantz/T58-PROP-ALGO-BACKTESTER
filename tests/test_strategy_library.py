@@ -627,3 +627,27 @@ def test_seeding_never_overwrites_a_user_edited_file(tmp_path, monkeypatch):
 
     saved = library.get_strategy_library_dir("python") / "one.py"
     assert saved.read_text() == "my edited version\n"
+
+
+def test_list_misplaced_files_flags_wrong_extension_in_folder():
+    """A .pine file dropped into strategies/python/ (wrong subfolder) never
+    matches python's *.py glob, so it silently never shows up on REFRESH
+    LIBRARY with no error at all -- list_misplaced_files exists so the UI
+    can surface it by name instead."""
+    python_dir = library.get_strategy_library_dir("python")
+    (python_dir / "oops_wrong_folder.pine").write_text("//@version=5\n")
+    library.save_strategy_text("print('hi')\n", "real_one.py", "python")
+
+    misplaced = library.list_misplaced_files("python")
+    assert misplaced == ["oops_wrong_folder.pine"]
+
+    # The correctly-placed file must NOT be flagged, and must still show
+    # up normally in the library listing.
+    names = [s.name for s in library.list_saved_strategies("python")]
+    assert names == ["real_one.py"]
+
+
+def test_list_misplaced_files_ignores_metadata_sidecars():
+    library.save_strategy_text("print('hi')\n", "real_one.py", "python")
+    library.save_strategy_metadata("python", "real_one.py", {"description": "test"})
+    assert library.list_misplaced_files("python") == []

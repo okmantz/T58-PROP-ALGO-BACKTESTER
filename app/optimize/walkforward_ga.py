@@ -58,6 +58,7 @@ from app.optimize.refinement import (
     _tournament_select,
     apply_cost_stress_penalty,
     compute_fitness,
+    preflight_signal_check,
 )
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
 from app.strategy.base import Strategy
@@ -124,6 +125,8 @@ def run_walkforward_aware_refinement(
             "Not enough bars to build the requested number of walk-forward folds for the GA."
         )
     test_slices = [f.test_df for f in folds]
+
+    preflight_signal_check(df, strategy, risk, "Walk-Forward-Aware GA")
 
     tmp_dir: Path | None = None
     if strategy.source_type == "python":

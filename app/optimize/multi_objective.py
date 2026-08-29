@@ -49,6 +49,7 @@ from app.optimize.refinement import (
     _crossover,
     _mutate,
     _random_gene_value,
+    preflight_signal_check,
 )
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
 from app.strategy.base import Strategy
@@ -253,6 +254,8 @@ def run_multi_objective_refinement(
         tmp_dir = Path(tempfile.mkdtemp(prefix="t58_mo_"))
 
     try:
+        preflight_signal_check(df, strategy, risk, "Multi-Objective search")
+
         genes, build = _build_adapter(strategy, tmp_dir)
         if not genes:
             raise RefinementError(

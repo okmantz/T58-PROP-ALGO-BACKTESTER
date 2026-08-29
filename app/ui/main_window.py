@@ -17,6 +17,7 @@ import sys
 import threading
 import traceback
 import webbrowser
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from tkinter import (
     Tk, Frame, Label, Button, Entry, StringVar, Text, END,
@@ -42,6 +43,7 @@ from app.optimize.parameter_space import RefinementError, apply_genome, extract_
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
 from app.optimize.multi_objective import DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
+from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
 from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
@@ -59,10 +61,10 @@ from app.strategy.base import StrategyError
 from app.strategy.library import (
     STRATEGY_STATUSES, STRATEGY_TYPES, StrategyAlreadyExists, delete_many,
     delete_saved_strategy, export_library_zip, get_strategy_library_dir,
-    list_all_markets, list_all_tags, list_saved_strategies, record_backtest_result,
-    record_lookahead_result, record_search_result, rename_saved_strategy,
-    save_strategy_bytes, save_strategy_metadata, save_strategy_path,
-    set_strategy_status, set_strategy_tags,
+    list_all_markets, list_all_tags, list_misplaced_files, list_saved_strategies,
+    record_backtest_result, record_lookahead_result, record_search_result,
+    rename_saved_strategy, save_strategy_bytes, save_strategy_metadata,
+    save_strategy_path, set_strategy_status, set_strategy_tags,
 )
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
@@ -403,12 +405,13 @@ class MainWindow:
         self.tab_multiobj = Frame(self.content, bg=BG)
         self.tab_wfga = Frame(self.content, bg=BG)
         self.tab_ensemble = Frame(self.content, bg=BG)
+        self.tab_fullpipeline = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
-            self.tab_multiobj, self.tab_wfga, self.tab_ensemble,
+            self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -431,6 +434,8 @@ class MainWindow:
             ("wfga", "\u21BB", "13  WALK-FORWARD GA", self.tab_wfga),
             (None, None, None, None),  # divider — Finding an Edge group
             ("ensemble", "\u25C6", "14  ENSEMBLE", self.tab_ensemble),
+            (None, None, None, None),  # divider — All-In-One
+            ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline),
         ]
         self._nav_buttons: dict[str, Label] = {}
         self._build_sidebar_nav()
@@ -451,6 +456,7 @@ class MainWindow:
         self._build_multiobj_tab()
         self._build_wfga_tab()
         self._build_ensemble_tab()
+        self._build_full_pipeline_tab()
 
         self._show_page("dashboard")
 
@@ -825,6 +831,8 @@ class MainWindow:
                 bg=PANEL,
                 fg=TEXT_DIM,
                 font=_safe_font(8),
+                wraplength=820,
+                justify="left",
             ).pack(anchor="w", padx=18, pady=(0, 8))
 
         return box
@@ -1754,6 +1762,16 @@ class MainWindow:
             lib_btn_row_2, "EXPORT LIBRARY AS ZIP", self._export_strategy_library
         ).pack(side="left")
 
+        Label(
+            library_section,
+            text="Tip: OPEN LIBRARY FOLDER is only for copying/dropping files in Explorer "
+            "(or Finder). To actually use a saved strategy, select it in the list above and "
+            "click LOAD SELECTED (or double-click it) -- double-clicking a .py/.pine/.mq5 "
+            "file itself in Explorer won't work, since Windows has no default app registered "
+            "for those extensions and will say so.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
         # ---- Metadata for the selected saved strategy -------------
         meta_frame = Frame(library_section, bg=PANEL)
         meta_frame.pack(fill="x", padx=0, pady=(0, 4))
@@ -2084,20 +2102,31 @@ class MainWindow:
         total = len(list_saved_strategies(mode))
         filtered = query or market_filter not in ("", "All markets") or \
             tag_filter not in ("", "All tags") or status_filter not in ("", "All statuses")
+        misplaced = list_misplaced_files(mode)
+        misplaced_note = ""
+        if misplaced:
+            shown_names = ", ".join(misplaced[:3]) + (f", +{len(misplaced) - 3} more" if len(misplaced) > 3 else "")
+            misplaced_note = (
+                f"\n\u26a0 {len(misplaced)} file(s) in this folder don't match the "
+                f"{mode} extension and won't show up here: {shown_names}. If one of "
+                f"these is a strategy you dropped in, it's probably in the wrong "
+                f"language's subfolder -- move it into strategies/"
+                f"{{python|pinescript|mql5}}/ as appropriate, then REFRESH LIBRARY."
+            )
         if self._strategy_library_items:
             shown = (
                 f"{len(self._strategy_library_items)} of {total} saved {mode} strategy(ies)"
                 if filtered else f"{total} saved {mode} strategy(ies)"
             )
-            self.strategy_library_status.config(text=f"{shown}  •  {d}", fg=TEXT_DIM)
+            self.strategy_library_status.config(text=f"{shown}  •  {d}{misplaced_note}", fg=TEXT_DIM)
         elif total and filtered:
             self.strategy_library_status.config(
-                text=f"No saved {mode} strategies match the current search/filters.", fg=TEXT_DIM,
+                text=f"No saved {mode} strategies match the current search/filters.{misplaced_note}", fg=TEXT_DIM,
             )
         else:
             self.strategy_library_status.config(
                 text=f"No saved {mode} strategies yet. Import one above, or drop a file "
-                f"directly in {d} and press REFRESH LIBRARY.",
+                f"directly in {d} and press REFRESH LIBRARY.{misplaced_note}",
                 fg=TEXT_DIM,
             )
         self._clear_strategy_metadata_panel()
@@ -3864,6 +3893,22 @@ class MainWindow:
             self._log_search(f"\nPair CSV error: {exc}")
         except StrategyError as exc:
             self._log_search(f"\nStrategy error: {exc}")
+        except BrokenProcessPool:
+            self._log_search(
+                "\nSearch Lab crashed: a worker process was terminated abruptly "
+                "(BrokenProcessPool).\n\n"
+                "If you're running the built .exe: this is almost always caused "
+                "by a .exe built before this app called "
+                "multiprocessing.freeze_support() at startup -- without it, every "
+                "worker process a packaged .exe spawns re-launches the whole app "
+                "instead of running as a plain worker, and immediately dies. "
+                "Rebuild/redownload the .exe (run_app.py now calls "
+                "freeze_support() first thing) and try again.\n\n"
+                "If you're running from source (python run_app.py) and still see "
+                "this, it usually means a worker genuinely ran out of memory or "
+                "crashed hard -- try lowering 'Parallel workers' on this tab, or "
+                "reducing the candidate pool / population size."
+            )
         except Exception:
             self._log_search("\nUnexpected error:\n" + traceback.format_exc())
         finally:
@@ -5018,6 +5063,182 @@ class MainWindow:
             self._log_ensemble("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.ensemble_progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Tab 15 — Full Pipeline (run everything, hand back the champion)
+    # -----------------------------------------------------------------------
+
+    def _build_full_pipeline_tab(self):
+        f = self._scrollable(self.tab_fullpipeline)
+
+        self._page_header(
+            f,
+            "15 / All-In-One",
+            "Full Pipeline",
+            "One button, the whole workflow: backtests the strategy as given, runs "
+            "app.optimize.walkforward_ga to search for a configuration that generalizes "
+            "(scored ONLY on out-of-sample fold data, never in-sample -- so it isn't just "
+            "curve-fit harder), re-validates the winner with a fresh full-fidelity Monte "
+            "Carlo, checks it holds up across several distinct historical stretches with "
+            "no further re-tuning, and produces one final report with a plain READY / "
+            "MARGINAL / NOT READY verdict. For Python/PineScript/MQL5 strategies, the "
+            "winning source is also saved straight into the Strategy Library, tagged "
+            "'validated', ready to use. Uses the strategy, data, prop rules, and risk "
+            "settings already configured in Steps 01-04.",
+        )
+
+        settings = self._section(
+            f, "Pipeline settings",
+            "Sensible defaults for a single run -- raise population/generations for a more "
+            "thorough (slower) search once you know a strategy is worth the time.",
+            emphasize=True,
+        )
+        self.fp_window_mode = LabeledCombo(settings, "GA fold window mode", ["rolling", "anchored"], "rolling")
+        self.fp_folds = LabeledEntry(settings, "Number of folds (GA + OOS check)", 4)
+        self._fp_metric_labels = list(FITNESS_METRICS.values())
+        self._fp_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
+        self.fp_metric = LabeledCombo(
+            settings, "Fitness metric", self._fp_metric_labels, FITNESS_METRICS["composite_prop_score"],
+        )
+        self.fp_population = LabeledEntry(settings, "GA population size", 12)
+        self.fp_generations = LabeledEntry(settings, "GA generations", 6)
+        self.fp_search_mc_sims = LabeledEntry(settings, "Monte Carlo sims during search", 200)
+        self.fp_final_mc_sims = LabeledEntry(settings, "Monte Carlo sims for final report", 10000)
+        self.fp_holdout_frac = LabeledEntry(settings, "Final holdout fraction", 0.2)
+        self.fp_seed = LabeledEntry(settings, "Random seed", 42)
+
+        library_section = self._section(
+            f, "Strategy Library",
+            "Code strategies only (Manual Strategy Builder configs aren't files, so there's "
+            "nothing to save) -- the winning source is written under a new filename, never "
+            "overwriting the strategy you started from.",
+        )
+        self.fp_save_to_library = LabeledCheckbox(
+            library_section, "Save the winning strategy to the Strategy Library when finished", True,
+        )
+        self.fp_library_status = LabeledCombo(
+            library_section, "Status to tag it with", list(STRATEGY_STATUSES), "validated",
+        )
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN FULL PIPELINE", self._fullpipeline_run_clicked, primary=True).pack(side="left")
+        self.open_fullpipeline_report_btn = self._button(button_row, "OPEN REPORT", self._open_fullpipeline_report)
+        self.open_fullpipeline_report_btn.config(state="disabled")
+        self.open_fullpipeline_report_btn.pack(side="left", padx=8)
+
+        self.fullpipeline_progress = ttk.Progressbar(f, mode="indeterminate", style="T58.Horizontal.TProgressbar")
+        self.fullpipeline_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        verdict_section = self._section(f, "Verdict", "Filled in once a run completes.")
+        self.fullpipeline_verdict_label = Label(
+            verdict_section, text="No run yet.", bg=PANEL, fg=TEXT_DIM,
+            font=_safe_font(11, "bold"), justify="left",
+        )
+        self.fullpipeline_verdict_label.pack(anchor="w", padx=18, pady=(2, 10))
+
+        output_section = self._section(f, "Full Pipeline output", "Live progress log.")
+        self.fullpipeline_output = Text(
+            output_section, height=20, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.fullpipeline_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_fullpipeline_html_path = None
+
+    def _log_fullpipeline(self, msg: str):
+        self.fullpipeline_output.insert(END, msg + "\n")
+        self.fullpipeline_output.see(END)
+        self.root.update_idletasks()
+
+    def _open_fullpipeline_report(self):
+        if self._last_fullpipeline_html_path:
+            webbrowser.open(f"file://{self._last_fullpipeline_html_path.resolve()}")
+
+    def _fullpipeline_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.fullpipeline_output.delete("1.0", END)
+        self.fullpipeline_verdict_label.config(text="Running...", fg=TEXT_DIM)
+        self.fullpipeline_progress.start(10)
+        threading.Thread(target=self._fullpipeline_run_pipeline, daemon=True).start()
+
+    def _fullpipeline_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_fullpipeline)
+            if df is None:
+                return
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+
+            metric_key = self._fp_metric_label_to_key.get(self.fp_metric.get_str(), "composite_prop_score")
+            cfg = FullPipelineConfig(
+                n_folds=self.fp_folds.get_int(4),
+                window_mode=self.fp_window_mode.get_str(),
+                ga_population=self.fp_population.get_int(12),
+                ga_generations=self.fp_generations.get_int(6),
+                ga_search_mc_sims=self.fp_search_mc_sims.get_int(200),
+                fitness_metric=metric_key,
+                final_mc_sims=self.fp_final_mc_sims.get_int(10000),
+                holdout_frac=self.fp_holdout_frac.get_float(0.2),
+                oos_check_folds=self.fp_folds.get_int(4),
+                random_seed=self.fp_seed.get_int(42),
+                save_to_library=self.fp_save_to_library.var.get(),
+                library_status=self.fp_library_status.get_str(),
+            )
+
+            self._log_fullpipeline(f"Starting Full Pipeline for '{_strategy_display_name(strategy)}'...\n")
+            result = run_full_pipeline(
+                df, strategy, risk, rules, OUTPUT_DIR / "full_pipeline", cfg,
+                progress_cb=self._log_fullpipeline,
+            )
+
+            self._last_fullpipeline_html_path = result.report_paths["html"]
+            self.open_fullpipeline_report_btn.config(state="normal")
+
+            verdict_color = {"READY": GREEN, "MARGINAL": AMBER, "NOT READY": RED}.get(result.verdict, TEXT_DIM)
+            self.fullpipeline_verdict_label.config(
+                text=f"{result.verdict}\n" + "\n".join(f"  \u2022 {r}" for r in result.verdict_reasons),
+                fg=verdict_color,
+            )
+
+            self._log_fullpipeline(
+                f"\nBaseline -> Final:  "
+                f"trades {len(result.baseline_bt.trades)} -> {len(result.final_bt.trades)}  |  "
+                f"net ${result.baseline_bt.statistics.net_profit:,.2f} -> ${result.final_bt.statistics.net_profit:,.2f}  |  "
+                f"eval pass {result.baseline_mc.evaluation_pass_probability:.1f}% -> {result.final_mc.evaluation_pass_probability:.1f}%  |  "
+                f"payout {result.baseline_mc.first_payout_probability:.1f}% -> {result.final_mc.first_payout_probability:.1f}%"
+            )
+            if result.refinement_skip_reason:
+                self._log_fullpipeline(f"\nOptimization was skipped: {result.refinement_skip_reason}")
+            if result.saved_library_note:
+                self._log_fullpipeline(f"\n{result.saved_library_note}")
+            for w in result.warnings:
+                self._log_fullpipeline(f"WARNING: {w}")
+
+            try:
+                self._refresh_dashboard()
+            except Exception:
+                pass
+
+            self._log_fullpipeline(f"\nVerdict: {result.verdict}")
+            self._log_fullpipeline("\nDone. Full Pipeline report written to:")
+            for k, p in result.report_paths.items():
+                self._log_fullpipeline(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_fullpipeline(f"\nStrategy error: {exc}")
+            self.fullpipeline_verdict_label.config(text="Failed -- see log.", fg=RED)
+        except RefinementError as exc:
+            self._log_fullpipeline(f"\nFull Pipeline error: {exc}")
+            self.fullpipeline_verdict_label.config(text="Failed -- see log.", fg=RED)
+        except Exception:
+            self._log_fullpipeline("\nUnexpected error:\n" + traceback.format_exc())
+            self.fullpipeline_verdict_label.config(text="Failed -- see log.", fg=RED)
+        finally:
+            self.fullpipeline_progress.stop()
 
 
 def launch():

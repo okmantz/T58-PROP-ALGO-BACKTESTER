@@ -70,6 +70,7 @@ from app.optimize.refinement import (
     _random_gene_value,
     _tournament_select,
     compute_fitness,
+    preflight_signal_check,
 )
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
 from app.strategy.base import Strategy
@@ -342,6 +343,8 @@ def run_walk_forward_optimization(
             "Not enough bars to build the requested number of walk-forward folds. "
             "Use fewer folds or a larger dataset."
         )
+
+    preflight_signal_check(df, strategy, risk, "Walk-Forward Optimization")
 
     tmp_dir: Path | None = None
     if strategy.source_type == "python":

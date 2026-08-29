@@ -181,6 +181,29 @@ class StoredStrategy:
         return list(self.metadata.get("tags") or [])
 
 
+def list_misplaced_files(strategy_type: str) -> list[str]:
+    """Filenames sitting inside strategy_type's own folder that don't have
+    that type's expected extension -- almost always means someone dropped
+    a file into the wrong one of the three subfolders (e.g. a .pine file
+    inside strategies/python/ instead of strategies/pinescript/), which
+    silently never shows up for any mode's REFRESH LIBRARY since the
+    listing only ever globs for its own extension. Surfacing this by name
+    turns "my file just isn't showing up, with no error" into something
+    the person can actually fix themselves."""
+    t = _normalize_type(strategy_type)
+    d = get_strategy_library_dir(t)
+    expected_ext = _EXTENSIONS[t]
+    out = []
+    for f in sorted(d.iterdir()):
+        if not f.is_file():
+            continue
+        if f.name.endswith(_META_SUFFIX):
+            continue
+        if not f.name.lower().endswith(expected_ext):
+            out.append(f.name)
+    return out
+
+
 def strategy_exists(strategy_type: str, filename: str) -> bool:
     """Whether a saved strategy with this exact filename already exists —
     check this before saving/renaming so the caller can ask "overwrite or

@@ -426,6 +426,71 @@ def _build_adapter(strategy: Strategy, tmp_dir: Path | None):
     )
 
 
+def preflight_signal_check(
+    df: pd.DataFrame, strategy: Strategy, risk: RiskConfig, feature_name: str,
+) -> None:
+    """
+    Runs ONE cheap, unmodified backtest of `strategy` on the FULL `df`
+    before any fold-splitting or GA/NSGA-II search begins, and raises a
+    clear RefinementError if it produces zero trades.
+
+    Why this exists: Walk-Forward Optimization, Multi-Objective search,
+    and the Walk-Forward-Aware GA all score every candidate (across every
+    fold and every generation) the same way -- backtest it and read off
+    stats. If the UNMODIFIED baseline strategy already produces zero
+    trades on the WHOLE dataset, every single candidate downstream is
+    guaranteed to also produce zero trades (folds are strict subsets of
+    the same data, and no amount of numeric-parameter tuning fixes a
+    strategy that structurally never fires on this data/timeframe). The
+    old behavior was to grind through every fold and every generation
+    anyway and hand back a report that's all zeros / -inf / "infeasible"
+    with no explanation -- expensive AND confusing. This catches it in
+    under a second, before any of that work starts.
+
+    This is deliberately NOT run for Iterative Refinement's own baseline
+    (run_iterative_refinement already computes and reports that baseline
+    as part of its normal flow) -- only for the three heavier fold/
+    population-based searches that would otherwise waste real time
+    re-discovering the same "zero trades" fact many times over.
+    """
+    try:
+        bt = run_backtest(df, strategy, risk)
+    except Exception:
+        # Let the caller's own error handling deal with a strategy that
+        # can't even run once -- this check is only about "runs fine but
+        # never fires," not about strategies that crash outright.
+        return
+    if bt.trades:
+        return
+    raise RefinementError(
+        f"{feature_name} can't proceed: the strategy, unmodified, produced "
+        f"ZERO trades on the entire dataset ({len(df)} bars, "
+        f"{df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}) before any "
+        f"optimization even began. Every fold and every candidate downstream "
+        f"would also score zero trades -- that's not a search-quality problem, "
+        f"it's this strategy never firing on this data at all, so the search "
+        f"was stopped instead of grinding through folds/generations for a "
+        f"guaranteed-empty result.\n\n"
+        f"Common causes, roughly in order of likelihood:\n"
+        f"  - The strategy filters entries to specific hours-of-day (a London/"
+        f"NY \"session\" window) but this data is daily bars or otherwise has "
+        f"no real intraday hour information -- every bar's hour is constant, "
+        f"so an hour-of-day filter excludes 100% of bars. Check the strategy "
+        f"source for an hour/session filter if this data isn't intraday.\n"
+        f"  - Not enough bars for the strategy's slowest indicator to warm up "
+        f"(e.g. a 200-period moving average on a dataset with only a few "
+        f"hundred bars).\n"
+        f"  - The data's price scale, symbol, or timeframe doesn't match what "
+        f"the strategy was written/tuned for.\n"
+        f"  - The strategy's entry conditions are just very strict for this "
+        f"particular instrument/period.\n\n"
+        f"Try running a plain Run & Report (Step 5) on this same data/strategy "
+        f"pair first -- if that also shows 0 trades, the fix is in the "
+        f"strategy or the data pairing, not in this search."
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------

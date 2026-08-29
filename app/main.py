@@ -776,6 +776,56 @@ def run_wfga_cli(
         print(f"  {k}: {p}")
 
 
+def run_full_pipeline_cli(
+    csv_path: str | None,
+    output_dir: str,
+    n_folds: int = 4,
+    window_mode: str = "rolling",
+    population: int = 12,
+    generations: int = 6,
+    fitness_metric: str = "composite_prop_score",
+    final_mc_sims: int = 10000,
+    seed: int = 42,
+    save_to_library: bool = True,
+) -> None:
+    """Full Pipeline: baseline -> walk-forward-aware GA (robust, not
+    curve-fit) -> re-validated final report -> library save. See
+    app.orchestration.full_pipeline for the full step-by-step docstring."""
+    from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
+
+    if csv_path is None:
+        csv_path = _resolve_default_csv()
+    else:
+        csv_path = str(store_csv_path(csv_path))
+    import_result = import_csv(csv_path)
+    if not import_result.is_valid:
+        print("Import failed:")
+        for e in import_result.errors:
+            print(f"  ERROR: {e}")
+        sys.exit(1)
+    df = import_result.dataframe
+    print(f"Loaded {len(df)} bars from {csv_path}")
+
+    strategy = ManualStrategy(DEFAULT_MANUAL_STRATEGY)
+    risk, rules = RiskConfig(), PropRules()
+    cfg = FullPipelineConfig(
+        n_folds=n_folds, window_mode=window_mode, ga_population=population,
+        ga_generations=generations, fitness_metric=fitness_metric,
+        final_mc_sims=final_mc_sims, random_seed=seed, save_to_library=save_to_library,
+    )
+
+    print("Running Full Pipeline...")
+    result = run_full_pipeline(df, strategy, risk, rules, output_dir, cfg, progress_cb=print)
+    print(f"\nVerdict: {result.verdict}")
+    for r in result.verdict_reasons:
+        print(f"  - {r}")
+    if result.saved_library_note:
+        print(result.saved_library_note)
+    print("\nFull Pipeline report written to:")
+    for k, p in result.report_paths.items():
+        print(f"  {k}: {p}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="T58 Trading — Prop Algo Backtester")
     parser.add_argument("--cli", action="store_true", help="run headlessly instead of launching the GUI")
@@ -981,6 +1031,21 @@ def main():
     parser.add_argument("--wfga-metric", default="composite_prop_score", help="Walk-forward-aware GA: fitness metric")
     parser.add_argument("--wfga-seed", type=int, default=42, help="Walk-forward-aware GA: random seed")
 
+    parser.add_argument("--full-pipeline", action="store_true",
+                         help="run everything: baseline -> walk-forward-aware GA (robust config search) -> "
+                              "re-validated final report -> Strategy Library save. See "
+                              "app.orchestration.full_pipeline for details.")
+    parser.add_argument("--fp-folds", type=int, default=4, help="Full Pipeline: number of folds (GA + OOS check)")
+    parser.add_argument("--fp-window-mode", default="rolling", choices=["rolling", "anchored"],
+                         help="Full Pipeline: rolling or anchored GA fold windows")
+    parser.add_argument("--fp-population", type=int, default=12, help="Full Pipeline: GA population size")
+    parser.add_argument("--fp-generations", type=int, default=6, help="Full Pipeline: GA generations")
+    parser.add_argument("--fp-metric", default="composite_prop_score", help="Full Pipeline: fitness metric")
+    parser.add_argument("--fp-final-mc-sims", type=int, default=10000, help="Full Pipeline: Monte Carlo sims for the final report")
+    parser.add_argument("--fp-seed", type=int, default=42, help="Full Pipeline: random seed")
+    parser.add_argument("--fp-no-save-to-library", action="store_true",
+                         help="Full Pipeline: don't save the winning code strategy to the Strategy Library")
+
     args = parser.parse_args()
 
     if args.search:
@@ -1044,6 +1109,13 @@ def main():
             args.csv, args.output, n_folds=args.wfga_folds, window_mode=args.wfga_window_mode,
             population=args.wfga_population, generations=args.wfga_generations,
             fitness_metric=args.wfga_metric, seed=args.wfga_seed,
+        )
+    elif args.full_pipeline:
+        run_full_pipeline_cli(
+            args.csv, args.output, n_folds=args.fp_folds, window_mode=args.fp_window_mode,
+            population=args.fp_population, generations=args.fp_generations,
+            fitness_metric=args.fp_metric, final_mc_sims=args.fp_final_mc_sims, seed=args.fp_seed,
+            save_to_library=not args.fp_no_save_to_library,
         )
     elif args.cli:
         run_cli(

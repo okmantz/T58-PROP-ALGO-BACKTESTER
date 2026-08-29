@@ -41,6 +41,11 @@ from app.data.multi_timeframe import merge_multi_timeframe
 from app.data.pairs import PairDataError, merge_pair_series
 from app.data.storage import EMPTY_DATASET_BYTES, list_datasets_by_instrument, list_stored_datasets, store_csv_path
 from app.ensemble.ensemble import EnsembleError, EnsembleVoteConfig, run_ensemble_blend, run_ensemble_vote
+import app.forward_test.mt5_settings as mt5_settings_module
+from app.forward_test.mt5_settings import MT5Settings
+from app.forward_test import mt5_connector as mt5_connector_module
+from app.forward_test.journal import ForwardTestJournal
+from app.forward_test.engine import ForwardTestConfig, ForwardTestSession
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.parameter_space import RefinementError, apply_genome, extract_genome
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
@@ -136,6 +141,17 @@ ACCENT = "#7C6FFF"
 ACCENT_HOVER = "#9089FF"
 ACCENT_DIM = "#332E5C"     # low-opacity-style accent for subtle fills/left-bars
 ACCENT_INK = "#0C0A16"     # near-black used as text on top of the bright accent
+# Neon accent set -- used for the glowing card borders / ring progress /
+# per-metric coloring on the Dashboard tab, matching the neon-dark
+# reference mockups. Kept separate from the semantic GREEN/RED/AMBER above
+# (which mean pass/fail/warning everywhere else in the app) -- these are
+# purely decorative variety across KPI tiles, the way the mockups give
+# every stat card a different hue rather than making hue mean something.
+NEON_CYAN = "#00F0FF"
+NEON_MAGENTA = "#FF2BD6"
+NEON_LIME = "#B6FF3C"
+NEON_VIOLET = "#8A5CFF"
+NEON_AMBER = "#FFB547"
 FONT = "Segoe UI"
 MONO = "Consolas"
 
@@ -272,22 +288,28 @@ def _blend_hex(color_hex: str, toward_hex: str, t: float) -> str:
 
 
 class NeuralProgress(Canvas):
-    """An indeterminate progress indicator styled as a pulse of light
-    traveling through a short chain of connected nodes -- a quieter,
-    more purposeful alternative to a generic bouncing progress bar,
-    built from the same node/glow visual language as the Dashboard's
-    equity-curve and strategy-universe charts elsewhere in this app.
+    """An indeterminate progress indicator styled as a signal spreading
+    outward through a small neural mesh -- a diamond of layers (1 -> 3 -> 3
+    -> 3 -> 1 nodes) with a wave of activation that washes through the
+    whole network left to right, each node rippling on with a slight
+    per-node offset instead of a single dot sliding down a line. Built from
+    the same node/glow visual language as the Dashboard's equity-curve and
+    strategy-universe charts elsewhere in this app, just spread across two
+    dimensions instead of one.
 
     Drop-in replacement for `ttk.Progressbar(mode="indeterminate")`:
     supports the same `.start(interval)` / `.stop()` calls (interval is
     accepted for signature compatibility but this always animates at its
-    own fixed frame rate) and the same `.pack(...)` usage.
+    own fixed frame rate) and the same `.pack(...)` usage -- every existing
+    call site swaps in unchanged.
     """
 
-    N_NODES = 7
-    FRAME_MS = 30           # ~33fps
-    SWEEP_SECONDS = 3.2     # time for one full left-to-right pass
-    GLOW_SIGMA = 0.16       # how wide the bright region around the pulse is, as a fraction of the bar's width
+    LAYER_SIZES = (1, 3, 3, 3, 1)     # input -> hidden -> hidden -> hidden -> output
+    FRAME_MS = 22                      # ~45fps -- smoother than a generic indeterminate bar
+    SWEEP_SECONDS = 2.6                # time for one full wave to cross the mesh
+    WAVE_SIGMA = 0.62                  # how many "layers wide" the bright band of the wave is
+    RIPPLE_SPREAD = 0.16               # per-node timing offset within a layer, in layer-units
+    IDLE_GLOW = 0.05                   # faint resting brightness so the mesh never looks fully dead
 
     def __init__(self, parent, height: int = 26, **kwargs):
         super().__init__(parent, height=height, bg=PANEL_2, highlightthickness=0, **kwargs)
@@ -295,8 +317,10 @@ class NeuralProgress(Canvas):
         self._phase = 0.0
         self._running = False
         self._after_id = None
-        self.bind("<Configure>", lambda _e: self._draw())
-        self._draw()  # resting state before the first start()
+        self._nodes = []       # [(layer_idx, node_idx, x, y, ripple_offset), ...]
+        self._edges = []       # [(node_a_index_in_self._nodes, node_b_index_in_self._nodes), ...]
+        self.bind("<Configure>", lambda _e: self._layout_and_draw())
+        self._layout_and_draw()  # resting state before the first start()
 
     def start(self, interval=None):
         if self._running:
@@ -323,46 +347,203 @@ class NeuralProgress(Canvas):
         self._draw(active=True)
         self._after_id = self.after(self.FRAME_MS, self._tick)
 
+    def _layout_and_draw(self):
+        """Recomputes node positions (only needed on resize) and the fixed
+        mesh adjacency, then draws the resting frame."""
+        width = max(self.winfo_width(), 60)
+        height = self._height
+        margin_x = 16
+        margin_y = max(5, height * 0.18)
+        n_layers = len(self.LAYER_SIZES)
+        span_x = max(width - 2 * margin_x, 1)
+        span_y = max(height - 2 * margin_y, 1)
+
+        self._nodes = []
+        layer_node_indices = []  # for building adjacency: layer_node_indices[layer] = [index into self._nodes]
+        for li, count in enumerate(self.LAYER_SIZES):
+            x = margin_x + span_x * (li / (n_layers - 1))
+            indices = []
+            for ni in range(count):
+                # Centered vertically; a lone node (input/output) sits on the midline.
+                y = margin_y + span_y * ((ni + 0.5) / count) if count > 1 else margin_y + span_y / 2
+                ripple_offset = (ni - (count - 1) / 2) * self.RIPPLE_SPREAD
+                indices.append(len(self._nodes))
+                self._nodes.append([li, x, y, ripple_offset])
+            layer_node_indices.append(indices)
+
+        self._edges = []
+        for li in range(n_layers - 1):
+            left, right = layer_node_indices[li], layer_node_indices[li + 1]
+            # Every node connects to every node in the next layer when at
+            # least one side is a single input/output node (fans out/in
+            # cleanly); otherwise each hidden node connects to its two
+            # nearest neighbors in the next layer, which reads as a real
+            # mesh without turning into a dense, illegible tangle.
+            if len(left) == 1 or len(right) == 1:
+                for a in left:
+                    for b in right:
+                        self._edges.append((a, b))
+            else:
+                for i, a in enumerate(left):
+                    frac = i / max(len(left) - 1, 1)
+                    center = frac * (len(right) - 1)
+                    for b_off in (-1, 0, 1):
+                        j = round(center) + b_off
+                        if 0 <= j < len(right):
+                            self._edges.append((a, right[j]))
+
+        self._draw(active=self._running)
+
     def _draw(self, active: bool = False):
         self.delete("all")
-        width = max(self.winfo_width(), 40)
-        height = self._height
-        mid_y = height / 2
-        margin = 16
-        span = max(width - 2 * margin, 1)
+        if not self._nodes:
+            return
+        n_layers = len(self.LAYER_SIZES)
+        # Wave position in "layer units", padded so it eases in from before
+        # layer 0 and out past the last layer instead of snapping on/off.
+        pad = 1.3
+        wave_pos = self._phase * ((n_layers - 1) + 2 * pad) - pad
 
-        positions = [margin + span * i / (self.N_NODES - 1) for i in range(self.N_NODES)]
-        pulse_x = margin + span * self._phase
-
-        def activation(x: float) -> float:
+        def activation(layer_idx: float) -> float:
+            base = self.IDLE_GLOW
             if not active:
-                return 0.0
-            dx = (x - pulse_x) / span
-            return math.exp(-(dx * dx) / (2 * self.GLOW_SIGMA * self.GLOW_SIGMA))
+                return base
+            dx = layer_idx - wave_pos
+            return min(base + math.exp(-(dx * dx) / (2 * self.WAVE_SIGMA * self.WAVE_SIGMA)), 1.0)
 
-        # Connections first (drawn under the nodes), brightness following
-        # whichever endpoint is closer to the current pulse position.
-        for i in range(self.N_NODES - 1):
-            x1, x2 = positions[i], positions[i + 1]
-            a = max(activation(x1), activation(x2))
-            color = _blend_hex(BORDER, ACCENT_HOVER, min(a * 1.4, 1.0))
-            self.create_line(x1, mid_y, x2, mid_y, fill=color, width=2)
+        node_activation = [activation(li + off) for li, _x, _y, off in self._nodes]
 
-        # Soft glow halo around the pulse itself -- same "several fading
-        # concentric circles" trick used for the Dashboard's glow dots.
+        # Edges first, brightness following the brighter of its two endpoints.
+        for a, b in self._edges:
+            _, xa, ya, _ = self._nodes[a]
+            _, xb, yb, _ = self._nodes[b]
+            act = max(node_activation[a], node_activation[b])
+            color = _blend_hex(BORDER, ACCENT_HOVER, min(act * 1.3, 1.0))
+            width = 1 + (1.4 if act > 0.5 else 0)
+            self.create_line(xa, ya, xb, yb, fill=color, width=width)
+
+        # Soft glow halo under every sufficiently-bright node -- several
+        # nodes can glow at once as the wave spreads across a whole layer
+        # and its ripple-offset neighbors, which is the whole point versus
+        # a single traveling dot.
         if active:
-            for radius, t in ((10, 0.85), (6.5, 0.6), (3.5, 0.35)):
-                self.create_oval(
-                    pulse_x - radius, mid_y - radius, pulse_x + radius, mid_y + radius,
-                    fill=_blend_hex(PANEL_2, ACCENT, t), outline="",
+            for (_li, x, y, _off), act in zip(self._nodes, node_activation):
+                if act < 0.35:
+                    continue
+                t = (act - 0.35) / 0.65
+                for radius, alpha in ((9, 0.55), (5.5, 0.4), (3, 0.28)):
+                    self.create_oval(
+                        x - radius, y - radius, x + radius, y + radius,
+                        fill=_blend_hex(PANEL_2, ACCENT, t * alpha), outline="",
+                    )
+
+        # Nodes on top.
+        for (_li, x, y, _off), act in zip(self._nodes, node_activation):
+            r = 2.2 + 2.2 * act
+            fill = _blend_hex(BORDER_LIGHT, ACCENT_HOVER, act)
+            self.create_oval(x - r, y - r, x + r, y + r, fill=fill, outline="")
+
+
+class GlowCard(Canvas):
+    """A rounded panel with a soft neon glow border -- the "gradient
+    border card" look from the neon dashboard reference mockups. Tkinter
+    has no native box-shadow or rounded Frame, so this draws the panel
+    itself: a smoothed rounded-rect polygon for the body, a crisp accent-
+    colored edge, and an outward-fading halo built from the same nested/
+    dimming-shapes trick NeuralProgress uses for its pulse glow.
+
+    Usage: build widgets into `.body` (a plain Frame) exactly like any
+    other container -- `GlowCard(parent, accent=NEON_CYAN).body` is a drop
+    -in replacement for `Frame(parent, bg=PANEL_2)` wherever a panel
+    currently gets a flat `highlightbackground=BORDER` outline.
+    """
+
+    CORNER_RADIUS = 14
+
+    def __init__(self, parent, accent=ACCENT, glow=True, **kwargs):
+        super().__init__(parent, bg=BG, highlightthickness=0, **kwargs)
+        self.accent = accent
+        self.glow = glow
+        self.body = Frame(self, bg=PANEL_2)
+        self._window_id = None
+        self.bind("<Configure>", lambda e: self._redraw(e.width, e.height))
+
+    def set_accent(self, accent: str):
+        self.accent = accent
+        self._redraw(self.winfo_width(), self.winfo_height())
+
+    def _rounded_rect(self, x0, y0, x1, y1, r, **kwargs):
+        r = max(0.0, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+        points = [
+            x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
+            x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+            x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
+        ]
+        return self.create_polygon(points, smooth=True, **kwargs)
+
+    def _redraw(self, width, height):
+        if width < 8 or height < 8:
+            return
+        self.delete("all")
+        r = self.CORNER_RADIUS
+        pad = 4  # room for the glow halo to breathe past the card's own edge
+
+        if self.glow:
+            for i, alpha in ((3, 0.05), (2, 0.10), (1, 0.20)):
+                self._rounded_rect(
+                    pad - i * 2, pad - i * 2, width - pad + i * 2, height - pad + i * 2,
+                    r + i * 2, outline=_blend_hex(BG, self.accent, alpha), fill="", width=2,
                 )
 
-        # Nodes on top, each brightening as the pulse passes through it.
-        for x in positions:
-            a = activation(x)
-            r = 2.6 + 2.0 * a
-            fill = _blend_hex(BORDER_LIGHT, ACCENT_HOVER, a)
-            self.create_oval(x - r, mid_y - r, x + r, mid_y + r, fill=fill, outline="")
+        self._rounded_rect(pad, pad, width - pad, height - pad, r, fill=PANEL_2, outline=self.accent, width=1)
+
+        inner_w, inner_h = max(width - 2 * pad - 2, 1), max(height - 2 * pad - 2, 1)
+        if self._window_id is None:
+            self._window_id = self.create_window(
+                pad + 1, pad + 1, anchor="nw", window=self.body, width=inner_w, height=inner_h,
+            )
+        else:
+            self.coords(self._window_id, pad + 1, pad + 1)
+            self.itemconfigure(self._window_id, width=inner_w, height=inner_h)
+
+
+class RingProgress(Canvas):
+    """A glowing circular percentage ring -- the donut readout used for
+    "progress toward a target" across the neon dashboard mockups, in place
+    of a flat horizontal progress bar. Call `.set(pct)` to update.
+    """
+
+    def __init__(self, parent, size=88, thickness=9, accent=ACCENT, track=BORDER, **kwargs):
+        super().__init__(parent, width=size, height=size, bg=PANEL_2, highlightthickness=0, **kwargs)
+        self.size = size
+        self.thickness = thickness
+        self.accent = accent
+        self.track = track
+        self._pct = 0.0
+        self._draw()
+
+    def set(self, pct: float, accent: str | None = None):
+        self._pct = max(0.0, min(100.0, pct))
+        if accent is not None:
+            self.accent = accent
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        s, t = self.size, self.thickness
+        pad = t / 2 + 5
+        for radius_pad, alpha in ((6, 0.05), (3, 0.14)):
+            self.create_oval(
+                pad - radius_pad, pad - radius_pad, s - pad + radius_pad, s - pad + radius_pad,
+                outline=_blend_hex(PANEL_2, self.accent, alpha), width=t + radius_pad,
+            )
+        self.create_oval(pad, pad, s - pad, s - pad, outline=self.track, width=t)
+        extent = -359.9 * (self._pct / 100.0)  # 359.9, not 360 -- a full-circle arc draws nothing in Tk
+        if abs(extent) > 0.5:
+            self.create_arc(pad, pad, s - pad, s - pad, start=90, extent=extent, style="arc",
+                             outline=self.accent, width=t)
+        self.create_text(s / 2, s / 2, text=f"{self._pct:.0f}%", fill=self.accent,
+                          font=_safe_font(max(int(s * 0.16), 9), "bold"))
 
 
 _ADAPTIVE_RISK_TRIGGERS = [
@@ -517,12 +698,14 @@ class MainWindow:
         self.tab_wfga = Frame(self.content, bg=BG)
         self.tab_ensemble = Frame(self.content, bg=BG)
         self.tab_fullpipeline = Frame(self.content, bg=BG)
+        self.tab_forwardtest = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
+            self.tab_forwardtest,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -547,6 +730,8 @@ class MainWindow:
             ("ensemble", "\u25C6", "14  ENSEMBLE", self.tab_ensemble),
             (None, None, None, None),  # divider — All-In-One
             ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline),
+            (None, None, None, None),  # divider — going live
+            ("forwardtest", "\u25D4", "16  FORWARD TEST", self.tab_forwardtest),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -569,6 +754,7 @@ class MainWindow:
         self._build_wfga_tab()
         self._build_ensemble_tab()
         self._build_full_pipeline_tab()
+        self._build_forward_test_tab()
 
         self._show_page("dashboard")
 
@@ -979,14 +1165,34 @@ class MainWindow:
             canvas.create_oval(x - dr, y - dr, x + dr, y + dr, fill=blended, outline="")
         canvas.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=ring_color or color, width=1.5)
 
-    def _stat_card(self, parent, label, value, color=ACCENT_HOVER):
-        card = Frame(parent, bg=PANEL_2, highlightthickness=1, highlightbackground=BORDER)
-        Label(card, text=label.upper(), bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
-            anchor="w", padx=12, pady=(10, 2)
+    def _stat_card(self, parent, label, value, color=ACCENT_HOVER, accent=None):
+        """A single glowing neon KPI tile -- `accent` controls the card's
+        border/halo color (defaults to matching `color`, the value text
+        color), so callers that only cared about text color before still
+        work unchanged."""
+        card = GlowCard(parent, accent=accent or color, height=92)
+        Label(card.body, text=label.upper(), bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+            anchor="w", padx=14, pady=(12, 3)
         )
-        Label(card, text=value, bg=PANEL_2, fg=color, font=_safe_font(20, "bold")).pack(
-            anchor="w", padx=12, pady=(0, 10)
+        Label(card.body, text=value, bg=PANEL_2, fg=(accent or color), font=_safe_font(20, "bold")).pack(
+            anchor="w", padx=14, pady=(0, 10)
         )
+        return card
+
+    def _ring_stat_card(self, parent, label, pct, accent):
+        """A KPI tile that shows its value as a glowing ring instead of
+        flat text -- the "progress toward a target" donut readout from the
+        reference mockups."""
+        card = GlowCard(parent, accent=accent, height=92)
+        row = Frame(card.body, bg=PANEL_2)
+        row.pack(fill="both", expand=True, padx=10, pady=8)
+        ring = RingProgress(row, size=68, thickness=7, accent=accent)
+        ring.pack(side="left")
+        ring.set(pct)
+        Label(
+            row, text=label.upper(), bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(8, "bold"),
+            wraplength=90, justify="left",
+        ).pack(side="left", padx=(10, 0), anchor="w")
         return card
 
     def _build_dashboard_tab(self):
@@ -1007,17 +1213,17 @@ class MainWindow:
         self._dash_stats_row = Frame(scroll_frame, bg=BG)
         self._dash_stats_row.pack(fill="x", padx=24, pady=(4, 14))
 
-        library_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        library_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=NEON_VIOLET)
         library_wrap.pack(fill="x", padx=24, pady=(0, 14))
-        Label(library_wrap, text="MARKET DATA LIBRARY — data/raw, BY INSTRUMENT", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+        Label(library_wrap, text="● MARKET DATA LIBRARY — data/raw, BY INSTRUMENT", bg=PANEL, fg=NEON_VIOLET, font=_safe_font(8, "bold")).pack(
             anchor="w", padx=14, pady=(10, 4)
         )
         self._dash_library_frame = Frame(library_wrap, bg=PANEL)
         self._dash_library_frame.pack(fill="x", padx=14, pady=(0, 14))
 
-        universe_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        universe_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=NEON_CYAN)
         universe_wrap.pack(fill="x", padx=24, pady=(0, 14))
-        Label(universe_wrap, text="STRATEGY UNIVERSE", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+        Label(universe_wrap, text="● STRATEGY UNIVERSE", bg=PANEL, fg=NEON_CYAN, font=_safe_font(8, "bold")).pack(
             anchor="w", padx=14, pady=(10, 4)
         )
         self._dash_universe_canvas = Canvas(universe_wrap, bg=PANEL, height=220, highlightthickness=0)
@@ -1026,25 +1232,25 @@ class MainWindow:
         charts_row = Frame(scroll_frame, bg=BG)
         charts_row.pack(fill="x", padx=24, pady=(0, 14))
 
-        equity_wrap = Frame(charts_row, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        equity_wrap = Frame(charts_row, bg=PANEL, highlightthickness=1, highlightbackground=NEON_CYAN)
         equity_wrap.pack(side="left", fill="both", expand=True, padx=(0, 7))
-        Label(equity_wrap, text="EQUITY CURVES — TOP STRATEGIES", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+        Label(equity_wrap, text="● EQUITY CURVES — TOP STRATEGIES", bg=PANEL, fg=NEON_CYAN, font=_safe_font(8, "bold")).pack(
             anchor="w", padx=14, pady=(10, 4)
         )
         self._dash_equity_canvas = Canvas(equity_wrap, bg=PANEL, height=180, highlightthickness=0)
         self._dash_equity_canvas.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
-        heatmap_wrap = Frame(charts_row, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        heatmap_wrap = Frame(charts_row, bg=PANEL, highlightthickness=1, highlightbackground=NEON_MAGENTA)
         heatmap_wrap.pack(side="left", fill="both", expand=True, padx=(7, 0))
-        Label(heatmap_wrap, text="WEEKDAY x HOUR PNL (ALL RUNS)", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+        Label(heatmap_wrap, text="● WEEKDAY x HOUR PNL (ALL RUNS)", bg=PANEL, fg=NEON_MAGENTA, font=_safe_font(8, "bold")).pack(
             anchor="w", padx=14, pady=(10, 4)
         )
         self._dash_heatmap_canvas = Canvas(heatmap_wrap, bg=PANEL, height=180, highlightthickness=0)
         self._dash_heatmap_canvas.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
-        table_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        table_wrap = Frame(scroll_frame, bg=PANEL, highlightthickness=1, highlightbackground=NEON_VIOLET)
         table_wrap.pack(fill="both", expand=True, padx=24, pady=(0, 20))
-        Label(table_wrap, text="STRATEGY SCORECARD", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
+        Label(table_wrap, text="● STRATEGY SCORECARD", bg=PANEL, fg=NEON_VIOLET, font=_safe_font(8, "bold")).pack(
             anchor="w", padx=14, pady=(10, 6)
         )
 
@@ -1084,15 +1290,28 @@ class MainWindow:
         for child in self._dash_stats_row.winfo_children():
             child.destroy()
         best = data.get("best")
-        cards = [
-            ("Strategies tested", str(data["total_strategies"]), METAL_BRIGHT),
-            ("Eval pass rate", f"{data['pass_rate']:.0f}%", GREEN if data["pass_rate"] >= 50 else RED),
-            ("Best Sharpe", f"{best['sharpe_ratio']:.2f}" if best else "--", ACCENT_HOVER),
-            ("Leader", best["strategy_name"] if best else "--", METAL_BRIGHT),
-        ]
-        for label, value, color in cards:
-            card = self._stat_card(self._dash_stats_row, label, value, color)
-            card.pack(side="left", fill="both", expand=True, padx=6)
+        pass_rate = data["pass_rate"]
+
+        card1 = self._stat_card(self._dash_stats_row, "Strategies tested", str(data["total_strategies"]), accent=NEON_VIOLET)
+        card1.pack(side="left", fill="both", expand=True, padx=6)
+
+        card2 = self._ring_stat_card(
+            self._dash_stats_row, "Eval pass rate", pass_rate,
+            accent=NEON_LIME if pass_rate >= 50 else NEON_MAGENTA,
+        )
+        card2.pack(side="left", fill="both", expand=True, padx=6)
+
+        card3 = self._stat_card(
+            self._dash_stats_row, "Best Sharpe",
+            f"{best['sharpe_ratio']:.2f}" if best else "--", accent=NEON_CYAN,
+        )
+        card3.pack(side="left", fill="both", expand=True, padx=6)
+
+        card4 = self._stat_card(
+            self._dash_stats_row, "Leader",
+            best["strategy_name"] if best else "--", accent=NEON_AMBER,
+        )
+        card4.pack(side="left", fill="both", expand=True, padx=6)
 
         self._paint_data_library()
 
@@ -5469,6 +5688,384 @@ class MainWindow:
             self.fullpipeline_verdict_label.config(text="Failed -- see log.", fg=RED)
         finally:
             self.fullpipeline_progress.stop()
+
+
+    # -----------------------------------------------------------------------
+    # Tab 16 — Forward Test (MT5 Demo)
+    # -----------------------------------------------------------------------
+
+    def _build_forward_test_tab(self):
+        f = self._scrollable(self.tab_forwardtest)
+        self._ft_session: ForwardTestSession | None = None
+        self._ft_journal = None
+
+        self._page_header(
+            f,
+            "16 / Going Live",
+            "Forward Test (MT5 Demo)",
+            "Deploy any Strategy Library strategy to a free MetaTrader 5 demo account and "
+            "watch it trade forward, bar by bar, against real broker prices instead of a "
+            "CSV. Uses the exact same signal engine and position-sizing math as the "
+            "backtester -- no separate re-implementation to drift out of sync. This is a "
+            "demo account only; there is no live/funded order path here.",
+        )
+
+        if not mt5_connector_module.is_available():
+            notice = self._section(f, "MetaTrader 5 not detected", "", emphasize=True)
+            Label(
+                notice, text=mt5_connector_module.unavailable_reason(), bg=PANEL, fg=AMBER,
+                font=_safe_font(9), wraplength=820, justify="left",
+            ).pack(anchor="w", padx=18, pady=(2, 6))
+            Label(
+                notice,
+                text="To use this tab: run the app on Windows with an MT5 terminal installed "
+                     "and logged into a demo account (any MT5 broker's site offers a free demo "
+                     "account signup), and make sure `pip install MetaTrader5` succeeded. The "
+                     "rest of this tab still works for entering settings -- Start Forward Test "
+                     "will just fail with a clear message until MT5 is reachable.",
+                bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+            ).pack(anchor="w", padx=18, pady=(0, 12))
+
+        strat_section = self._section(
+            f, "Strategy",
+            "Pulled from your Strategy Library (Step 02) -- Python, PineScript, and MQL5 "
+            "strategies all work here since they share the same signal interface.",
+            emphasize=True,
+        )
+        picker_row = Frame(strat_section, bg=PANEL)
+        picker_row.pack(fill="x", padx=18, pady=(2, 4))
+        Label(
+            picker_row, text="Strategy", width=31, anchor="w",
+            bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9),
+        ).pack(side="left")
+        self.ft_strategy_var = StringVar(value="")
+        self.ft_strategy_combo = ttk.Combobox(
+            picker_row, textvariable=self.ft_strategy_var, values=[], state="readonly",
+            width=52, font=_safe_font(9), style="T58.TCombobox",
+        )
+        self.ft_strategy_combo.pack(side="left", padx=(4, 8))
+        self._button(picker_row, "REFRESH", self._ft_refresh_strategies).pack(side="left")
+        self._ft_strategy_items: list = []
+        self._ft_refresh_strategies()
+
+        market_section = self._section(
+            f, "Market",
+            "Symbol must match this exact string on your MT5 account/broker (e.g. 'XAUUSD', "
+            "'EURUSD', 'US30' -- some brokers append a suffix like 'XAUUSD.m', check your "
+            "MT5 Market Watch if the exact symbol isn't found).",
+        )
+        self.ft_symbol = LabeledEntry(market_section, "Symbol", mt5_settings_module.DEFAULT_SYMBOL)
+        self.ft_timeframe = LabeledCombo(
+            market_section, "Timeframe",
+            ["1 minute", "5 minutes", "15 minutes", "30 minutes", "1 hour", "4 hours", "1 day"],
+            "15 minutes",
+        )
+
+        account_section = self._section(
+            f, "MT5 Demo Account",
+            "Saved locally (password via your OS keyring where available). Get a free demo "
+            "login from any MT5-supporting broker's website, or your prop firm's own demo/"
+            "trial account if they offer one.",
+        )
+        saved_mt5 = mt5_settings_module.load_settings()
+        self.ft_login = LabeledEntry(account_section, "Login (account number)", saved_mt5.login)
+        self.ft_server = LabeledEntry(account_section, "Server", saved_mt5.server)
+        self.ft_password = LabeledEntry(account_section, "Password", saved_mt5.password, secret=True)
+        self.ft_terminal_path = LabeledEntry(
+            account_section, "Terminal path (optional, only if auto-detect fails)", saved_mt5.terminal_path,
+        )
+        conn_row = Frame(account_section, bg=PANEL)
+        conn_row.pack(anchor="w", padx=18, pady=(2, 10))
+        self.ft_test_conn_btn = self._button(conn_row, "SAVE & TEST CONNECTION", self._ft_test_connection, primary=True)
+        self.ft_test_conn_btn.pack(side="left")
+        self.ft_conn_status = Label(conn_row, text="", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=760, justify="left")
+        self.ft_conn_status.pack(side="left", padx=(12, 0))
+
+        risk_section = self._section(
+            f, "Risk (same fields as Step 04, applied to this live demo account)",
+            "Position sizing calls the exact same RiskConfig.position_size(...) the "
+            "backtester uses -- if a strategy defines its own dynamic stop, that's honored "
+            "first; otherwise a fixed-pip or 1%-of-price fallback applies, same precedence "
+            "as a backtest run.",
+        )
+        self.ft_risk_pct = LabeledEntry(risk_section, "Risk per trade (% of equity)", 1.0)
+        self.ft_daily_loss_limit = LabeledEntry(risk_section, "Daily loss limit (% of balance, halts new entries)", 5.0)
+        self.ft_max_trades_per_day = LabeledEntry(risk_section, "Max trades per day", 10)
+        self.ft_pip_size = LabeledEntry(risk_section, "Pip size (leave blank to auto-detect from MT5 symbol info)", "")
+        self.ft_baseline_win_rate = LabeledEntry(
+            risk_section, "Backtest win rate %, for drift comparison (optional)", "",
+        )
+
+        control_section = self._section(f, "Session control", "")
+        btn_row = Frame(control_section, bg=PANEL)
+        btn_row.pack(fill="x", padx=18, pady=(2, 4))
+        self.ft_start_btn = self._button(btn_row, "START FORWARD TEST", self._ft_start_clicked, primary=True)
+        self.ft_start_btn.pack(side="left")
+        self.ft_stop_btn = self._button(btn_row, "STOP", self._ft_stop_clicked)
+        self.ft_stop_btn.pack(side="left", padx=8)
+        self.ft_stop_btn.config(state="disabled")
+        self.ft_kill_btn = Button(
+            btn_row, text="KILL SWITCH — FLATTEN & STOP", command=self._ft_kill_clicked,
+            bg=RED, fg="#1a0a0d", activebackground="#c94656", activeforeground="#1a0a0d",
+            relief="flat", bd=0, font=_safe_font(9, "bold"), padx=14, pady=8, cursor="hand2",
+        )
+        self.ft_kill_btn.pack(side="left", padx=8)
+        self.ft_kill_btn.config(state="disabled")
+
+        self.ft_progress = NeuralProgress(control_section)
+        self.ft_progress.pack(fill="x", padx=18, pady=(6, 10))
+
+        status_row = Frame(control_section, bg=PANEL)
+        status_row.pack(fill="x", padx=18, pady=(0, 12))
+        self.ft_status_label = Label(
+            status_row, text="Not running.", bg=PANEL, fg=TEXT_DIM,
+            font=_safe_font(10, "bold"), justify="left", wraplength=820,
+        )
+        self.ft_status_label.pack(anchor="w")
+
+        journal_section = self._section(f, "Trade journal (this session)", "")
+        columns = ("time", "direction", "volume", "entry", "exit", "pnl", "status")
+        self.ft_journal_tree = ttk.Treeview(journal_section, columns=columns, show="headings", height=8)
+        for col, label, w in (
+            ("time", "Entry Time", 140), ("direction", "Dir", 50), ("volume", "Size", 70),
+            ("entry", "Entry", 90), ("exit", "Exit", 90), ("pnl", "P&L", 80), ("status", "Status", 70),
+        ):
+            self.ft_journal_tree.heading(col, text=label)
+            self.ft_journal_tree.column(col, width=w, anchor="center")
+        self.ft_journal_tree.pack(fill="x", padx=18, pady=(2, 12))
+
+        log_section = self._section(f, "Live log", "")
+        self.ft_log = Text(
+            log_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.ft_log.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+    def _ft_refresh_strategies(self):
+        items = list_saved_strategies(None)
+        self._ft_strategy_items = items
+        labels = [f"[{it.strategy_type}] {it.name}" for it in items]
+        self.ft_strategy_combo["values"] = labels
+        if labels and not self.ft_strategy_var.get():
+            self.ft_strategy_var.set(labels[0])
+
+    def _ft_selected_strategy_item(self):
+        label = self.ft_strategy_var.get()
+        for it in self._ft_strategy_items:
+            if f"[{it.strategy_type}] {it.name}" == label:
+                return it
+        return None
+
+    def _ft_build_strategy_instance(self, item):
+        if item.strategy_type == "python":
+            return PythonStrategy(item.path)
+        text = item.path.read_text(encoding="utf-8")
+        if item.strategy_type == "pinescript":
+            return PineScriptStrategy(text)
+        if item.strategy_type == "mql5":
+            return MQL5Strategy(text)
+        raise StrategyError(f"Unsupported strategy type for forward test: {item.strategy_type}")
+
+    def _ft_timeframe_minutes(self) -> int:
+        mapping = {
+            "1 minute": 1, "5 minutes": 5, "15 minutes": 15, "30 minutes": 30,
+            "1 hour": 60, "4 hours": 240, "1 day": 1440,
+        }
+        return mapping.get(self.ft_timeframe.get_str(), 15)
+
+    def _ft_log_line(self, level: str, message: str):
+        color = {"error": RED, "warn": AMBER, "info": TEXT}.get(level, TEXT)
+        tag = f"lvl_{level}"
+        self.ft_log.tag_config(tag, foreground=color)
+        self.ft_log.insert(END, f"[{level.upper()}] {message}\n", tag)
+        self.ft_log.see(END)
+        try:
+            self.root.after(0, self.root.update_idletasks)
+        except Exception:
+            pass
+
+    def _ft_save_mt5_settings(self) -> MT5Settings:
+        settings = MT5Settings(
+            login=self.ft_login.get_str().strip(),
+            server=self.ft_server.get_str().strip(),
+            password=self.ft_password.get_str(),
+            symbol=self.ft_symbol.get_str().strip() or mt5_settings_module.DEFAULT_SYMBOL,
+            timeframe_minutes=self._ft_timeframe_minutes(),
+            terminal_path=self.ft_terminal_path.get_str().strip(),
+        )
+        mt5_settings_module.save_settings(settings)
+        return settings
+
+    def _ft_test_connection(self):
+        settings = self._ft_save_mt5_settings()
+        if not mt5_connector_module.is_available():
+            self.ft_conn_status.config(text=mt5_connector_module.unavailable_reason(), fg=AMBER)
+            return
+        self.ft_test_conn_btn.config(state="disabled")
+        self.ft_conn_status.config(text="Connecting...", fg=AMBER)
+
+        def run():
+            from app.forward_test.mt5_connector import MT5Connector
+            connector = MT5Connector(settings.login, settings.password, settings.server, settings.terminal_path)
+            result = connector.connect()
+            if result.ok:
+                msg = (f"Connected: account {result.account_login} @ {result.account_server} — "
+                       f"balance {result.balance:,.2f} {result.currency}, equity {result.equity:,.2f}.")
+                connector.disconnect()
+            else:
+                msg = result.message
+            self.root.after(0, lambda: self.ft_conn_status.config(text=msg, fg=GREEN if result.ok else RED))
+            self.root.after(0, lambda: self.ft_test_conn_btn.config(state="normal"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _ft_start_clicked(self):
+        item = self._ft_selected_strategy_item()
+        if item is None:
+            messagebox.showwarning("No strategy selected", "Choose a strategy from the Strategy Library first.")
+            return
+        if not mt5_connector_module.is_available():
+            messagebox.showwarning("MT5 not available", mt5_connector_module.unavailable_reason())
+            return
+
+        settings = self._ft_save_mt5_settings()
+        if not settings.is_usable:
+            messagebox.showwarning("Missing credentials", "Enter your MT5 demo login, server, and password.")
+            return
+
+        try:
+            strategy = self._ft_build_strategy_instance(item)
+        except Exception as exc:
+            messagebox.showerror("Strategy error", f"Could not load strategy: {exc}")
+            return
+
+        from app.forward_test.mt5_connector import MT5Connector
+
+        connector = MT5Connector(settings.login, settings.password, settings.server, settings.terminal_path)
+        pip_size_str = self.ft_pip_size.get_str().strip()
+        pip_size = None
+        if pip_size_str:
+            try:
+                pip_size = float(pip_size_str)
+            except ValueError:
+                pip_size = None
+
+        def resolve_pip_and_start():
+            nonlocal pip_size
+            probe = MT5Connector(settings.login, settings.password, settings.server, settings.terminal_path)
+            conn = probe.connect()
+            if not conn.ok:
+                self.root.after(0, lambda: self._ft_log_line("error", conn.message))
+                return
+            if pip_size is None:
+                try:
+                    pip_size = probe.symbol_point(settings.symbol)
+                except Exception as exc:
+                    self.root.after(0, lambda: self._ft_log_line(
+                        "warn", f"Could not auto-detect pip size ({exc}); falling back to 0.0001."))
+                    pip_size = 0.0001
+            probe.disconnect()
+
+            risk = RiskConfig(
+                initial_balance=conn.balance or 10_000.0,
+                risk_mode="percent",
+                risk_value=self.ft_risk_pct.get_float(1.0),
+                max_trades_per_day=self.ft_max_trades_per_day.get_int(10),
+                pip_size=pip_size,
+                daily_loss_limit_pct=self.ft_daily_loss_limit.get_float(5.0) or None,
+            )
+            baseline_str = self.ft_baseline_win_rate.get_str().strip()
+            baseline_win_rate = float(baseline_str) if baseline_str else None
+
+            cfg = ForwardTestConfig(
+                symbol=settings.symbol, timeframe_minutes=settings.timeframe_minutes,
+                risk=risk, baseline_win_rate=baseline_win_rate,
+            )
+            self._ft_journal = ForwardTestJournal()
+            session = ForwardTestSession(
+                strategy=strategy, strategy_type=item.strategy_type, strategy_filename=item.name,
+                connector=connector, journal=self._ft_journal, config=cfg,
+                on_log=lambda level, msg: self.root.after(0, lambda: self._ft_log_line(level, msg)),
+                on_status=lambda status: self.root.after(0, lambda: self._ft_update_status(status)),
+            )
+            ok, msg = session.start()
+            if not ok:
+                self.root.after(0, lambda: self._ft_log_line("error", msg))
+                return
+            self._ft_session = session
+            self.root.after(0, self._ft_on_started)
+
+        threading.Thread(target=resolve_pip_and_start, daemon=True).start()
+        self.ft_start_btn.config(state="disabled")
+        self.ft_status_label.config(text="Connecting...", fg=AMBER)
+
+    def _ft_on_started(self):
+        self.ft_stop_btn.config(state="normal")
+        self.ft_kill_btn.config(state="normal")
+        self.ft_progress.start()
+        self.ft_status_label.config(text="Running.", fg=GREEN)
+
+    def _ft_update_status(self, status):
+        parts = [f"Running: {status.running}", f"Last signal: {status.last_signal}"]
+        if status.balance is not None:
+            parts.append(f"Balance ${status.balance:,.2f}")
+        if status.equity is not None:
+            parts.append(f"Equity ${status.equity:,.2f}")
+        if status.n_trades_closed:
+            parts.append(f"Closed trades: {status.n_trades_closed}")
+        if status.win_rate is not None:
+            parts.append(f"Win rate {status.win_rate:.1f}%")
+        if status.halted_reason:
+            parts.append(f"HALTED: {status.halted_reason}")
+        color = RED if status.halted_reason else (GREEN if status.running else TEXT_DIM)
+        if status.drift_flag:
+            parts.append(f"⚠ {status.drift_flag}")
+            color = AMBER
+        self.ft_status_label.config(text="  |  ".join(parts), fg=color)
+        self._ft_refresh_journal_view()
+
+    def _ft_refresh_journal_view(self):
+        if self._ft_journal is None or self._ft_session is None or self._ft_session._session_id is None:
+            return
+        for row in self.ft_journal_tree.get_children():
+            self.ft_journal_tree.delete(row)
+        trades = self._ft_journal.all_trades(self._ft_session._session_id)
+        for t in trades[:100]:
+            import datetime
+            entry_time = datetime.datetime.fromtimestamp(t.entry_time).strftime("%m-%d %H:%M")
+            direction = "LONG" if t.direction == 1 else "SHORT"
+            exit_price = f"{t.exit_price:.5f}" if t.exit_price else ""
+            pnl = f"{t.pnl:,.2f}" if t.pnl is not None else ""
+            self.ft_journal_tree.insert("", END, values=(
+                entry_time, direction, f"{t.volume:.2f}", f"{t.entry_price:.5f}", exit_price, pnl, t.status,
+            ))
+
+    def _ft_stop_clicked(self):
+        if self._ft_session is None:
+            return
+        self.ft_status_label.config(text="Stopping...", fg=AMBER)
+        threading.Thread(target=self._ft_session.stop, daemon=True).start()
+        self.ft_start_btn.config(state="normal")
+        self.ft_stop_btn.config(state="disabled")
+        self.ft_kill_btn.config(state="disabled")
+        self.ft_progress.stop()
+
+    def _ft_kill_clicked(self):
+        if self._ft_session is None:
+            return
+        if not messagebox.askyesno(
+            "Kill switch",
+            "This closes every open position on this symbol immediately and stops the "
+            "session. Continue?",
+        ):
+            return
+        self.ft_status_label.config(text="Flattening and stopping...", fg=RED)
+        threading.Thread(target=self._ft_session.flatten_all_and_stop, daemon=True).start()
+        self.ft_start_btn.config(state="normal")
+        self.ft_stop_btn.config(state="disabled")
+        self.ft_kill_btn.config(state="disabled")
+        self.ft_progress.stop()
 
 
 def launch():

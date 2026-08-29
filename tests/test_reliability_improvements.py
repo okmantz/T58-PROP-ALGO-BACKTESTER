@@ -191,3 +191,54 @@ def test_eod_drawdown_mode_survives_intraday_dip_that_recovers_by_close():
 
     assert result_intrabar.failed and result_intrabar.failure_reason == "daily_loss_limit"
     assert not result_eod.failed
+
+
+def _gold_scale_trending_df(n=400, seed=3):
+    """Price data on a ~1900-per-unit scale (like gold), the way an
+    instrument that isn't 4-decimal FX would look, used to confirm the
+    pip-size/instrument-scale mismatch warning below."""
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2024-01-01", periods=n, freq="5min")
+    price = 1900.0
+    rows = []
+    for i in range(n):
+        drift = rng.normal(0, 0.6)
+        o = price
+        c = o + drift
+        h = max(o, c) + abs(rng.normal(0, 0.4))
+        l = min(o, c) - abs(rng.normal(0, 0.4))
+        rows.append((ts[i], o, h, l, c, 100.0))
+        price = c
+    return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+
+def test_pip_size_instrument_mismatch_produces_a_clear_warning():
+    """A strategy with a fixed-pips stop (e.g. ported from an FX script)
+    run against a non-FX-scaled instrument (gold-like prices ~1900) while
+    risk.pip_size is left at the FX default of 0.0001 should surface an
+    explicit warning identifying the mismatch, rather than silently
+    producing nonsensical position sizes."""
+    df = _gold_scale_trending_df()
+    strategy = _sma_strategy()  # stop_loss_pips=15, take_profit_pips=30
+    risk = RiskConfig(
+        initial_balance=50_000.0, risk_mode="percent", risk_value=2.0,
+        pip_size=0.0001,  # FX default, wrong for ~1900-scale prices
+        spread_pips=1.0, slippage_pips=0.5, commission_per_trade=5.0,
+    )
+    result = run_backtest(df, strategy, risk)
+    assert any("pip_size" in w and "doesn't match" in w for w in result.warnings)
+
+
+def test_matched_pip_size_produces_no_mismatch_warning():
+    """Sanity check for the same scenario with a correctly-scaled pip_size
+    (as if the person had set it appropriately for the instrument) --
+    the mismatch warning should NOT fire purely because prices are large."""
+    df = _gold_scale_trending_df()
+    strategy = _sma_strategy()
+    risk = RiskConfig(
+        initial_balance=50_000.0, risk_mode="percent", risk_value=2.0,
+        pip_size=1.0,  # appropriately scaled for ~1900-priced instrument
+        spread_pips=1.0, slippage_pips=0.5, commission_per_trade=5.0,
+    )
+    result = run_backtest(df, strategy, risk)
+    assert not any("pip_size" in w and "doesn't match" in w for w in result.warnings)

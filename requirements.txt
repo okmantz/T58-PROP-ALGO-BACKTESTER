@@ -6,3 +6,8 @@ alpaca-py>=0.33.0
 keyring>=24.0.0
 qrcode[pil]==8.2
 requests>=2.31.0
+# Forward Test (MT5 Demo) tab only -- talks to a locally-running MT5
+# terminal, which only exists on Windows. Harmless to leave in on
+# other platforms: pip simply skips it there, and the Forward Test tab
+# detects its absence and explains why instead of erroring.
+MetaTrader5>=5.0.45; platform_system == "Windows"

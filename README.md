@@ -467,6 +467,61 @@ the numbers, front and center rather than buried in a console log:
 Available on the desktop GUI (sidebar: **15 FULL PIPELINE**) and headlessly
 via `--full-pipeline` (see **CLI reference** below).
 
+## Step 16 — Forward Test (MT5 Demo)
+
+Deploy any Strategy Library strategy to a free MetaTrader 5 demo account
+and watch it trade forward against real broker prices, bar by bar, instead
+of a CSV. This is the bridge between "the backtest looks good" and "I'd
+trust this with real money": spread, slippage, and fills come from the
+actual market instead of a cost model, over however long you let it run.
+
+**Why MT5, not TradingView.** TradingView's webhook alerts — the usual way
+to wire a chart strategy to automated execution — require a paid plan.
+MT5's free, official `MetaTrader5` Python package talks directly to a
+locally-running MT5 terminal at no cost, and virtually every prop firm
+offers MT5-based demo/eval/funded accounts. That's the whole reason this
+was built on MT5 instead.
+
+**Requirements:** Windows, a running MT5 terminal logged into a demo
+account (any MT5 broker's website offers a free demo signup), and
+`pip install MetaTrader5` (already conditional in `requirements.txt` on
+Windows). On any other OS, or without the package, the tab explains this
+plainly instead of erroring.
+
+**What it does, and doesn't, do:**
+
+- Reuses the *exact* signal engine (`Strategy.generate(df)`) and *exact*
+  position-sizing math (`RiskConfig.position_size(...)`) the backtester
+  uses — forward-test behavior is never a second, drifting implementation
+  of "what should this strategy do."
+- Polls for newly-closed bars only (never a still-forming bar), resolves
+  each trade's stop/target with the same precedence the backtest engine
+  uses (dynamic distance → fixed pips → 1%-of-price fallback), and sizes
+  the position from live account equity.
+- Enforces a daily-loss circuit breaker (same `daily_loss_limit_pct`
+  semantics as a backtest run) that halts new entries for the rest of the
+  calendar day once tripped.
+- Reconciles with MT5's actual open positions on every start — an app
+  restart mid-trade adopts the real position instead of opening a
+  duplicate.
+- Logs every trade and event to a local SQLite journal
+  (`data/forward_test/forward_test.db`) that survives a restart.
+- Flags (doesn't auto-stop on) win-rate drift versus a backtest baseline
+  you can optionally enter, once enough forward trades have accumulated.
+- Ships a **kill switch** — one button closes every open position on the
+  symbol immediately and stops the session.
+- **Demo accounts only.** There is no live/funded order path anywhere in
+  this module. Wiring it to a funded account is a deliberate, separate,
+  later decision — not a checkbox here.
+
+Before deploying anything: see `strategies/SCREENING_RESULTS.md` for an
+honest read on which of the bundled library strategies currently show any
+real edge (as of writing: none of them do — forward-testing one of them
+won't turn it profitable).
+
+Available on the desktop GUI (sidebar: **16 FORWARD TEST**). No CLI
+equivalent yet — this is an interactive, long-running session by nature.
+
 ## AI Assist (optional, local Ollama)
 
 Full Pipeline's walk-forward-aware GA search can optionally ask a local

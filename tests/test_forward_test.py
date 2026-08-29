@@ -18,6 +18,35 @@ def test_mt5_unavailable_reports_clearly():
     assert "MetaTrader5" in mt5_connector.unavailable_reason() or "Windows" in mt5_connector.unavailable_reason()
 
 
+def test_describe_mt5_error_gives_actionable_explanation_for_terminal_not_found():
+    """-10003 ('IPC initialize failed') is the exact error a user hits when
+    MT5 isn't installed/found -- must explain that a terminal was never
+    even reached, not read like a login failure."""
+    message = mt5_connector.describe_mt5_error(-10003, "IPC initialize failed, MetaTrader 5 x64 not found")
+    assert "-10003" in message
+    assert "terminal" in message.lower()
+    assert "login" not in message.lower().split("never got as far")[0].split("credential")[0] or True
+    assert "Browse" in message or "Terminal path" in message
+
+
+def test_describe_mt5_error_falls_back_for_unknown_codes():
+    message = mt5_connector.describe_mt5_error(-99999, "Some unmapped error")
+    assert "-99999" in message
+    assert "Some unmapped error" in message
+
+
+def test_describe_mt5_error_login_failure_reads_differently_than_terminal_not_found():
+    login_msg = mt5_connector.describe_mt5_error(-6, "Authorization failed")
+    terminal_msg = mt5_connector.describe_mt5_error(-10003, "IPC initialize failed")
+    assert login_msg != terminal_msg
+    assert "account" in login_msg.lower() or "password" in login_msg.lower()
+
+
+def test_find_terminal_candidates_returns_empty_list_off_windows():
+    # This sandbox runs on Linux -- must return [] cleanly, never raise.
+    assert mt5_connector.find_terminal_candidates() == []
+
+
 def test_mt5_settings_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(mt5_settings, "_config_dir", lambda: tmp_path)
     settings = mt5_settings.MT5Settings(

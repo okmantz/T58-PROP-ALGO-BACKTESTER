@@ -46,6 +46,19 @@ def test_build_prompt_never_asks_the_model_to_write_code():
     assert "NOT being asked to" in prompt
 
 
+def test_build_prompt_without_failure_analysis_has_no_patterns_section():
+    prompt = _build_prompt("Test", "python", _genes(), {}, {}, 2)
+    assert "Patterns already observed" not in prompt
+
+
+def test_build_prompt_includes_failure_analysis_when_given():
+    lines = ['  - "period": higher values -> better fitness (top performers cluster around 20-30).']
+    prompt = _build_prompt("Test", "python", _genes(), {}, {}, 2, failure_analysis_lines=lines)
+    assert "Patterns already observed" in prompt
+    assert "period" in prompt
+    assert "20-30" in prompt
+
+
 # ---------------------------------------------------------------------------
 # Response parsing
 # ---------------------------------------------------------------------------

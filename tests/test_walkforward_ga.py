@@ -145,3 +145,57 @@ def test_ai_suggest_cb_with_wrong_length_genome_is_ignored():
         ai_suggest_cb=wrong_length_ai_suggest,
     )
     assert result.best is not None
+
+
+def test_ai_suggest_cb_two_argument_form_receives_population_snapshot():
+    """A callback declaring a second parameter should receive the prior
+    generation's [(genome, fitness), ...] snapshot -- empty on generation
+    0, non-empty (and the right size) on every generation after."""
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    risk = RiskConfig()
+    rules = PropRules()
+    mc_cfg = MonteCarloConfig(n_simulations=50)
+    refine_cfg = RefinementConfig(population_size=6, generations=2, search_monte_carlo_sims=30)
+
+    seen_population_sizes = []
+
+    def population_aware_ai_suggest(genes, population):
+        seen_population_sizes.append(len(population))
+        return [[g.base_value for g in genes]]
+
+    result = run_walkforward_aware_refinement(
+        df, strategy, risk, rules, mc_cfg, refinement_config=refine_cfg, n_folds=3,
+        ai_suggest_cb=population_aware_ai_suggest,
+    )
+    assert result.best is not None
+    # Generation 0 call gets an empty snapshot; every later generation's
+    # call gets the full prior population.
+    assert seen_population_sizes[0] == 0
+    assert all(size == refine_cfg.population_size for size in seen_population_sizes[1:])
+    assert len(seen_population_sizes) >= 2
+
+
+def test_ai_suggest_cb_single_argument_form_still_works_unchanged():
+    """Existing one-argument callbacks (no population parameter) must
+    keep working exactly as before -- detected via signature inspection,
+    not a breaking API change."""
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    risk = RiskConfig()
+    rules = PropRules()
+    mc_cfg = MonteCarloConfig(n_simulations=50)
+    refine_cfg = RefinementConfig(population_size=6, generations=2, search_monte_carlo_sims=30)
+
+    calls = []
+
+    def one_arg_ai_suggest(genes):
+        calls.append(len(genes))
+        return [[g.base_value for g in genes]]
+
+    result = run_walkforward_aware_refinement(
+        df, strategy, risk, rules, mc_cfg, refinement_config=refine_cfg, n_folds=3,
+        ai_suggest_cb=one_arg_ai_suggest,
+    )
+    assert result.best is not None
+    assert len(calls) >= 2

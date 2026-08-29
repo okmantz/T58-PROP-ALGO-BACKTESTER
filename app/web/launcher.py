@@ -58,7 +58,10 @@ def _qr_image_path(url: str) -> Path | None:
     try:
         import qrcode
 
-        img = qrcode.make(url, box_size=10, border=2)
+        qr = qrcode.QRCode(box_size=10, border=2)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image()
         out_dir = Path.home() / ".t58-backtester"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "phone-qr-code.png"

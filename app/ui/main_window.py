@@ -118,41 +118,138 @@ DEFAULT_MANUAL_STRATEGY = {
     "take_profit_pips": 40,
 }
 
-BG = "#08090C"
-PANEL = "#131720"          # lifted slightly off BG so cards read as elevated surfaces
-PANEL_2 = "#171B25"
-PANEL_3 = "#1E232E"
-PANEL_HOVER = "#242A37"    # hover state for interactive surfaces (buttons, rows)
-BORDER = "#272C38"
-BORDER_LIGHT = "#3D4453"
-TEXT = "#E9EBEF"
-TEXT_MUTED = "#8D94A3"
-TEXT_DIM = "#5C6472"
-METAL = "#B8BDC5"
-METAL_BRIGHT = "#E7E9ED"
-GREEN = "#3ED685"
-RED = "#F0596A"
-BLUE = "#6FA8FF"
-AMBER = "#D9A441"
-# Signature brand accent — used deliberately for primary actions, the active
-# tab indicator, focus states and a handful of high-intent highlights. Kept
-# out of the status vocabulary (green/red/blue/amber already mean
-# success/error/info/warning) so it always reads as "act here."
-ACCENT = "#7C6FFF"
-ACCENT_HOVER = "#9089FF"
-ACCENT_DIM = "#332E5C"     # low-opacity-style accent for subtle fills/left-bars
-ACCENT_INK = "#0C0A16"     # near-black used as text on top of the bright accent
-# Neon accent set -- used for the glowing card borders / ring progress /
-# per-metric coloring on the Dashboard tab, matching the neon-dark
-# reference mockups. Kept separate from the semantic GREEN/RED/AMBER above
-# (which mean pass/fail/warning everywhere else in the app) -- these are
-# purely decorative variety across KPI tiles, the way the mockups give
-# every stat card a different hue rather than making hue mean something.
-NEON_CYAN = "#00F0FF"
-NEON_MAGENTA = "#FF2BD6"
-NEON_LIME = "#B6FF3C"
-NEON_VIOLET = "#8A5CFF"
-NEON_AMBER = "#FFB547"
+# ---------------------------------------------------------------------------
+# Theme system -- every color used across the whole app is one of the names
+# below, looked up as a plain module global. THEMES holds the full palette
+# for each mode; apply_theme() (near the bottom of this block) overwrites
+# these globals in place and triggers a full UI rebuild, which is how a
+# single Dark/Light toggle reaches every tab, chart, and widget at once
+# without threading a theme object through thousands of call sites.
+# ---------------------------------------------------------------------------
+THEMES = {
+    "dark": {
+        "BG": "#08090C",
+        "PANEL": "#131720",          # lifted slightly off BG so cards read as elevated surfaces
+        "PANEL_2": "#171B25",
+        "PANEL_3": "#1E232E",
+        "PANEL_HOVER": "#242A37",    # hover state for interactive surfaces (buttons, rows)
+        "BORDER": "#272C38",
+        "BORDER_LIGHT": "#3D4453",
+        "TEXT": "#E9EBEF",
+        "TEXT_MUTED": "#8D94A3",
+        "TEXT_DIM": "#5C6472",
+        "METAL": "#B8BDC5",
+        "METAL_BRIGHT": "#E7E9ED",
+        "LOG_BG": "#0B0D10",         # background for the monospace live-log/output Text widgets
+        "GREEN": "#3ED685",
+        "RED": "#F0596A",
+        "BLUE": "#6FA8FF",
+        "AMBER": "#D9A441",
+        "ACCENT": "#7C6FFF",
+        "ACCENT_HOVER": "#9089FF",
+        "ACCENT_DIM": "#332E5C",     # low-opacity-style accent for subtle fills/left-bars
+        "ACCENT_INK": "#0C0A16",     # near-black used as text on top of the bright accent
+        # Neon accent set -- used for the glowing card borders / ring progress /
+        # per-metric coloring on the Dashboard tab, matching the neon-dark
+        # reference mockups. Kept separate from the semantic GREEN/RED/AMBER above
+        # (which mean pass/fail/warning everywhere else in the app) -- these are
+        # purely decorative variety across KPI tiles, the way the mockups give
+        # every stat card a different hue rather than making hue mean something.
+        "NEON_CYAN": "#00F0FF",
+        "NEON_MAGENTA": "#FF2BD6",
+        "NEON_LIME": "#B6FF3C",
+        "NEON_VIOLET": "#8A5CFF",
+        "NEON_AMBER": "#FFB547",
+    },
+    "light": {
+        "BG": "#F4F5F7",
+        "PANEL": "#FFFFFF",
+        "PANEL_2": "#F1F2F5",
+        "PANEL_3": "#E7E9EE",
+        "PANEL_HOVER": "#DCE0E8",
+        "BORDER": "#D9DCE3",
+        "BORDER_LIGHT": "#C3C8D1",
+        "TEXT": "#14161B",
+        "TEXT_MUTED": "#565D6B",
+        "TEXT_DIM": "#8B909C",
+        "METAL": "#6B7280",
+        "METAL_BRIGHT": "#2F333B",
+        "LOG_BG": "#FBFBFC",
+        "GREEN": "#0E9B5E",
+        "RED": "#D23B52",
+        "BLUE": "#2C64D6",
+        "AMBER": "#A66A16",
+        "ACCENT": "#5B4CE0",
+        "ACCENT_HOVER": "#4739C9",
+        "ACCENT_DIM": "#E4E1FA",
+        "ACCENT_INK": "#FFFFFF",
+        # Same decorative role as the dark theme's neon set, deliberately
+        # darkened/desaturated from true neon so they stay legible as text
+        # and card borders against a near-white background instead of
+        # glaring -- same hue identity per tile, tuned for contrast rather
+        # than raw brightness.
+        "NEON_CYAN": "#0089A3",
+        "NEON_MAGENTA": "#B01C93",
+        "NEON_LIME": "#5D8A12",
+        "NEON_VIOLET": "#6438C9",
+        "NEON_AMBER": "#A66A16",
+    },
+}
+
+_THEME_SETTINGS_FILENAME = "ui_theme.json"
+
+
+def _load_theme_name() -> str:
+    """Never raises -- defaults to 'dark' (this app's original look) if
+    nothing saved yet, the settings file is corrupt, or the persistence
+    layer isn't reachable for any reason."""
+    try:
+        import json as _json
+
+        from app.data.storage import get_app_base_dir
+
+        path = get_app_base_dir() / "data" / "config" / _THEME_SETTINGS_FILENAME
+        if path.exists():
+            name = _json.loads(path.read_text(encoding="utf-8")).get("theme")
+            if name in THEMES:
+                return name
+    except Exception:
+        pass
+    return "dark"
+
+
+def _save_theme_name(name: str) -> None:
+    try:
+        import json as _json
+
+        from app.data.storage import get_app_base_dir
+
+        config_dir = get_app_base_dir() / "data" / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / _THEME_SETTINGS_FILENAME).write_text(_json.dumps({"theme": name}), encoding="utf-8")
+    except Exception:
+        pass  # persistence is a convenience -- never worth crashing the toggle over
+
+
+def apply_theme(name: str) -> None:
+    """Overwrites every color constant below (as module globals) with the
+    named theme's palette. Callers must rebuild any already-built widgets
+    themselves afterward (see MainWindow._toggle_theme) -- this function
+    only updates the source of truth those widgets read their colors
+    from; it does not (and structurally cannot, for widgets whose colors
+    were baked in at construction time) reach back and recolor anything
+    already on screen."""
+    if name not in THEMES:
+        return
+    globals().update(THEMES[name])
+    global CURRENT_THEME
+    CURRENT_THEME = name
+    _save_theme_name(name)
+
+
+CURRENT_THEME = _load_theme_name()
+apply_theme(CURRENT_THEME)
+
 FONT = "Segoe UI"
 MONO = "Consolas"
 
@@ -467,9 +564,15 @@ class GlowCard(Canvas):
 
     CORNER_RADIUS = 14
 
-    def __init__(self, parent, accent=ACCENT, glow=True, **kwargs):
+    def __init__(self, parent, accent=None, glow=True, **kwargs):
+        # accent's default is resolved HERE (call time), not bound into
+        # the function signature at module-load time, so it always
+        # reflects whichever theme is currently active -- a literal
+        # `accent=ACCENT` default would freeze at the color ACCENT held
+        # when this module was first imported and never follow a later
+        # theme toggle.
         super().__init__(parent, bg=BG, highlightthickness=0, **kwargs)
-        self.accent = accent
+        self.accent = accent if accent is not None else ACCENT
         self.glow = glow
         self.body = Frame(self, bg=PANEL_2)
         self._window_id = None
@@ -520,12 +623,15 @@ class RingProgress(Canvas):
     of a flat horizontal progress bar. Call `.set(pct)` to update.
     """
 
-    def __init__(self, parent, size=88, thickness=9, accent=ACCENT, track=BORDER, **kwargs):
+    def __init__(self, parent, size=88, thickness=9, accent=None, track=None, **kwargs):
+        # Same call-time-default reasoning as GlowCard above -- resolved
+        # here rather than bound into the signature, so this keeps
+        # following the active theme rather than freezing at import time.
         super().__init__(parent, width=size, height=size, bg=PANEL_2, highlightthickness=0, **kwargs)
         self.size = size
         self.thickness = thickness
-        self.accent = accent
-        self.track = track
+        self.accent = accent if accent is not None else ACCENT
+        self.track = track if track is not None else BORDER
         self._pct = 0.0
         self._draw()
 
@@ -656,18 +762,45 @@ class MainWindow:
             pass
         self.root.geometry("1000x760")
         self.root.minsize(900, 680)
-        self.root.configure(bg=BG)
 
+        # State that must survive a theme toggle's full widget rebuild
+        # (see _toggle_theme) lives directly on self, set once here --
+        # _build_ui() only ever CREATES widgets, it never resets this.
         self.csv_path: str | None = None
         self.csv_paths: list[str] = []
         self.strategy_py_path: str | None = None
         self._active_library_strategy: tuple[str, str] | None = None
         self.strategy_mode = StringVar(value="manual")
 
+        self._build_ui()
+
+    def _toggle_theme(self):
+        """Dark/Light switch in the header. Repaints the ENTIRE app: color
+        constants are plain module globals referenced by name throughout
+        this file (not threaded through as a theme object), so the only
+        reliable way to make thousands of already-built widgets and
+        hand-drawn Canvas charts pick up a new palette is to update those
+        globals via apply_theme() and then throw away and rebuild every
+        widget from scratch -- reconfiguring each one in place would mean
+        separately re-deriving the right color for every Label/Canvas/
+        chart/glow effect in the app, which is exactly what building them
+        fresh already does correctly. Whichever tab was open stays open
+        across the rebuild."""
+        new_theme = "light" if CURRENT_THEME == "dark" else "dark"
+        current_page = getattr(self, "active_page", "dashboard")
+        apply_theme(new_theme)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self._build_ui()
+        self._show_page(current_page)
+
+    def _build_ui(self):
+        self.root.configure(bg=BG)
+
         self._configure_styles()
 
         # Main application shell.
-        shell = Frame(root, bg=BG)
+        shell = Frame(self.root, bg=BG)
         shell.pack(fill="both", expand=True)
 
         self._build_header(shell)
@@ -682,9 +815,41 @@ class MainWindow:
         body = Frame(shell, bg=BG)
         body.pack(fill="both", expand=True, padx=18, pady=(0, 18))
 
+        # The sidebar itself scrolls: with 17 tabs + section dividers, the
+        # full nav list is taller than the sidebar's available height on
+        # this app's default/minimum window size, and a fixed (non-
+        # scrolling) sidebar simply clips whatever doesn't fit off the
+        # bottom -- every tab must stay reachable no matter the window
+        # size, so a mouse-wheel-scrollable canvas backs the nav list
+        # instead of relying on padding alone to make it fit.
         self.sidebar = Frame(body, bg=PANEL, width=196)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
+
+        self._sidebar_canvas = Canvas(self.sidebar, bg=PANEL, highlightthickness=0)
+        self._sidebar_canvas.pack(side="left", fill="both", expand=True)
+        self._sidebar_inner = Frame(self._sidebar_canvas, bg=PANEL)
+        self._sidebar_window_id = self._sidebar_canvas.create_window(
+            (0, 0), window=self._sidebar_inner, anchor="nw",
+        )
+        self._sidebar_inner.bind(
+            "<Configure>", lambda _e: self._sidebar_canvas.configure(scrollregion=self._sidebar_canvas.bbox("all")),
+        )
+        self._sidebar_canvas.bind(
+            "<Configure>", lambda e: self._sidebar_canvas.itemconfig(self._sidebar_window_id, width=e.width),
+        )
+
+        def _sidebar_wheel(event):
+            delta = -1 if getattr(event, "delta", 0) > 0 else 1
+            if getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            self._sidebar_canvas.yview_scroll(delta, "units")
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self._sidebar_canvas.bind(seq, _sidebar_wheel)
+            self._sidebar_inner.bind(seq, _sidebar_wheel)
 
         self.content = Frame(body, bg=BG)
         self.content.pack(side="left", fill="both", expand=True, padx=(14, 0))
@@ -766,23 +931,41 @@ class MainWindow:
         self._show_page("dashboard")
 
     def _build_sidebar_nav(self):
+        def _wheel(event):
+            delta = -1 if getattr(event, "delta", 0) > 0 else 1
+            if getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            self._sidebar_canvas.yview_scroll(delta, "units")
+
         for key, icon, label, frame, color in self._nav_items:
             if key is None:
-                Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
+                Frame(self._sidebar_inner, bg=BORDER, height=1).pack(fill="x", padx=14, pady=5)
                 continue
-            row = Frame(self.sidebar, bg=PANEL, cursor="hand2")
-            row.pack(fill="x", padx=8, pady=2)
-            accent = Canvas(row, bg=PANEL, width=8, highlightthickness=0)
+            row = Frame(self._sidebar_inner, bg=PANEL, cursor="hand2")
+            row.pack(fill="x", padx=8, pady=1)
+            # height=1 is deliberate: a Tkinter Canvas with no explicit
+            # height defaults to a large platform size (the actual bug
+            # that made every sidebar row balloon in height and pushed
+            # tabs off the bottom of the screen). pack(fill="y") below
+            # still correctly stretches this to match the row's real
+            # height, which is set by the label -- height=1 just stops
+            # the canvas's OWN natural size from inflating that row in
+            # the first place.
+            accent = Canvas(row, bg=PANEL, width=6, height=1, highlightthickness=0)
             accent.pack(side="left", fill="y")
             accent.bind("<Configure>", lambda _e, k=key: self._draw_nav_accent(k))
             lbl = Label(
                 row, text=f"  {icon}   {label}", bg=PANEL, fg=TEXT_MUTED,
-                font=_safe_font(9, "bold"), anchor="w", padx=6, pady=9,
+                font=_safe_font(8, "bold"), anchor="w", padx=6, pady=6,
             )
             lbl.pack(side="left", fill="x", expand=True)
             for widget in (row, accent, lbl):
                 widget.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
                 widget.bind("<Enter>", lambda _e, k=key: self._on_nav_hover(k, True))
+                for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    widget.bind(seq, _wheel)
                 widget.bind("<Leave>", lambda _e, k=key: self._on_nav_hover(k, False))
             self._nav_buttons[key] = (row, accent, lbl, color)
 
@@ -972,8 +1155,29 @@ class MainWindow:
         right = Frame(header, bg=BG)
         right.pack(side="right", fill="y")
 
+        top_row = Frame(right, bg=BG)
+        top_row.pack(anchor="e", pady=(13, 0))
+
+        theme_label = "LIGHT" if CURRENT_THEME == "dark" else "DARK"
+        theme_btn = Label(
+            top_row,
+            text=f"\u25D1  {theme_label} MODE",
+            bg=PANEL_2,
+            fg=TEXT_MUTED,
+            font=_safe_font(8, "bold"),
+            padx=10,
+            pady=5,
+            highlightthickness=1,
+            highlightbackground=BORDER_LIGHT,
+            cursor="hand2",
+        )
+        theme_btn.pack(side="left", padx=(0, 8))
+        theme_btn.bind("<Button-1>", lambda _e: self._toggle_theme())
+        theme_btn.bind("<Enter>", lambda _e: theme_btn.configure(bg=PANEL_HOVER, fg=TEXT))
+        theme_btn.bind("<Leave>", lambda _e: theme_btn.configure(bg=PANEL_2, fg=TEXT_MUTED))
+
         Label(
-            right,
+            top_row,
             text="MVP",
             bg=PANEL_2,
             fg=ACCENT_HOVER,
@@ -982,7 +1186,7 @@ class MainWindow:
             pady=5,
             highlightthickness=1,
             highlightbackground=BORDER_LIGHT,
-        ).pack(anchor="e", pady=(17, 0))
+        ).pack(side="left")
 
         Label(
             right,
@@ -1212,11 +1416,13 @@ class MainWindow:
             canvas.create_oval(x - dr, y - dr, x + dr, y + dr, fill=blended, outline="")
         canvas.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=ring_color or color, width=1.5)
 
-    def _stat_card(self, parent, label, value, color=ACCENT_HOVER, accent=None):
+    def _stat_card(self, parent, label, value, color=None, accent=None):
         """A single glowing neon KPI tile -- `accent` controls the card's
         border/halo color (defaults to matching `color`, the value text
         color), so callers that only cared about text color before still
-        work unchanged."""
+        work unchanged. `color`'s default is resolved here (call time),
+        not bound into the signature, so it follows theme toggles."""
+        color = color if color is not None else ACCENT_HOVER
         card = GlowCard(parent, accent=accent or color, height=92)
         Label(card.body, text=label.upper(), bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
             anchor="w", padx=14, pady=(12, 3)
@@ -3348,7 +3554,7 @@ class MainWindow:
 
         output_section = self._section(f, "Refinement output", "Live search log.")
         self.refine_output = Text(
-            output_section, height=18, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -3583,7 +3789,7 @@ class MainWindow:
             output_section,
             height=18,
             wrap="word",
-            bg="#0B0D10",
+            bg=LOG_BG,
             fg=TEXT,
             insertbackground=TEXT,
             relief="flat",
@@ -4042,7 +4248,7 @@ class MainWindow:
 
         output_section = self._section(f, "Search Lab output", "Live funnel log.")
         self.search_output = Text(
-            output_section, height=18, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -4588,7 +4794,7 @@ class MainWindow:
 
         output_section = self._section(f, "Walk-forward output", "Live progress log.")
         self.wfo_output = Text(
-            output_section, height=18, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -4723,7 +4929,7 @@ class MainWindow:
 
         output_section = self._section(f, "CPCV / PBO output", "Live progress log.")
         self.cpcv_output = Text(
-            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -4911,7 +5117,7 @@ class MainWindow:
 
         output_section = self._section(f, "Sensitivity output", "Live progress log.")
         self.sens_output = Text(
-            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -5060,7 +5266,7 @@ class MainWindow:
 
         output_section = self._section(f, "Portfolio output", "Live progress log.")
         self.portfolio_output = Text(
-            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -5207,7 +5413,7 @@ class MainWindow:
 
         output_section = self._section(f, "Multi-objective output", "Live progress log.")
         self.multiobj_output = Text(
-            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -5316,7 +5522,7 @@ class MainWindow:
 
         output_section = self._section(f, "Walk-forward-aware GA output", "Live progress log.")
         self.wfga_output = Text(
-            output_section, height=18, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -5461,7 +5667,7 @@ class MainWindow:
 
         output_section = self._section(f, "Ensemble output", "Live progress log.")
         self.ensemble_output = Text(
-            output_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -5691,7 +5897,7 @@ class MainWindow:
 
         output_section = self._section(f, "Full Pipeline output", "Live progress log.")
         self.fullpipeline_output = Text(
-            output_section, height=20, wrap="word", bg="#0B0D10", fg=TEXT,
+            output_section, height=20, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
@@ -6014,7 +6220,7 @@ class MainWindow:
 
         log_section = self._section(f, "Live log", "")
         self.ft_log = Text(
-            log_section, height=16, wrap="word", bg="#0B0D10", fg=TEXT,
+            log_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )

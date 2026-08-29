@@ -589,3 +589,41 @@ def test_export_selection_without_metadata_sidecar_only_includes_the_file():
 def test_export_selection_raises_for_missing_item():
     with pytest.raises(FileNotFoundError):
         library.export_library_zip_bytes(selection=[("python", "ghost.py")])
+
+
+def test_seeds_bundled_strategies_on_first_run_of_a_frozen_build(tmp_path, monkeypatch):
+    """Regression test for the packaged .exe shipping with empty strategy
+    folders: PyInstaller only bundles what --add-data was told to include
+    (under sys._MEIPASS at runtime), and get_strategy_library_dir() must
+    copy that bundled content into the persistent, writable library the
+    very first time a frozen build runs -- exactly like
+    app.data.storage._seed_bundled_raw_data already does for CSVs."""
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "strategies" / "python").mkdir(parents=True)
+    (bundle_root / "strategies" / "python" / "bundled_one.py").write_text("print('bundled')\n")
+    (bundle_root / "strategies" / "pinescript").mkdir(parents=True)
+    (bundle_root / "strategies" / "pinescript" / "bundled.pine").write_text("//@version=5\n")
+
+    monkeypatch.setattr(library.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(library.sys, "_MEIPASS", str(bundle_root), raising=False)
+
+    saved = library.get_strategy_library_dir("python") / "bundled_one.py"
+    assert saved.exists()
+    assert saved.read_text() == "print('bundled')\n"
+    assert (library.get_strategy_library_dir("pinescript") / "bundled.pine").exists()
+
+
+def test_seeding_never_overwrites_a_user_edited_file(tmp_path, monkeypatch):
+    """If the user already has (or has edited) a strategy with the same
+    filename in the persistent library, seeding must not clobber it."""
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "strategies" / "python").mkdir(parents=True)
+    (bundle_root / "strategies" / "python" / "one.py").write_text("bundled version\n")
+
+    library.save_strategy_bytes(b"my edited version\n", "one.py", "python")
+
+    monkeypatch.setattr(library.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(library.sys, "_MEIPASS", str(bundle_root), raising=False)
+
+    saved = library.get_strategy_library_dir("python") / "one.py"
+    assert saved.read_text() == "my edited version\n"

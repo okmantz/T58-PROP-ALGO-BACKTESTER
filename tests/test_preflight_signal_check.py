@@ -102,20 +102,21 @@ def _stock_scale_ohlcv(n=1200, seed=7):
     })
 
 
-def test_preflight_signal_check_catches_pip_size_instrument_mismatch_before_any_search():
-    """A strategy with a fixed-pips stop, run against stock-scale prices
-    while risk.pip_size is left at its FX default, must fail fast with a
-    clear pip_size-specific message -- not grind through a whole
-    walk-forward-aware GA search whose every candidate inherits the same
-    broken position sizing regardless of what it tries."""
+def test_preflight_signal_check_does_not_block_on_pip_size_mismatch():
+    """A pip_size/instrument-scale mismatch is a real, serious issue (see
+    app.backtest.execution's pip_scale_mismatch warning and the report's
+    warning banner) but users need their searches to actually run even
+    when they haven't yet corrected pip_size -- this must not hard-block
+    the pipeline. It still shows up as a warning on the underlying
+    backtest result and in the saved report; it just isn't fatal here."""
     df = _stock_scale_ohlcv()
     config = _always_fires_config()
     config["stop_loss_pips"] = 30
     config["take_profit_pips"] = 60
     strategy = ManualStrategy(config)
     risk = RiskConfig(initial_balance=50_000.0, pip_size=0.0001)  # wrong for ~190-scale prices
-    with pytest.raises(RefinementError, match="pip_size"):
-        preflight_signal_check(df, strategy, risk, "Full Pipeline")
+    # Should not raise, despite the mismatch.
+    preflight_signal_check(df, strategy, risk, "Full Pipeline")
 
 
 def test_preflight_signal_check_does_not_mask_strategy_crashes():

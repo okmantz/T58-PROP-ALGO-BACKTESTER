@@ -147,3 +147,48 @@ def test_full_pipeline_skips_optimization_gracefully_when_no_tunable_params(tmp_
     assert result.refinement_skip_reason is not None
     assert result.final_config == strategy.config
     assert result.report_paths["html"].exists()
+
+
+def test_full_pipeline_with_ai_assist_enabled_seeds_ga_and_logs(tmp_path, monkeypatch):
+    """ollama_settings, when usable, must actually reach the GA (via
+    ai_suggest_cb) and log AI activity -- without needing a live Ollama
+    server, by stubbing OllamaClient itself."""
+    from app.ai.ollama_settings import OllamaSettings
+    import app.ai.ollama_client as ollama_client_module
+
+    class _FakeResult:
+        def __init__(self, genomes):
+            self.genomes = genomes
+            self.error = None
+
+    class _FakeOllamaClient:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def suggest_parameter_adjustments(self, **kwargs):
+            genes = kwargs["genes"]
+            return _FakeResult([[g.base_value for g in genes]])
+
+    monkeypatch.setattr(ollama_client_module, "OllamaClient", _FakeOllamaClient)
+
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    settings = OllamaSettings(enabled=True, host="http://localhost:11434", model="llama3.1")
+
+    logs = []
+    result = run_full_pipeline(
+        df, strategy, RiskConfig(), PropRules(), tmp_path, _cfg(),
+        progress_cb=logs.append, ollama_settings=settings,
+    )
+    assert any("AI assist" in line for line in logs)
+    assert result.verdict in ("READY", "MARGINAL", "NOT READY")
+
+
+def test_full_pipeline_ai_assist_disabled_by_default(tmp_path):
+    """Omitting ollama_settings entirely (the default for every existing
+    caller) must behave exactly as before -- no AI-related log lines."""
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    logs = []
+    run_full_pipeline(df, strategy, RiskConfig(), PropRules(), tmp_path, _cfg(), progress_cb=logs.append)
+    assert not any("AI assist" in line for line in logs)

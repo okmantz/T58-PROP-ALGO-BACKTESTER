@@ -79,3 +79,69 @@ def test_run_walkforward_aware_refinement_insufficient_data_raises():
     strategy = ManualStrategy(_sma_config())
     with pytest.raises(RefinementError):
         run_walkforward_aware_refinement(df, strategy, RiskConfig(), PropRules(), MonteCarloConfig(n_simulations=10), n_folds=5)
+
+
+def test_ai_suggest_cb_seeds_the_population():
+    """A working ai_suggest_cb should get its genomes evaluated as part of
+    generation 0's population, not silently ignored."""
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    risk = RiskConfig()
+    rules = PropRules()
+    mc_cfg = MonteCarloConfig(n_simulations=50)
+    refine_cfg = RefinementConfig(population_size=6, generations=1, search_monte_carlo_sims=30)
+
+    calls = []
+
+    def fake_ai_suggest(genes):
+        calls.append(len(genes))
+        return [[g.base_value for g in genes]]  # trivially valid: the baseline genome again
+
+    result = run_walkforward_aware_refinement(
+        df, strategy, risk, rules, mc_cfg, refinement_config=refine_cfg, n_folds=3,
+        ai_suggest_cb=fake_ai_suggest,
+    )
+    assert len(calls) >= 1
+    assert result.best is not None
+
+
+def test_ai_suggest_cb_exception_does_not_break_the_search():
+    """A misbehaving/unreachable AI callback must be treated exactly like
+    AI assist being off -- never allowed to crash or block the GA."""
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    risk = RiskConfig()
+    rules = PropRules()
+    mc_cfg = MonteCarloConfig(n_simulations=50)
+    refine_cfg = RefinementConfig(population_size=6, generations=1, search_monte_carlo_sims=30)
+
+    def broken_ai_suggest(genes):
+        raise RuntimeError("Ollama is not running")
+
+    result = run_walkforward_aware_refinement(
+        df, strategy, risk, rules, mc_cfg, refinement_config=refine_cfg, n_folds=3,
+        ai_suggest_cb=broken_ai_suggest,
+    )
+    assert result.best is not None
+    assert len(result.leaderboard) == refine_cfg.population_size
+
+
+def test_ai_suggest_cb_with_wrong_length_genome_is_ignored():
+    """A genome that doesn't match the discovered gene count (e.g. a
+    hallucinated response) must be silently skipped, not passed to the
+    backtester with mismatched parameters."""
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+    risk = RiskConfig()
+    rules = PropRules()
+    mc_cfg = MonteCarloConfig(n_simulations=50)
+    refine_cfg = RefinementConfig(population_size=6, generations=1, search_monte_carlo_sims=30)
+
+    def wrong_length_ai_suggest(genes):
+        return [[1.0, 2.0, 3.0, 4.0, 5.0]]  # deliberately wrong length
+
+    result = run_walkforward_aware_refinement(
+        df, strategy, risk, rules, mc_cfg, refinement_config=refine_cfg, n_folds=3,
+        ai_suggest_cb=wrong_length_ai_suggest,
+    )
+    assert result.best is not None

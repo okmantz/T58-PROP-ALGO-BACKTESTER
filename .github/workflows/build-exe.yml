@@ -96,6 +96,10 @@ jobs:
             --hidden-import "app.strategy.mql5" `
             --hidden-import "app.strategy.pinescript" `
             --hidden-import "app.strategy.python" `
+            --hidden-import "app.ai" `
+            --hidden-import "app.ai.ollama_client" `
+            --hidden-import "app.ai.ollama_settings" `
+            --hidden-import "requests" `
             --hidden-import "app.backtest" `
             --hidden-import "app.backtest.engine" `
             --hidden-import "app.backtest.risk" `

@@ -84,6 +84,40 @@ def test_preflight_signal_check_passes_when_baseline_has_trades():
     preflight_signal_check(df, strategy, RiskConfig(), "Some feature")
 
 
+def _stock_scale_ohlcv(n=1200, seed=7):
+    """~AAPL-scale prices (hundreds of dollars), the way an Alpaca equities
+    import actually looks -- as opposed to _ohlcv()'s ~100-scale synthetic
+    data, this is specifically sized to trigger the pip_size mismatch when
+    risk.pip_size is left at its FX default."""
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2024-01-01", periods=n, freq="15min")
+    price = 190.0 + np.cumsum(rng.normal(0, 0.3, n))
+    high = price + np.abs(rng.normal(0, 0.15, n))
+    low = price - np.abs(rng.normal(0, 0.15, n))
+    close = price + rng.normal(0, 0.05, n)
+    volume = rng.integers(100, 1000, n)
+    return pd.DataFrame({
+        "timestamp": ts, "open": price, "high": high, "low": low,
+        "close": close, "volume": volume,
+    })
+
+
+def test_preflight_signal_check_catches_pip_size_instrument_mismatch_before_any_search():
+    """A strategy with a fixed-pips stop, run against stock-scale prices
+    while risk.pip_size is left at its FX default, must fail fast with a
+    clear pip_size-specific message -- not grind through a whole
+    walk-forward-aware GA search whose every candidate inherits the same
+    broken position sizing regardless of what it tries."""
+    df = _stock_scale_ohlcv()
+    config = _always_fires_config()
+    config["stop_loss_pips"] = 30
+    config["take_profit_pips"] = 60
+    strategy = ManualStrategy(config)
+    risk = RiskConfig(initial_balance=50_000.0, pip_size=0.0001)  # wrong for ~190-scale prices
+    with pytest.raises(RefinementError, match="pip_size"):
+        preflight_signal_check(df, strategy, risk, "Full Pipeline")
+
+
 def test_preflight_signal_check_does_not_mask_strategy_crashes():
     """A strategy that raises outright is a different failure mode (an
     actual bug/incompatibility) -- this check must not swallow that into

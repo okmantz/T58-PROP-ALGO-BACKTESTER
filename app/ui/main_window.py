@@ -2266,6 +2266,31 @@ class MainWindow:
         self._refresh_strategy_library()
 
     def _open_strategy_library_folder(self):
+        # This folder-open button is a frequent source of confusion: people
+        # naturally double-click a .py/.pine/.mq5 file once Explorer/Finder
+        # is open, which fails with an OS-level "no program configured to
+        # open this file" error (Windows has no default app registered for
+        # those extensions). That error comes from Windows itself, not this
+        # app, and it can't be silently fixed here -- so we head it off with
+        # an explicit heads-up *before* opening the folder, rather than
+        # relying on the small print label under the button, which is easy
+        # to miss or scroll past. Cancelling here skips opening the folder
+        # entirely, so a person who reads the warning never sees the error.
+        proceed = messagebox.askokcancel(
+            "Before you open this folder",
+            "This opens the raw strategy files on disk -- useful for backing "
+            "them up or copying them to another device.\n\n"
+            "Don't double-click a strategy file from there: Windows has no "
+            "program registered for .py / .pine / .mq5 files and will show "
+            "\"no program configured to open this file.\" That's expected "
+            "and isn't something this app can fix.\n\n"
+            "To actually use a saved strategy, come back to this screen, "
+            "select it in the list above, and click LOAD SELECTED (or "
+            "double-click it there instead).\n\n"
+            "Click OK to open the folder anyway, or Cancel to go back.",
+        )
+        if not proceed:
+            return
         d = get_strategy_library_dir(self.strategy_mode.get()) \
             if self.strategy_mode.get() in STRATEGY_TYPES else get_strategy_library_dir()
         try:

@@ -27,7 +27,9 @@ from tkinter import (
 
 from app.backtest.adaptive_risk import AdaptiveRiskConfig, AdaptiveRiskError, AdaptiveRiskRule
 from app.backtest.engine import run_backtest, run_holdout_comparison
-from app.backtest.risk import RiskConfig
+from app.backtest.risk import RiskConfig, suggest_pip_size
+import app.ai.ollama_settings as ollama_settings_module
+from app.ai.ollama_settings import OllamaSettings
 from app.data import alpaca_credentials
 from app.data.alpaca_source import (
     ASSET_CLASSES, ADJUSTMENT_CHOICES, FEED_CHOICES, TIMEFRAME_LABELS,
@@ -2572,6 +2574,15 @@ class MainWindow:
         self.r_pip_size = LabeledEntry(
             section, "Pip size (e.g. 0.0001 FX)", 0.0001
         )
+        pip_detect_row = Frame(section, bg=PANEL)
+        pip_detect_row.pack(anchor="w", padx=18, pady=(0, 8))
+        self._button(
+            pip_detect_row, "DETECT PIP SIZE FROM DATA", self._detect_pip_size_from_data
+        ).pack(side="left")
+        self.pip_detect_status = Label(
+            pip_detect_row, text="", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8),
+        )
+        self.pip_detect_status.pack(side="left", padx=(10, 0))
 
         adaptive_section = self._section(
             f, "Adaptive risk (optional)",
@@ -2653,6 +2664,33 @@ class MainWindow:
             spread_pips=self.r_spread.get_float(1.0),
             pip_size=self.r_pip_size.get_float(0.0001),
         )
+
+    def _detect_pip_size_from_data(self):
+        """Suggests a pip_size from whatever's currently selected in Step 1
+        (Market Data), rather than leaving pip_size at its FX default
+        (0.0001) for non-FX instruments -- the single most common cause of
+        a strategy's fixed-pips stop translating into a nonsensical
+        position size. Only ever suggests a starting value; the person
+        still confirms it by seeing it land in the field."""
+        if not self.csv_paths:
+            self.pip_detect_status.config(
+                text="Select a market data CSV in Step 1 first.", fg=AMBER,
+            )
+            return
+        try:
+            result = import_csv(self.csv_paths[0])
+            if not result.is_valid:
+                self.pip_detect_status.config(text="Couldn't read that CSV.", fg=RED)
+                return
+            suggested = suggest_pip_size(result.dataframe)
+            self.r_pip_size.var.set(str(suggested))
+            self.pip_detect_status.config(
+                text=f"Suggested {suggested} from {os.path.basename(self.csv_paths[0])} "
+                     f"-- confirm this matches the instrument before running a backtest.",
+                fg=GREEN,
+            )
+        except Exception as exc:
+            self.pip_detect_status.config(text=f"Couldn't detect: {exc}", fg=RED)
 
     # -----------------------------------------------------------------------
     # Iterative Refinement — shared execution helper (used by both the
@@ -5141,6 +5179,8 @@ class MainWindow:
             library_section, "Status to tag it with", list(STRATEGY_STATUSES), "validated",
         )
 
+        self._build_ai_assist_section(f)
+
         button_row = Frame(f, bg=BG)
         button_row.pack(fill="x", padx=24, pady=10)
         self._button(button_row, "RUN FULL PIPELINE", self._fullpipeline_run_clicked, primary=True).pack(side="left")
@@ -5167,6 +5207,67 @@ class MainWindow:
         self.fullpipeline_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
 
         self._last_fullpipeline_html_path = None
+
+    def _build_ai_assist_section(self, parent):
+        """Optional local-Ollama AI assistant (see app.ai.ollama_client):
+        off by default and everywhere. When enabled, Step 2's search asks
+        a local Ollama model for candidate parameter values once per
+        generation, seeded into the population alongside the normal
+        random/bred candidates -- the model only ever proposes numbers
+        for the strategy's already-discovered tunable parameters, never
+        code, and every suggestion still goes through the exact same
+        backtest/prop-sim/Monte Carlo evaluation as any other candidate.
+        Any failure to reach Ollama (not running, wrong host, model not
+        pulled) degrades silently to the search running exactly as if
+        this were disabled."""
+        section = self._section(
+            parent, "AI Assist (optional, local Ollama)",
+            "Off by default. When enabled, a local Ollama model suggests parameter values "
+            "to try during Step 2's search, once per generation, alongside the normal "
+            "random search -- every suggestion still has to pass the exact same "
+            "backtest/prop-simulation/Monte Carlo checks as anything else. Requires "
+            "Ollama installed and running locally (https://ollama.com) -- nothing is sent "
+            "anywhere except to the host you configure below.",
+        )
+        saved = ollama_settings_module.load_settings()
+        self.ai_enabled = LabeledCheckbox(section, "Enable AI Assist for this run", saved.enabled)
+        self.ai_host = LabeledEntry(section, "Ollama host", saved.host)
+        self.ai_model = LabeledEntry(section, "Model (must already be pulled, e.g. `ollama pull llama3.1`)", saved.model)
+        self.ai_api_key = LabeledEntry(section, "API key (optional -- only for a remote/proxied Ollama)", saved.api_key, secret=True)
+
+        btn_row = Frame(section, bg=PANEL)
+        btn_row.pack(anchor="w", padx=18, pady=(2, 8))
+        self.ai_test_btn = self._button(btn_row, "TEST CONNECTION", self._test_ollama_connection, primary=True)
+        self.ai_test_btn.pack(side="left")
+        self.ai_status = Label(section, text="", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left")
+        self.ai_status.pack(anchor="w", padx=18, pady=(0, 12))
+
+    def _build_ollama_settings(self) -> "OllamaSettings":
+        settings = OllamaSettings(
+            enabled=self.ai_enabled.get(),
+            host=self.ai_host.get_str().strip() or ollama_settings_module.DEFAULT_HOST,
+            model=self.ai_model.get_str().strip() or ollama_settings_module.DEFAULT_MODEL,
+            api_key=self.ai_api_key.get_str().strip(),
+        )
+        ollama_settings_module.save_settings(settings)
+        return settings
+
+    def _test_ollama_connection(self):
+        from app.ai.ollama_client import OllamaClient
+
+        settings = self._build_ollama_settings()
+        self.ai_test_btn.config(state="disabled")
+        self.ai_status.config(text="Testing connection...", fg=AMBER)
+
+        def run():
+            try:
+                ok, message = OllamaClient(settings).test_connection()
+            except Exception as exc:
+                ok, message = False, f"Unexpected error: {exc}"
+            self.ai_status.config(text=message, fg=GREEN if ok else RED)
+            self.ai_test_btn.config(state="normal")
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _log_fullpipeline(self, msg: str):
         self.fullpipeline_output.insert(END, msg + "\n")
@@ -5217,9 +5318,11 @@ class MainWindow:
                 if len(self.csv_paths) == 1
                 else " + ".join(os.path.basename(p) for p in self.csv_paths)
             )
+            ollama_settings = self._build_ollama_settings()
             result = run_full_pipeline(
                 df, strategy, risk, rules, OUTPUT_DIR / "full_pipeline", cfg,
                 progress_cb=self._log_fullpipeline, instrument=instrument,
+                ollama_settings=ollama_settings,
             )
 
             self._last_fullpipeline_html_path = result.report_paths["html"]

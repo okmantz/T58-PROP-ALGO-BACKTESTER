@@ -44,3 +44,33 @@ class RiskConfig:
         if self.max_position_size is not None:
             units = min(units, self.max_position_size)
         return max(units, 0.0)
+
+
+def suggest_pip_size(df) -> float:
+    """Suggests a starting pip_size from a loaded OHLCV DataFrame's actual
+    price scale, purely by magnitude of the median close price. This is a
+    starting point for the person to confirm, not an authoritative
+    per-instrument lookup (it can't distinguish gold from a $2,000 index,
+    for instance) -- it exists because leaving pip_size at its FX default
+    (0.0001) against a non-FX-scaled instrument (stocks, indices, crypto,
+    JPY pairs) is the single most common cause of a strategy's fixed-pips
+    stop translating into a nonsensical position size (see the
+    pip_scale_mismatch warning in app.backtest.execution).
+
+    Rough bands, all "1 pip = smallest meaningful price increment" for
+    that price level:
+      >= 500          -> 1.0    (large-index / high-priced-crypto scale)
+      >= 20            -> 0.01   (typical stock-in-dollars or JPY-pair scale)
+      >= 5             -> 0.01   (lower-priced stocks; still cent-scale)
+      < 5              -> 0.0001 (FX-major scale, e.g. EURUSD ~1.10)
+    """
+    if df is None or "close" not in getattr(df, "columns", []) or len(df) == 0:
+        return 0.0001
+    median_price = float(df["close"].abs().median())
+    if not median_price or median_price != median_price:  # NaN guard
+        return 0.0001
+    if median_price >= 500:
+        return 1.0
+    if median_price >= 5:
+        return 0.01
+    return 0.0001

@@ -110,10 +110,32 @@ def run_walkforward_aware_refinement(
     window_mode: str = "rolling",
     train_frac: float = 0.6,
     progress_cb: ProgressCallback | None = None,
+    ai_suggest_cb: Callable[[list], list[list[float]]] | None = None,
 ) -> WalkforwardGAResult:
+    """
+    ai_suggest_cb: optional, called with the strategy's discovered `genes`
+    list once per generation (including generation 0's initial population)
+    when the optional AI assistant (see app.ai.ollama_client) is enabled.
+    Returns a list of already-clamped-and-validated genomes to inject into
+    that generation's population, replacing some of what would otherwise
+    be random immigrants/offspring -- never an elite, so a bad AI
+    suggestion can never displace a genuinely better candidate, only
+    compete for the non-elite slots on equal footing. Any exception the
+    callback raises, or an empty list, is treated exactly like AI assist
+    being off: the generation proceeds with its normal random/bred
+    population, unchanged.
+    """
     def log(msg: str) -> None:
         if progress_cb:
             progress_cb(msg)
+
+    def ai_genomes(genes_for_cb: list) -> list[list[float]]:
+        if ai_suggest_cb is None:
+            return []
+        try:
+            return ai_suggest_cb(genes_for_cb) or []
+        except Exception:
+            return []
 
     cfg = refinement_config or RefinementConfig(population_size=12, generations=6, search_monte_carlo_sims=200)
     t0 = time.time()
@@ -210,6 +232,11 @@ def run_walkforward_aware_refinement(
 
         baseline = make([g.base_value for g in genes])
         population = [baseline]
+        for ai_genome in ai_genomes(genes):
+            if len(ai_genome) == len(genes) and len(population) < cfg.population_size:
+                population.append(make(ai_genome))
+        if len(population) > 1:
+            log(f"AI assist: seeded {len(population) - 1} candidate(s) into the initial population.")
         while len(population) < cfg.population_size:
             population.append(make([_random_gene_value(g, rng) for g in genes]))
 
@@ -230,6 +257,24 @@ def run_walkforward_aware_refinement(
                 child_genome = _crossover(pa.genome, pb.genome, rng)
                 child_genome = _mutate(child_genome, genes, cfg.mutation_rate, cfg.mutation_strength, rng)
                 next_pop.append(make(child_genome))
+
+            # AI-suggested genomes take up to n_immigrants of the
+            # remaining slots (never an elite slot -- see the docstring
+            # above), so a fresh round of suggestions each generation can
+            # actually influence the search as it progresses, not just at
+            # the start. Whatever's left over still falls back to random
+            # immigrants exactly as before.
+            remaining = cfg.population_size - len(next_pop)
+            ai_added = 0
+            if remaining > 0:
+                for ai_genome in ai_genomes(genes):
+                    if ai_added >= n_immigrants or len(next_pop) >= cfg.population_size:
+                        break
+                    if len(ai_genome) == len(genes):
+                        next_pop.append(make(ai_genome))
+                        ai_added += 1
+                if ai_added:
+                    log(f"AI assist: seeded {ai_added} candidate(s) into generation {gen}.")
             while len(next_pop) < cfg.population_size:
                 next_pop.append(make([_random_gene_value(g, rng) for g in genes]))
 

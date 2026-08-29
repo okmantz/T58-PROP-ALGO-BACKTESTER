@@ -213,7 +213,22 @@ def run_full_pipeline(
     cfg: FullPipelineConfig | None = None,
     progress_cb: ProgressCallback | None = None,
     instrument: str = "unknown",
+    ollama_settings: "OllamaSettings | None" = None,
 ) -> FullPipelineResult:
+    """
+    ollama_settings: optional. When provided and `.is_usable` (enabled,
+    with a host configured -- see app.ai.ollama_settings), Step 2's
+    walk-forward-aware GA asks a local Ollama model for candidate
+    parameter values once per generation and seeds them into that
+    generation's population alongside the normal random/bred candidates
+    (see app.optimize.walkforward_ga's ai_suggest_cb). Every suggestion
+    still goes through the exact same backtest/prop-sim/Monte Carlo
+    evaluation as any other candidate -- the model proposes numbers for
+    already-existing tunable parameters, never code. None/disabled (the
+    default) runs exactly as before this parameter existed; any failure
+    to reach Ollama degrades to the same "AI assist is off" behavior
+    without interrupting the pipeline.
+    """
     def log(msg: str) -> None:
         if progress_cb:
             progress_cb(msg)
@@ -261,6 +276,38 @@ def run_full_pipeline(
     if strategy.source_type != "manual":
         final_code_text, final_code_ext = patched_source_for_strategy(strategy, [], [])
 
+    ai_suggest_cb = None
+    if ollama_settings is not None and ollama_settings.is_usable:
+        from app.ai.ollama_client import OllamaClient
+
+        ollama_client = OllamaClient(ollama_settings)
+        # Captures Step 1's baseline stats once -- good enough context for
+        # every generation's request without re-running anything extra.
+        # A live "how's the search going" readout would need re-summarizing
+        # the current best each generation; left for a future pass.
+        baseline_stats_summary = {
+            k: v for k, v in baseline_bt.statistics.to_dict().items()
+            if k in ("net_profit", "win_rate", "profit_factor", "max_drawdown_pct", "total_trades")
+        }
+        prop_rules_summary = {
+            "account_size": prop_rules.account_size,
+            "max_drawdown_pct": prop_rules.max_drawdown_pct,
+            "daily_loss_limit_pct": prop_rules.daily_loss_limit_pct,
+            "evaluation_profit_target_pct": prop_rules.evaluation_profit_target_pct,
+        }
+
+        def ai_suggest_cb(genes: list) -> list:
+            result = ollama_client.suggest_parameter_adjustments(
+                strategy_name=display_name,
+                source_type=strategy.source_type,
+                genes=genes,
+                baseline_stats=baseline_stats_summary,
+                prop_rules_summary=prop_rules_summary,
+            )
+            if result.error:
+                log(f"  AI assist: {result.error}")
+            return result.genomes
+
     try:
         refine_cfg = RefinementConfig(
             population_size=cfg.ga_population,
@@ -275,6 +322,7 @@ def run_full_pipeline(
             refinement_config=refine_cfg,
             n_folds=cfg.n_folds, window_mode=cfg.window_mode,
             progress_cb=lambda m: log(f"  {m}"),
+            ai_suggest_cb=ai_suggest_cb,
         )
         refinement_ran = True
         if ga_result.best.oos_trade_count > 0:

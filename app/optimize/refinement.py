@@ -461,24 +461,6 @@ def preflight_signal_check(
         # never fires," not about strategies that crash outright.
         return
 
-    # A pip_size/instrument-scale mismatch (see app.backtest.execution's
-    # pip_scale_mismatch warning) makes every dollar figure downstream
-    # meaningless regardless of what the search finds -- every candidate
-    # genome inherits the exact same broken units, so a multi-generation
-    # GA search would spend real time (minutes) confirming the same
-    # nonsensical result over and over. This reuses the backtest run just
-    # above (no extra cost) and fails fast, before any search starts.
-    mismatch_warnings = [w for w in bt.warnings if "pip_size" in w and "doesn't match" in w]
-    if mismatch_warnings:
-        raise RefinementError(
-            f"{feature_name} can't proceed: {mismatch_warnings[0]}\n\n"
-            "Fix pip_size in the Risk & Execution tab for this instrument "
-            "before running a search -- every candidate genome the GA "
-            "generates will inherit the same broken position sizing "
-            "regardless of what parameters it tries, so no amount of "
-            "searching can produce a meaningful result here."
-        )
-
     if bt.trades:
         return
     raise RefinementError(

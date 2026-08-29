@@ -886,16 +886,13 @@ class MainWindow:
             "desktop, mobile web, and Search Lab all feed this automatically.",
         )
 
-        outer = Frame(f, bg=BG)
-        outer.pack(fill="both", expand=True)
-        canvas = Canvas(outer, bg=BG, highlightthickness=0)
-        vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview, style="T58.Vertical.TScrollbar")
-        scroll_frame = Frame(canvas, bg=BG)
-        scroll_frame.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=vbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
+        # Uses the same shared _scrollable() helper every other tab uses, so
+        # this canvas is registered in self._scroll_canvases and responds to
+        # the mouse wheel the same way -- it previously built its own
+        # one-off Canvas/Scrollbar pair that was never registered there,
+        # so only the dashboard's scrollbar could be dragged; the wheel
+        # silently did nothing.
+        scroll_frame = self._scrollable(f)
 
         self._dash_stats_row = Frame(scroll_frame, bg=BG)
         self._dash_stats_row.pack(fill="x", padx=24, pady=(4, 14))
@@ -1181,7 +1178,7 @@ class MainWindow:
     # -----------------------------------------------------------------------
 
     def _build_data_tab(self):
-        f = self.tab_data
+        f = self._scrollable(self.tab_data)
 
         self._page_header(
             f,
@@ -2442,7 +2439,7 @@ class MainWindow:
     # -----------------------------------------------------------------------
 
     def _build_prop_tab(self):
-        f = self.tab_prop
+        f = self._scrollable(self.tab_prop)
 
         self._page_header(
             f,
@@ -2536,7 +2533,7 @@ class MainWindow:
     # -----------------------------------------------------------------------
 
     def _build_risk_tab(self):
-        f = self.tab_risk
+        f = self._scrollable(self.tab_risk)
 
         self._page_header(
             f,
@@ -2996,7 +2993,7 @@ class MainWindow:
     # -----------------------------------------------------------------------
 
     def _build_run_tab(self):
-        f = self.tab_run
+        f = self._scrollable(self.tab_run)
 
         self._page_header(
             f,

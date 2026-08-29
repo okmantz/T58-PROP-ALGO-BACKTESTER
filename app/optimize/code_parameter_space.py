@@ -16,8 +16,12 @@ patches them directly in the source text:
                   extra convention to learn).
   PineScript   -- every `x = input.int(20, ...)` / `input.float(1.5, ...)`
                   default value (Pine's own dedicated "this is a parameter"
-                  mechanism), plus the `// T58_SL_PIPS=` / `// T58_TP_PIPS=`
-                  directive values this app already defines.
+                  mechanism); every `x = ta.sma/ema/wma/rsi(src, 20)` call
+                  whose length is a bare numeric literal rather than an
+                  input.* variable (the far more common way strategies
+                  actually write these, and previously invisible to this
+                  search entirely); plus the `// T58_SL_PIPS=` /
+                  `// T58_TP_PIPS=` directive values this app already defines.
   MQL5         -- every literal period argument inside an `iMA(...)` /
                   `iRSI(...)` call (the only form of period this adapter's
                   supported subset accepts at all -- see app/strategy/mql5.py),
@@ -105,6 +109,20 @@ _PINE_INPUT_NAME_RE = re.compile(r"^\s*(?:var\s+)?([A-Za-z_]\w*)\s*=")
 _SL_DIRECTIVE_RE = re.compile(r"T58_SL_PIPS\s*=\s*(-?\d+(?:\.\d+)?)")
 _TP_DIRECTIVE_RE = re.compile(r"T58_TP_PIPS\s*=\s*(-?\d+(?:\.\d+)?)")
 
+# A ta.sma/ema/wma/rsi call whose length argument is a bare numeric literal
+# rather than an input.int()/input.float() variable (e.g. `fast = ta.ema(close, 20)`,
+# as opposed to `fast = ta.ema(close, len)`). The vast majority of PineScript
+# strategies -- including every one written for this app so far -- hardcode
+# indicator lengths this way rather than routing them through input.*, which
+# meant they contributed zero tunable parameters to the walk-forward GA even
+# though the length is exactly the kind of number a search should be varying.
+# Anchored to the identical `var = ta.func(src, len)` assignment shape
+# app/strategy/pinescript.py's own _TA_CALL_RE already requires to parse at
+# all, so this can never touch a number outside that one supported call form.
+_PINE_TA_LEN_RE = re.compile(
+    r"^\s*(?:var\s+)?[A-Za-z_]\w*\s*=\s*ta\.(sma|ema|wma|rsi)\s*\(\s*[^,()]+\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*$"
+)
+
 _MQL5_IMA_RE = re.compile(
     r"iMA\s*\([^,]+,[^,]+,\s*(-?\d+(?:\.\d+)?)\s*,[^,]+,\s*MODE_\w+\s*,[^)]*\)"
 )
@@ -149,6 +167,24 @@ def discover_pinescript_parameters(code: str) -> list[CodeGene]:
                 name=name, kind="pine_input", is_int=is_int, lo=lo, hi=hi,
                 base_value=value, label=f"{name} = input.{'int' if is_int else 'float'}(...) (line {i + 1})",
                 line_index=i, span=(input_match.start(1), input_match.end(1)),
+            ))
+            continue
+
+        ta_len_match = _PINE_TA_LEN_RE.match(line)
+        if ta_len_match:
+            # Only reachable when the length wasn't already an input.*
+            # variable (that shape is handled above and never matches this
+            # stricter numeric-literal-only pattern), so no gene is ever
+            # double-counted for the same line.
+            func, literal = ta_len_match.groups()
+            name_match = _PINE_INPUT_NAME_RE.match(line)
+            name = name_match.group(1) if name_match else f"ta_{func}_L{i + 1}"
+            value = float(literal)
+            lo, hi = _multiplicative_bounds(value, True)
+            genes.append(CodeGene(
+                name=name, kind="pine_ta_length", is_int=True, lo=lo, hi=hi,
+                base_value=value, label=f"{name} = ta.{func}(..., {literal}) length (line {i + 1})",
+                line_index=i, span=(ta_len_match.start(2), ta_len_match.end(2)),
             ))
             continue
 

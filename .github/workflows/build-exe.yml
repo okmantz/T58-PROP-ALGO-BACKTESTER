@@ -115,6 +115,7 @@ jobs:
             --hidden-import "app.reports._assets" `
             --add-data "data/examples;data/examples" `
             --add-data "app/ui/assets;app/ui/assets" `
+            --add-data "strategies;strategies" `
             run_app.py
 
       - name: Verify executable
@@ -144,6 +145,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "release\data" | Out-Null
           New-Item -ItemType Directory -Force -Path "release\data\examples" | Out-Null
           New-Item -ItemType Directory -Force -Path "release\data\raw" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release\strategies" | Out-Null
 
           Copy-Item `
             "dist\T58-Prop-Algo-Backtester.exe" `
@@ -174,6 +176,18 @@ jobs:
             }
           }
 
+          if (Test-Path "strategies") {
+            $strategyFiles = Get-ChildItem "strategies" -File -Recurse -ErrorAction SilentlyContinue
+
+            if ($strategyFiles.Count -gt 0) {
+              Copy-Item `
+                "strategies\*" `
+                "release\strategies\" `
+                -Recurse `
+                -Force
+            }
+          }
+
           Write-Host ""
           Write-Host "=== FINAL RELEASE STRUCTURE ==="
 
@@ -195,6 +209,21 @@ jobs:
             $rawFiles |
               Where-Object { $_.Extension -ieq ".csv" } |
               Select-Object FullName, Length
+          }
+
+      - name: Verify packaged strategy files
+        shell: pwsh
+        run: |
+          Write-Host "=== VERIFYING PACKAGED STRATEGIES ==="
+
+          $strategyFiles = Get-ChildItem "release\strategies" -File -Recurse -ErrorAction SilentlyContinue
+
+          if ($strategyFiles.Count -eq 0) {
+            Write-Warning "No strategy files were packaged into release\strategies. The built-in Strategy Library will be empty on first run."
+          }
+          else {
+            Write-Host "Packaged $($strategyFiles.Count) strategy file(s) into release\strategies:"
+            $strategyFiles | Select-Object FullName, Length
           }
 
       - name: Create ZIP package

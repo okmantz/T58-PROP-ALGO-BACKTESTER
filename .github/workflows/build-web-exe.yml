@@ -100,6 +100,7 @@ jobs:
             --add-data "app/web/templates;app/web/templates" `
             --add-data "app/web/static;app/web/static" `
             --add-data "data/examples;data/examples" `
+            --add-data "strategies;strategies" `
             run_web.py
 
       - name: Verify executable
@@ -129,6 +130,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "release-web\data" | Out-Null
           New-Item -ItemType Directory -Force -Path "release-web\data\examples" | Out-Null
           New-Item -ItemType Directory -Force -Path "release-web\data\raw" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release-web\strategies" | Out-Null
 
           Copy-Item `
             "dist\T58-Web-App.exe" `
@@ -146,6 +148,13 @@ jobs:
             $rawFiles = Get-ChildItem "data\raw" -File -Recurse -ErrorAction SilentlyContinue
             if ($rawFiles.Count -gt 0) {
               Copy-Item "data\raw\*" "release-web\data\raw\" -Recurse -Force
+            }
+          }
+
+          if (Test-Path "strategies") {
+            $strategyFiles = Get-ChildItem "strategies" -File -Recurse -ErrorAction SilentlyContinue
+            if ($strategyFiles.Count -gt 0) {
+              Copy-Item "strategies\*" "release-web\strategies\" -Recurse -Force
             }
           }
 

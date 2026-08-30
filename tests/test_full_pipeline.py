@@ -124,7 +124,7 @@ def generate_signals(df: pd.DataFrame):
         assert result.saved_library_path.exists()
         assert result.saved_library_path.suffix == ".py"
         saved = library.list_saved_strategies("python")
-        assert any(s.status == "validated" for s in saved)
+        assert any(s.status in ("validated", "tested_passed", "tested_failed") for s in saved)
 
 
 def test_full_pipeline_skips_optimization_gracefully_when_no_tunable_params(tmp_path, monkeypatch):

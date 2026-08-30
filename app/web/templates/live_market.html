@@ -8,7 +8,7 @@
 <link rel="icon" href="/static/icon-192.png">
 <meta name="theme-color" content="#05070a">
 <link rel="stylesheet" href="/static/theme.css">
-<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="/static/lightweight-charts.standalone.production.js"></script>
 <style>
   /* Live Market page only -- self-contained light/dark variables so this
      one page can follow the desktop app's theme toggle without touching
@@ -204,6 +204,15 @@
 
 <script>
 (function () {
+  if (typeof LightweightCharts === 'undefined') {
+    const wrap = document.querySelector('.lm-chart-wrap');
+    if (wrap) {
+      wrap.innerHTML = '<div style="padding:40px;text-align:center;color:var(--lm-down);font-size:13px;">'
+        + 'Chart library failed to load (static/lightweight-charts.standalone.production.js is missing or '
+        + 'blocked). Reinstall/redownload the app files and try again.</div>';
+    }
+    return;
+  }
   const theme = document.documentElement.getAttribute('data-theme') || 'dark';
   const css = getComputedStyle(document.documentElement);
   const colors = {

@@ -45,6 +45,22 @@ def test_fetch_alpaca_bars_returns_empty_without_saved_credentials(monkeypatch):
     assert live_market.fetch_alpaca_bars("AAPL", "Stock", 15) == []
 
 
+def test_fetch_alpaca_bars_with_real_credentials_object_does_not_crash(monkeypatch):
+    """Regression test: load_credentials() returns an AlpacaCredentials
+    dataclass instance, not a tuple -- subscripting it (creds[0]) used to
+    raise TypeError and surface as an Internal Server Error on the Live
+    Market page for anyone with saved Alpaca keys."""
+    from app.data.alpaca_credentials import AlpacaCredentials
+
+    monkeypatch.setattr(
+        "app.data.alpaca_credentials.load_credentials",
+        lambda: AlpacaCredentials(api_key="fake", secret_key="fake"),
+    )
+    # Network call will fail (fake keys) -- the point is that it fails
+    # gracefully (returns []) rather than raising before it even tries.
+    assert live_market.fetch_alpaca_bars("AAPL", "Stock", 15) == []
+
+
 def test_replay_seeds_from_the_end_of_the_dataset(tmp_path, monkeypatch):
     name = _write_dataset(tmp_path, monkeypatch, n=400)
     bars, finished = live_market.fetch_replay_bars(name, advance=False)

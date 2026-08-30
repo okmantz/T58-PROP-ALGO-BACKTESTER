@@ -55,6 +55,7 @@ from app.optimize.parameter_space import RefinementError, apply_genome, extract_
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
 from app.optimize.multi_objective import DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
+from app.orchestration.batch_test import BatchTestItem, run_batch_test
 from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
 from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
@@ -74,7 +75,7 @@ from app.strategy.library import (
     STRATEGY_STATUSES, STRATEGY_TYPES, StrategyAlreadyExists, delete_many,
     delete_saved_strategy, export_library_zip, get_strategy_library_dir,
     list_all_markets, list_all_tags, list_misplaced_files, list_saved_strategies,
-    record_backtest_result, record_lookahead_result, record_search_result,
+    load_strategy_text, record_backtest_result, record_lookahead_result, record_search_result,
     rename_saved_strategy, save_strategy_bytes, save_strategy_metadata,
     save_strategy_path, set_strategy_status, set_strategy_tags,
 )
@@ -334,7 +335,7 @@ class LabeledEntry(Frame):
 
 
 class LabeledCombo(Frame):
-    def __init__(self, parent, label, values, default=""):
+    def __init__(self, parent, label, values, default="", width=None):
         super().__init__(parent, bg=PANEL)
 
         Label(
@@ -343,9 +344,22 @@ class LabeledCombo(Frame):
         ).pack(side="left")
 
         self.var = StringVar(value=str(default))
+        # width=18 was a fine default back when every combo's options were
+        # short labels ("bootstrap", "shuffle", ...); Search Lab's Mode
+        # dropdown has long descriptive option text (e.g. "Bulk backtest
+        # -- upload multiple Python / PineScript / MQL5 files and run
+        # each one") that a fixed width=18 clips hard in both the closed
+        # box and ttk's popdown listbox, which sizes off the widget's own
+        # width. Auto-sizing to the longest value (capped so it can't blow
+        # out the layout) fixes that everywhere a combo is used, not just
+        # this one spot -- pass an explicit width to opt back into the
+        # old fixed-width behavior for a combo that wants it.
+        if width is None:
+            longest = max((len(str(v)) for v in values), default=18)
+            width = min(60, max(18, longest + 2))
         self.combo = ttk.Combobox(
             self, textvariable=self.var, values=values, state="readonly",
-            width=18, font=_safe_font(9), style="T58.TCombobox",
+            width=width, font=_safe_font(9), style="T58.TCombobox",
         )
         self.combo.pack(side="left", padx=(4, 0))
         self.pack(fill="x", pady=3, padx=18)
@@ -2913,6 +2927,27 @@ class MainWindow:
             lib_btn_row, "REFRESH LIBRARY", self._refresh_strategy_library
         ).pack(side="left", padx=8)
 
+        lib_btn_row_3 = Frame(library_section, bg=PANEL)
+        lib_btn_row_3.pack(anchor="w", padx=18, pady=(0, 6))
+
+        self._button(
+            lib_btn_row_3, "TEST SELECTED (BATCH)", self._test_selected_library_strategies_batch, primary=True
+        ).pack(side="left")
+        self._button(
+            lib_btn_row_3, "VIEW CODE / CONFIG", self._view_selected_strategy_code
+        ).pack(side="left", padx=8)
+
+        Label(
+            library_section,
+            text="TEST SELECTED (BATCH) runs every currently highlighted strategy (Ctrl/Cmd or "
+            "Shift-click for more than one) through the same backtest -> prop-sim -> Monte Carlo "
+            "-> report pipeline as Run & Report, one after another -- one saved report per "
+            "strategy, all showing up on the Dashboard afterward. VIEW CODE / CONFIG shows the "
+            "saved source for a selected Python/PineScript/MQL5 strategy, or the built config for "
+            "whatever's currently set up in Manual mode.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
         lib_btn_row_2 = Frame(library_section, bg=PANEL)
         lib_btn_row_2.pack(anchor="w", padx=18, pady=(0, 10))
 
@@ -3428,6 +3463,187 @@ class MainWindow:
         if failed:
             messagebox.showwarning("Some deletions failed", "\n".join(failed))
         self._refresh_strategy_library()
+
+    def _show_text_viewer(self, title: str, text: str):
+        """Read-only popup showing raw text (strategy source, or a
+        manual strategy's built config as JSON) with copy-to-clipboard --
+        used by VIEW CODE / CONFIG."""
+        win = Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG)
+        win.geometry("860x640")
+
+        Label(
+            win, text=title, bg=BG, fg=TEXT, font=_safe_font(11, "bold"),
+        ).pack(anchor="w", padx=14, pady=(12, 6))
+
+        text_frame = Frame(win, bg=BG)
+        text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        txt = Text(
+            text_frame, wrap="none", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            font=(MONO, 10), relief="flat", bd=0,
+        )
+        vs = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview, style="T58.Vertical.TScrollbar")
+        hs = ttk.Scrollbar(text_frame, orient="horizontal", command=txt.xview)
+        txt.config(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        hs.grid(row=1, column=0, sticky="ew")
+        txt.insert("1.0", text)
+        txt.config(state="disabled")
+
+        btn_row = Frame(win, bg=BG)
+        btn_row.pack(fill="x", padx=14, pady=(0, 12))
+
+        def _copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+
+        self._button(btn_row, "COPY TO CLIPBOARD", _copy, primary=True).pack(side="left")
+        self._button(btn_row, "CLOSE", win.destroy).pack(side="left", padx=8)
+
+    def _view_selected_strategy_code(self):
+        mode = self.strategy_mode.get()
+        if mode == "manual":
+            try:
+                strategy = self._build_strategy()
+            except Exception as exc:
+                messagebox.showerror("Could not build strategy", str(exc))
+                return
+            text = json.dumps(strategy.config, indent=2)
+            self._show_text_viewer(f"Manual strategy config -- {strategy.config.get('name', 'Manual Strategy')}", text)
+            return
+        if mode not in STRATEGY_TYPES:
+            messagebox.showinfo("No strategy type selected", "Choose Python, PineScript, MQL5, or Manual above first.")
+            return
+        item = self._selected_library_item()
+        if item is None:
+            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            return
+        try:
+            text = load_strategy_text(mode, item.name)
+        except Exception as exc:
+            messagebox.showerror("Could not load", str(exc))
+            return
+        self._show_text_viewer(f"{item.name}  ({mode})", text)
+
+    def _open_progress_window(self, title: str):
+        """A small Toplevel with a scrolling log -- used for TEST SELECTED
+        (BATCH) so a multi-strategy run has somewhere to show progress
+        without borrowing the Search Lab tab's own console."""
+        win = Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG)
+        win.geometry("760x520")
+        Label(win, text=title, bg=BG, fg=TEXT, font=_safe_font(11, "bold")).pack(anchor="w", padx=14, pady=(12, 6))
+        text_frame = Frame(win, bg=BG)
+        text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+        txt = Text(text_frame, wrap="word", bg=PANEL_3, fg=TEXT, font=(MONO, 9), relief="flat", bd=0)
+        vs = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview, style="T58.Vertical.TScrollbar")
+        txt.config(yscrollcommand=vs.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        btn_row = Frame(win, bg=BG)
+        btn_row.pack(fill="x", padx=14, pady=(0, 12))
+        self._button(btn_row, "CLOSE", win.destroy).pack(side="left")
+
+        def append(msg: str) -> None:
+            def _do():
+                txt.insert(END, msg + "\n")
+                txt.see(END)
+            try:
+                self.root.after(0, _do)
+            except Exception:
+                pass
+
+        return win, append
+
+    def _test_selected_library_strategies_batch(self):
+        mode = self.strategy_mode.get()
+        items = self._selected_library_items()
+        if mode not in STRATEGY_TYPES or not items:
+            messagebox.showinfo(
+                "No selection",
+                "Select one or more saved Python/PineScript/MQL5 strategies from the list first "
+                "(Ctrl/Cmd-click or Shift-click for more than one).",
+            )
+            return
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1 before testing strategies.")
+            return
+        win, append = self._open_progress_window(f"Testing {len(items)} strategy(ies)...")
+        threading.Thread(
+            target=self._run_library_batch_test_pipeline, args=(mode, items, append), daemon=True,
+        ).start()
+
+    def _run_library_batch_test_pipeline(self, mode, items, log):
+        """Runs every selected Strategy Library item through
+        app.orchestration.batch_test.run_batch_test -- the same pipeline
+        Bulk Backtest already uses, just sourced from the library's
+        multi-select instead of a fresh file upload, and recording each
+        result back onto that strategy's own library metadata."""
+        try:
+            log(f"Loading {len(self.csv_paths)} market data file(s)...")
+            per_file_results = []
+            for p in self.csv_paths:
+                result = import_csv(p)
+                if not result.is_valid:
+                    log(f"Import errors ({os.path.basename(p)}):\n" + "\n".join(result.errors))
+                    return
+                per_file_results.append((p, result))
+            if len(per_file_results) == 1:
+                df = per_file_results[0][1].dataframe
+            else:
+                df, _labels = merge_multi_timeframe([r.dataframe for _, r in per_file_results])
+            log(f"Loaded {len(df)} bars.\n")
+
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            n_sims = self.mc_sims.get_int(10000)
+            method = self.mc_method.get_str().strip() or "bootstrap"
+            instrument = (
+                os.path.basename(self.csv_paths[0]) if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+
+            batch_items = []
+            for item in items:
+                try:
+                    strategy = self._load_bulk_strategy(item.path)
+                except Exception as exc:
+                    log(f"  Skipped {item.name} -- could not load: {exc}")
+                    continue
+                batch_items.append(BatchTestItem(label=item.name, strategy=strategy, library_ref=(mode, item.name)))
+
+            if not batch_items:
+                log("\nNothing to test -- every selected strategy failed to load.")
+                return
+
+            summary = run_batch_test(
+                df, batch_items, risk, rules, OUTPUT_DIR,
+                instrument=instrument, mc_sims=n_sims, mc_method=method,
+                basename_prefix=f"library_{mode}", progress_cb=log,
+            )
+            if summary.succeeded:
+                ranked = sorted(summary.succeeded, key=lambda o: o.eval_pass_probability, reverse=True)
+                log("\nRanked by eval pass probability:")
+                for o in ranked:
+                    log(f"  {o.eval_pass_probability:5.1f}%  ${o.net_profit:>12,.2f}   {o.label}")
+            try:
+                self._refresh_dashboard()
+            except Exception:
+                pass
+            try:
+                self._refresh_strategy_library()
+            except Exception:
+                pass
+        except Exception:
+            log("\nUnexpected error:\n" + traceback.format_exc())
 
     def _open_strategy_library_folder(self):
         # This folder-open button is a frequent source of confusion: people

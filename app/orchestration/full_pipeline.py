@@ -91,12 +91,31 @@ class FullPipelineConfig:
     ga_search_mc_sims: int = 200
     fitness_metric: str = "composite_prop_score"
     final_mc_sims: int = 10_000
+    # Step 1's baseline Monte Carlo run is diagnostic only -- it's logged
+    # and reported alongside the final numbers, but never feeds the
+    # verdict (see _make_verdict, which only reads final_mc) and gets
+    # thrown away entirely whenever Step 2 finds a better configuration.
+    # Running it at the same full_mc_sims fidelity as the run that
+    # actually counts wasted a meaningful share of every pipeline run for
+    # no quality benefit, so it defaults lower here -- this is a pure
+    # speed change with no effect on the report's headline numbers.
+    baseline_mc_sims: int = 2_000
     holdout_frac: float = 0.2
     oos_check_folds: int = 4               # for the post-hoc run_walk_forward check
     oos_check_metric: str = "profit_factor"
     random_seed: int | None = 42
     save_to_library: bool = True           # code strategies only -- manual configs aren't files
     library_status: str = "validated"
+    # Passed straight through to Step 2's walk-forward-aware GA (by far
+    # the most expensive step in a typical run) -- see
+    # app.optimize.walkforward_ga.run_walkforward_aware_refinement for
+    # what these control. parallel=True (the default) is a pure speed
+    # change: it evaluates a generation's candidates across worker
+    # processes instead of one at a time, with automatic fallback to a
+    # single process if that can't be set up, so it never changes which
+    # configuration wins.
+    parallel_search: bool = True
+    parallel_search_max_workers: int | None = None
 
 
 @dataclass
@@ -277,7 +296,7 @@ def run_full_pipeline(
     pnls = [t.pnl for t in baseline_bt.trades]
     dates = [t.entry_time for t in baseline_bt.trades]
     baseline_single_run = simulate_account(pnls, dates, prop_rules)
-    baseline_mc = run_monte_carlo(baseline_bt.trades, prop_rules, MonteCarloConfig(n_simulations=cfg.final_mc_sims, random_seed=cfg.random_seed))
+    baseline_mc = run_monte_carlo(baseline_bt.trades, prop_rules, MonteCarloConfig(n_simulations=cfg.baseline_mc_sims, random_seed=cfg.random_seed))
     log(
         f"  Baseline: {len(baseline_bt.trades)} trades, net ${baseline_bt.statistics.net_profit:,.2f}, "
         f"eval pass {baseline_mc.evaluation_pass_probability:.1f}%, payout {baseline_mc.first_payout_probability:.1f}%."
@@ -388,6 +407,8 @@ def run_full_pipeline(
             n_folds=cfg.n_folds, window_mode=cfg.window_mode,
             progress_cb=lambda m: log(f"  {m}"),
             ai_suggest_cb=ai_suggest_cb,
+            parallel=cfg.parallel_search,
+            max_workers=cfg.parallel_search_max_workers,
         )
         refinement_ran = True
         if ga_result.best.oos_trade_count > 0:

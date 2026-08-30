@@ -84,14 +84,72 @@ class AccountSimResult:
         return sum(p.amount for p in self.payouts)
 
 
+@dataclass
+class DayStructure:
+    """The part of simulate_account's bookkeeping that depends ONLY on
+    `trade_dates`, never on the P&L values themselves: which calendar day
+    each trade in the sequence falls on, and which trades are the last of
+    their day. The Monte Carlo engine resamples/shuffles P&L VALUES across
+    thousands of simulations while reusing the exact same (fixed,
+    historical) trade dates every time -- see app.monte_carlo.engine's
+    run_monte_carlo -- so this structure is identical across every one of
+    those simulations and only needs to be computed once, not
+    re-derived (via per-trade pandas Timestamp parsing and dict lookups)
+    on every single call. Precomputing it once and passing it in cut a
+    meaningful amount of wall-clock time out of every Monte Carlo run,
+    the walk-forward-aware GA, and Search Lab -- all of which call
+    simulate_account many thousands of times per run -- without changing
+    a single output value.
+    """
+    day_index_per_trade: list       # length == n_trades; which day (0-based, chronological) each trade belongs to
+    is_last_of_day: list            # length == n_trades; True where a trade is the last one of its calendar day
+    day_dates: list                 # length == n_days; the normalized date for each day index
+    n_days: int
+
+
+def precompute_day_structure(trade_dates: list) -> DayStructure:
+    """Builds the (dates-only) bookkeeping simulate_account needs, once,
+    so it can be reused across many calls that all share the same
+    `trade_dates` but different `trade_pnls` (exactly the Monte Carlo
+    engine's resampling pattern). See DayStructure's docstring."""
+    dates_norm = [pd.Timestamp(d).normalize() for d in trade_dates]
+    day_index_map: dict = {}
+    day_order: list = []
+    day_index_per_trade: list = []
+    for d in dates_norm:
+        idx = day_index_map.get(d)
+        if idx is None:
+            idx = len(day_order)
+            day_index_map[d] = idx
+            day_order.append(d)
+        day_index_per_trade.append(idx)
+    n = len(dates_norm)
+    is_last_of_day = [
+        (i == n - 1) or (dates_norm[i] != dates_norm[i + 1])
+        for i in range(n)
+    ]
+    return DayStructure(
+        day_index_per_trade=day_index_per_trade, is_last_of_day=is_last_of_day,
+        day_dates=day_order, n_days=len(day_order),
+    )
+
+
 def simulate_account(
     trade_pnls: list[float],
     trade_dates: list,
     rules: PropRules,
+    _day_structure: "DayStructure | None" = None,
 ) -> AccountSimResult:
     """
     trade_pnls: P&L of each trade (account-currency $), in chronological order
     trade_dates: date (or datetime) of each trade, same order/length as trade_pnls
+
+    _day_structure: internal fast-path for callers (the Monte Carlo engine)
+    that invoke this function many times with the SAME trade_dates and only
+    trade_pnls changing -- pass a DayStructure from precompute_day_structure()
+    once, computed from trade_dates, to skip re-deriving it on every call.
+    Every other caller can ignore this parameter entirely; it's derived
+    from trade_dates automatically when omitted, with identical results.
     """
     if len(trade_pnls) == 0:
         return AccountSimResult(
@@ -111,10 +169,12 @@ def simulate_account(
     failure_reason = None
     failure_day_index = None
 
-    day_order: list = []
-    day_index_map: dict = {}
-    daily_pnl: dict = {}
-    day_profit_history: dict = {}  # date -> cumulative pnl that day
+    day_structure = _day_structure if _day_structure is not None else precompute_day_structure(trade_dates)
+    day_index_per_trade = day_structure.day_index_per_trade
+    is_last_of_day = day_structure.is_last_of_day
+    day_dates = day_structure.day_dates
+    daily_pnl = [0.0] * day_structure.n_days
+    day_profit_history = [0.0] * day_structure.n_days  # day index -> cumulative pnl that day
 
     payouts: list[PayoutEvent] = []
     first_payout_day_index = None
@@ -127,30 +187,18 @@ def simulate_account(
     total_profit_since_start = 0.0
     best_day_profit = 0.0
 
-    dates_norm = [pd.Timestamp(d).normalize() for d in trade_dates]
-    # Precompute, for each trade, whether it's the LAST trade of its
-    # calendar day -- needed for "eod" drawdown_check_mode, where the
-    # failure checks below only fire once per day (using that day's final
-    # cumulative balance) rather than after every single trade.
-    is_last_of_day = [
-        (i == len(dates_norm) - 1) or (dates_norm[i] != dates_norm[i + 1])
-        for i in range(len(dates_norm))
-    ]
+    last_day_idx_reached = -1
 
-    for i, (pnl, d) in enumerate(zip(trade_pnls, dates_norm)):
-        if d not in day_index_map:
-            day_index_map[d] = len(day_order)
-            day_order.append(d)
-            daily_pnl[d] = 0.0
-            day_profit_history[d] = 0.0
+    for i, pnl in enumerate(trade_pnls):
+        cur_day_idx = day_index_per_trade[i]
+        last_day_idx_reached = cur_day_idx
 
         balance += pnl
-        daily_pnl[d] += pnl
-        day_profit_history[d] += pnl
+        daily_pnl[cur_day_idx] += pnl
+        day_profit_history[cur_day_idx] += pnl
         total_profit_since_start += pnl
-        best_day_profit = max(best_day_profit, day_profit_history[d])
+        best_day_profit = max(best_day_profit, day_profit_history[cur_day_idx])
 
-        cur_day_idx = day_index_map[d]
         check_now = (rules.drawdown_check_mode == "intrabar") or is_last_of_day[i]
 
         if not check_now:
@@ -167,7 +215,7 @@ def simulate_account(
         max_dd_pct_reached = max(max_dd_pct_reached, current_dd_pct)
 
         # --- Failure checks (apply in both evaluation and funded stages) ---
-        if daily_pnl[d] <= -rules.account_size * (rules.daily_loss_limit_pct / 100.0):
+        if daily_pnl[cur_day_idx] <= -rules.account_size * (rules.daily_loss_limit_pct / 100.0):
             failed = True
             failure_reason = "daily_loss_limit"
             failure_day_index = cur_day_idx
@@ -182,7 +230,7 @@ def simulate_account(
         # --- Evaluation pass check ---
         if stage == "evaluation":
             target_balance = rules.account_size * (1 + rules.evaluation_profit_target_pct / 100.0)
-            trading_days_so_far = len(day_order)
+            trading_days_so_far = cur_day_idx + 1
             if balance >= target_balance and trading_days_so_far >= rules.min_trading_days:
                 consistency_ok = True
                 if rules.consistency_rule_pct is not None and total_profit_since_start > 0:
@@ -209,7 +257,7 @@ def simulate_account(
                     balance -= withdrawable
                     payout = PayoutEvent(
                         day_index=cur_day_idx,
-                        date=str(d.date()),
+                        date=str(day_dates[cur_day_idx].date()),
                         amount=withdrawable,
                         balance_after=balance,
                     )
@@ -232,7 +280,7 @@ def simulate_account(
         payouts=payouts,
         final_balance=balance,
         max_drawdown_pct_reached=max_dd_pct_reached,
-        trading_days_count=len(day_order),
+        trading_days_count=last_day_idx_reached + 1,
     )
 
 

@@ -73,6 +73,33 @@
 <div class="{{ 'error' if alpaca_notice_kind == 'error' else ('warning' if alpaca_notice_kind == 'warning' else 'notice') }}">{{ alpaca_notice }}</div>
 {% endif %}
 
+{% if batch_result %}
+<div class="card">
+  <h2>Batch test results</h2>
+  <p style="font-size:12px;color:#888;margin-bottom:10px;">Ran against: <b>{{ batch_result.active_dataset }}</b></p>
+  {% if batch_result.load_errors %}
+  <p style="font-size:13px;color:#ffb4b4;margin-bottom:10px;">Could not load: {{ batch_result.load_errors|join('; ') }}</p>
+  {% endif %}
+  <table style="width:100%;font-size:13px;border-collapse:collapse;">
+    <tr style="text-align:left;color:#888;"><th>Strategy</th><th>Trades</th><th>Net profit</th><th>Eval pass %</th><th>Report</th></tr>
+    {% for o in batch_result.outcomes %}
+    <tr style="border-top:1px solid #262626;">
+      <td style="padding:6px 4px;">{{ o.label }}</td>
+      {% if o.ok %}
+      <td style="padding:6px 4px;">{{ o.trades }}</td>
+      <td style="padding:6px 4px;">${{ "{:,.2f}".format(o.net_profit) }}</td>
+      <td style="padding:6px 4px;">{{ "%.1f"|format(o.eval_pass_probability) }}%</td>
+      <td style="padding:6px 4px;"><a href="{{ o.report_html }}" target="_blank" style="color:#35e0b0;">Open report</a></td>
+      {% else %}
+      <td colspan="4" style="padding:6px 4px;color:#ffb4b4;">Skipped — {{ o.reason }}</td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </table>
+  <p style="font-size:12px;color:#888;margin-top:10px;">Every successful result above is also saved to the Strategy Library's own record and on the Dashboard.</p>
+</div>
+{% endif %}
+
 {% if result %}
 <div class="card">
   <h2>Result</h2>
@@ -314,8 +341,14 @@
           <div class="row">
             <button type="submit" class="submit-btn" style="padding:10px;font-size:13px;background:#3a1616;color:#ffb4b4;">Delete Checked</button>
             <button type="button" class="submit-btn" style="padding:10px;font-size:13px;" onclick="exportChecked()">Export Checked</button>
+            <button type="button" class="submit-btn" style="padding:10px;font-size:13px;" onclick="batchTestChecked()">Batch Test Checked</button>
           </div>
         </form>
+        <p style="font-size:11px;color:#888;margin-top:6px;">
+          Batch Test Checked runs every checked strategy through the same pipeline as the
+          Run button below (using whichever market data / risk / prop-rule settings are set on
+          this page right now) and produces one report per strategy.
+        </p>
       </details>
 
       <label style="margin-top:14px;">Or upload a strategy file (from this computer or your phone)</label>
@@ -525,6 +558,7 @@
       <label style="display:flex;align-items:center;gap:8px;margin:4px 0;">
         <input type="checkbox" name="items" value="${mode}::${s.name}" style="width:auto;">
         <span>[${s.status}] ${s.name}${s.description ? ' — ' + s.description : ''}</span>
+        <a href="#" onclick="viewStrategyCode('${mode}', '${s.name}'); return false;" style="font-size:11px;color:#35e0b0;">view code</a>
       </label>
     `).join('');
   }
@@ -534,6 +568,30 @@
     if (!checked.length) { alert('Check at least one strategy first.'); return; }
     const params = checked.map(v => `items=${encodeURIComponent(v)}`).join('&');
     window.location = `/strategies/bulk-export?${params}`;
+  }
+
+  function batchTestChecked() {
+    const checked = Array.from(document.querySelectorAll('#bulk-checklist input[type=checkbox]:checked')).map(c => c.value);
+    if (!checked.length) { alert('Check at least one strategy first.'); return; }
+    const mainForm = document.querySelector('form[action="/run"]');
+    mainForm.querySelectorAll('input[name="batch_items"]').forEach(el => el.remove());
+    checked.forEach(v => {
+      const inp = document.createElement('input');
+      inp.type = 'hidden';
+      inp.name = 'batch_items';
+      inp.value = v;
+      mainForm.appendChild(inp);
+    });
+    // A freshly-chosen CSV file above comes along fine (this submits the
+    // real form, files included) -- only picking an existing stored
+    // dataset is needed if you didn't just upload one.
+    mainForm.action = '/strategies/batch-test';
+    mainForm.submit();
+  }
+
+  function viewStrategyCode(strategyType, filename) {
+    const url = `/strategies/view-code?strategy_type=${encodeURIComponent(strategyType)}&filename=${encodeURIComponent(filename)}`;
+    window.open(url, '_blank');
   }
 
   function loadFromLibrary() {

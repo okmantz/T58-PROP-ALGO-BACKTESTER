@@ -44,6 +44,7 @@ from app.data.alpaca_source import (
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
+from app.orchestration.batch_test import BatchTestItem, run_batch_test
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
 from app.reports import run_history
@@ -456,6 +457,113 @@ def bulk_export_saved_strategies_route():
         data,
         mimetype="application/zip",
         headers={"Content-Disposition": "attachment; filename=t58_strategy_library_selection.zip"},
+    )
+
+
+@app.route("/strategies/view-code")
+def view_saved_strategy_code_route():
+    """Plain-text view of one saved strategy's source -- the web
+    equivalent of the desktop app's VIEW CODE / CONFIG button. Opens in a
+    new tab from the library panel rather than a modal, since a phone
+    browser handles a plain page far better than in-page JS overlay text."""
+    strategy_type = request.args.get("strategy_type", "")
+    filename = request.args.get("filename", "")
+    try:
+        text = load_strategy_text(strategy_type, filename)
+    except (ValueError, FileNotFoundError) as exc:
+        return Response(str(exc), status=404, mimetype="text/plain")
+    return Response(text, mimetype="text/plain")
+
+
+@app.route("/strategies/batch-test", methods=["POST"])
+def batch_test_saved_strategies_route():
+    """Runs every checked "type::filename" library item through the same
+    backtest -> prop-sim -> Monte Carlo -> report pipeline /run uses, one
+    after another -- the web equivalent of the desktop app's TEST
+    SELECTED (BATCH) button. Reuses the SAME market-data / risk / prop
+    rule fields the main Run & Report form already carries (the page's JS
+    clones them into this request), with one exception: a freshly
+    uploaded CSV can't be cloned this way by a browser for security
+    reasons, so batch-testing from the web currently requires picking an
+    already-stored dataset rather than uploading a brand new file in the
+    same click -- upload it once via Run & Report first, then batch-test
+    against it."""
+    form = request.form
+    items = _parse_bulk_items(form.getlist("batch_items"))
+    if not items:
+        return redirect(url_for("index", strategy_notice="No strategies were checked to batch-test."))
+
+    df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+    if dataset_error:
+        return redirect(url_for("index", strategy_notice=dataset_error))
+
+    risk = RiskConfig(
+        initial_balance=float(form.get("initial_balance", 100000)),
+        risk_mode=form.get("risk_mode", "percent"),
+        risk_value=float(form.get("risk_value", 1.0)),
+        max_trades_per_day=int(form.get("max_trades_day", 10)),
+        commission_per_trade=float(form.get("commission", 0)),
+        slippage_pips=float(form.get("slippage_pips", 0.5)),
+        spread_pips=float(form.get("spread_pips", 1.0)),
+        pip_size=float(form.get("pip_size", 0.0001)),
+    )
+    payout_cap = form.get("payout_cap", "").strip()
+    rules = PropRules(
+        account_size=float(form.get("account_size", 100000)),
+        evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+        daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+        max_drawdown_pct=float(form.get("max_dd", 10)),
+        drawdown_type=form.get("dd_type", "trailing"),
+        drawdown_check_mode=form.get("dd_check_mode", "intrabar"),
+        consistency_rule_pct=float(form.get("consistency", 30)) if form.get("consistency") else None,
+        min_trading_days=int(form.get("min_days", 5)),
+        payout_threshold_pct=float(form.get("payout_threshold", 0)),
+        payout_cap_pct=float(payout_cap) if payout_cap else None,
+        payout_frequency_days=int(form.get("payout_freq", 14)),
+        required_buffer_pct=float(form.get("buffer", 0)),
+    )
+    n_sims = int(form.get("n_sims", 5000))
+    mc_method = form.get("mc_method", "bootstrap")
+
+    batch_items = []
+    load_errors = []
+    for strategy_type, filename in items:
+        try:
+            code = load_strategy_text(strategy_type, filename)
+            strategy = build_strategy_from_code(strategy_type, code)
+        except Exception as exc:  # noqa: BLE001 -- one bad strategy must not stop the batch
+            load_errors.append(f"{filename}: {exc}")
+            continue
+        batch_items.append(BatchTestItem(label=filename, strategy=strategy, library_ref=(strategy_type, filename)))
+
+    if not batch_items:
+        return redirect(url_for("index", strategy_notice="Every checked strategy failed to load: " + "; ".join(load_errors)))
+
+    run_id = uuid.uuid4().hex[:8]
+    summary = run_batch_test(
+        df, batch_items, risk, rules, REPORTS_DIR,
+        instrument=active_label, mc_sims=min(n_sims, 50_000), mc_method=mc_method,
+        basename_prefix=f"webbatch_{run_id}",
+    )
+
+    return render_template(
+        "index.html",
+        stored_datasets=list_stored_datasets(),
+        saved_strategies_json=_saved_strategies_json(),
+        **_alpaca_template_context(),
+        batch_result={
+            "active_dataset": active_label,
+            "import_note": import_note,
+            "outcomes": [
+                {
+                    "label": o.label, "ok": o.ok, "reason": o.reason, "trades": o.trades,
+                    "net_profit": o.net_profit, "eval_pass_probability": o.eval_pass_probability,
+                    "report_html": f"/reports/{o.report_html.name}" if o.report_html else None,
+                }
+                for o in summary.outcomes
+            ],
+            "load_errors": load_errors,
+        },
     )
 
 

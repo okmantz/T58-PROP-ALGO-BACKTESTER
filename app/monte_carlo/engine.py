@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from app.backtest.execution import Trade
-from app.prop.simulator import PropRules, simulate_account
+from app.prop.simulator import PropRules, precompute_day_structure, simulate_account
 
 
 @dataclass
@@ -118,6 +118,17 @@ def run_monte_carlo(
     rng = np.random.default_rng(cfg.random_seed)
     base_pnls = np.array([t.pnl for t in trades], dtype=float)
     base_dates = [pd.Timestamp(t.entry_time).normalize() for t in trades]
+    # Every simulation below reassigns the SAME fixed calendar dates
+    # (base_dates never changes) to a resampled sequence of P&L values --
+    # only sim_pnls' order/values differ per simulation. That means the
+    # date-to-trading-day bookkeeping simulate_account would otherwise
+    # rebuild from scratch (via per-trade pandas Timestamp parsing and
+    # dict lookups) on every single one of cfg.n_simulations calls is
+    # actually identical every time, so it's computed once here instead.
+    # See app.prop.simulator.DayStructure's docstring for the full
+    # reasoning; this is a pure performance change with no effect on any
+    # output value.
+    day_structure = precompute_day_structure(base_dates)
 
     passed_flags, first_payout_flags, failed_before_payout_flags, multiple_payout_flags = [], [], [], []
     days_to_pass_list, days_to_first_payout_list = [], []
@@ -128,7 +139,7 @@ def run_monte_carlo(
         sim_pnls = _resample_pnls(rng, base_pnls, cfg)
         sim_pnls = _apply_slippage_stress(sim_pnls, cfg.slippage_stress_pct)
 
-        result = simulate_account(list(sim_pnls), base_dates, rules)
+        result = simulate_account(sim_pnls, base_dates, rules, _day_structure=day_structure)
 
         passed_flags.append(result.passed_evaluation)
         first_payout_flags.append(result.reached_first_payout)

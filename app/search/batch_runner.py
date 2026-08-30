@@ -79,6 +79,42 @@ from app.strategy.lookahead_check import check_for_lookahead
 ProgressCallback = Callable[[str], None]
 
 
+def _record_search_candidates_to_dashboard(
+    stage3_records: list[dict], instrument: str, timeframe: str, family: str | None,
+) -> None:
+    """Every Stage 3 candidate went through a real backtest + full Monte
+    Carlo run -- exactly the same kind of result a single Run & Report (or
+    Bulk Backtest) run produces -- so it's recorded into run_history the
+    same way, purely so Search Lab activity shows up on the Dashboard
+    instead of only Bulk Backtest ever doing so. Deliberately scoped to
+    Stage 3 only (typically a handful to a few dozen candidates per run,
+    never the hundreds/thousands seen at Stage 1) so this can't flood the
+    history file. Best-effort: a recording failure here must never affect
+    the search result itself."""
+    try:
+        from app.reports import run_history
+    except Exception:
+        return
+    for rec in stage3_records:
+        stats = rec.get("statistics") or {}
+        if not stats or not stats.get("total_trades"):
+            continue
+        try:
+            label = f"[Search Lab] {family or rec.get('family') or 'candidate'} {rec['candidate_id'][:8]}"
+            report = {
+                "strategy": {
+                    "name": label, "source_type": rec.get("source_type", "manual"),
+                    "instrument": instrument, "timeframe": timeframe,
+                },
+                "historical_backtest": {"statistics": stats},
+                "prop_firm_single_run": rec.get("prop_summary") or {},
+                "monte_carlo": rec.get("mc_summary") or {},
+            }
+            run_history.record_run(report, {"html": ""})
+        except Exception:  # noqa: BLE001 -- dashboard visibility is a convenience, never core output
+            continue
+
+
 def _record_fields_from_spec(spec: dict) -> dict:
     """The subset of a candidate spec that gets persisted to / propagated
     through the results DB record for a given stage's output -- separated
@@ -186,6 +222,22 @@ def _init_worker(df_pickle_path: str, risk_kwargs: dict, prop_kwargs: dict, tmp_
     # to disk (PythonStrategy only accepts a file path). Every write uses a
     # uuid4 filename, so concurrent workers sharing this directory is safe.
     _WORKER["tmp_dir"] = Path(tmp_dir_path)
+
+
+def _passes_stage1_filters(stats: dict, min_trades: int, min_profit_factor: float,
+                            max_dd_limit: float, require_positive_net: bool = True) -> bool:
+    """The Stage 1 pass/fail test, factored out so it can be re-applied
+    against already-computed per-candidate statistics with progressively
+    looser thresholds (see run_search's auto-relax step) without
+    re-running any backtests."""
+    if not stats:
+        return False
+    pf = stats.get("profit_factor", 0.0)
+    pf_val = 10.0 if pf == float("inf") else float(pf or 0.0)
+    n_trades = stats.get("total_trades", 0)
+    max_dd = stats.get("max_drawdown_pct", 0.0) or 0.0
+    net_ok = (stats.get("net_profit", 0.0) or 0.0) > 0 if require_positive_net else True
+    return bool(n_trades >= min_trades and pf_val >= min_profit_factor and max_dd <= max_dd_limit and net_ok)
 
 
 def _stage1_task(candidate_id: str, spec: dict, filters: dict) -> dict:
@@ -499,10 +551,70 @@ def run_search(
                 f"the cheap filter and advance to Stage 2 (GA refinement)."
             )
             if not survivors1:
+                # Auto-relax: the original filters found nothing to work
+                # with at all, which throws away the whole search rather
+                # than giving Stage 2's GA a weaker starting point to try
+                # to improve. Re-apply progressively looser thresholds
+                # against the SAME already-computed Stage 1 statistics --
+                # no re-backtesting -- so a strict default doesn't turn an
+                # otherwise-viable search into a dead end. Stage 3's
+                # validation gate is unaffected and stays exactly as
+                # strict, so a candidate that only got through on relaxed
+                # Stage 1 filters still has to earn its way past Stage 3
+                # on its own merits.
+                relax_rounds = [
+                    {
+                        "min_trades": max(5, stage_cfg.min_trades // 2),
+                        "min_profit_factor": max(0.9, stage_cfg.min_profit_factor * 0.85),
+                        "max_drawdown_buffer_mult": stage_cfg.max_drawdown_buffer_mult * 1.5,
+                        "require_positive_net": True,
+                    },
+                    {
+                        "min_trades": max(3, stage_cfg.min_trades // 4),
+                        "min_profit_factor": 0.7,
+                        "max_drawdown_buffer_mult": stage_cfg.max_drawdown_buffer_mult * 2.5,
+                        "require_positive_net": False,
+                    },
+                ]
+                relaxed_note = None
+                for round_idx, relaxed in enumerate(relax_rounds, start=1):
+                    max_dd_limit = prop_rules.max_drawdown_pct * relaxed["max_drawdown_buffer_mult"]
+                    candidates_now = [
+                        r for r in stage1_records
+                        if _passes_stage1_filters(
+                            r.get("statistics") or {}, relaxed["min_trades"], relaxed["min_profit_factor"],
+                            max_dd_limit, relaxed["require_positive_net"],
+                        )
+                    ]
+                    if candidates_now:
+                        survivors1 = sorted(
+                            candidates_now, key=lambda r: r.get("quick_score", 0.0), reverse=True,
+                        )[: stage_cfg.stage1_top_n]
+                        relaxed_note = (
+                            f"Stage 1's original filters (min {stage_cfg.min_trades} trades, "
+                            f"profit factor >= {stage_cfg.min_profit_factor:.2f}) found nothing, so it "
+                            f"automatically loosened to min {relaxed['min_trades']} trades, profit factor "
+                            f">= {relaxed['min_profit_factor']:.2f}"
+                            + (", net profit not required" if not relaxed["require_positive_net"] else "")
+                            + f" (auto-relax round {round_idx}/{len(relax_rounds)}) and found "
+                            f"{len(survivors1)} candidate(s) to refine. These start weaker than the "
+                            f"original filters wanted -- Stage 2's GA will try to tune them into "
+                            f"something real, and Stage 3's validation gate is unchanged and still strict."
+                        )
+                        log(f"  Auto-relax round {round_idx}: loosened Stage 1 filters -> "
+                            f"{len(survivors1)} candidate(s) now advance.")
+                        break
+                    log(f"  Auto-relax round {round_idx}: still 0 candidates even with loosened filters.")
+                if relaxed_note:
+                    log(relaxed_note)
+            if not survivors1:
                 log(
-                    "No candidates survived Stage 1 -- nothing to refine or validate. Consider "
-                    "loosening the Stage 1 filters (min trades / min profit factor) or widening the "
-                    "search space rather than trusting a forced 'winner' from an empty funnel."
+                    "No candidates survived Stage 1 even after automatically loosening the filters "
+                    "twice -- nothing to refine or validate. This means the search space itself "
+                    "(the strategy family, or the strategy you provided) doesn't produce a workable "
+                    "number of trades on this data at all, not just a strictness setting. Consider "
+                    "widening the search space, trying a different family, or checking that the "
+                    "market data actually suits the strategy type."
                 )
                 db.finish_run(run_id, status="no_survivors")
                 return SearchSummary(
@@ -606,6 +718,8 @@ def run_search(
     champion = next((r for r in leaderboard if r.get("passed_stage3_gate")), None)
     db.finish_run(run_id, status="completed")
     db.close()
+
+    _record_search_candidates_to_dashboard(stage3_records, instrument, timeframe, space.family)
 
     elapsed = time.time() - t0
     n_passed = sum(1 for r in stage3_records if r.get("passed_stage3_gate"))

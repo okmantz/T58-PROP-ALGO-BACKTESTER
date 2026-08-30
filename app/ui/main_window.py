@@ -788,6 +788,13 @@ class MainWindow:
         self.csv_paths: list[str] = []
         self.strategy_py_path: str | None = None
         self._active_library_strategy: tuple[str, str] | None = None
+        # Staged queue for TEST SELECTED (BATCH) -- ADD SELECTED TO BATCH QUEUE
+        # copies highlighted library rows in here instead of running
+        # immediately, so Prop Rules (03) and Risk (04) can be set up
+        # *after* picking strategies but *before* anything actually runs.
+        # Holds StoredStrategy objects (each already carries its own
+        # strategy_type, so mixing Python/PineScript/MQL5 in one queue is fine).
+        self._batch_queue: list = []
         self.strategy_mode = StringVar(value="manual")
 
         self._build_ui()
@@ -2931,7 +2938,7 @@ class MainWindow:
         lib_btn_row_3.pack(anchor="w", padx=18, pady=(0, 6))
 
         self._button(
-            lib_btn_row_3, "TEST SELECTED (BATCH)", self._test_selected_library_strategies_batch, primary=True
+            lib_btn_row_3, "ADD SELECTED TO BATCH QUEUE", self._add_selected_to_batch_queue, primary=True
         ).pack(side="left")
         self._button(
             lib_btn_row_3, "VIEW CODE / CONFIG", self._view_selected_strategy_code
@@ -2939,14 +2946,73 @@ class MainWindow:
 
         Label(
             library_section,
-            text="TEST SELECTED (BATCH) runs every currently highlighted strategy (Ctrl/Cmd or "
-            "Shift-click for more than one) through the same backtest -> prop-sim -> Monte Carlo "
-            "-> report pipeline as Run & Report, one after another -- one saved report per "
-            "strategy, all showing up on the Dashboard afterward. VIEW CODE / CONFIG shows the "
-            "saved source for a selected Python/PineScript/MQL5 strategy, or the built config for "
-            "whatever's currently set up in Manual mode.",
+            text="ADD SELECTED TO BATCH QUEUE stages every currently highlighted strategy "
+            "(Ctrl/Cmd or Shift-click for more than one) into the Batch test queue below "
+            "-- it does NOT start a test yet. Queue up strategies from Python, PineScript, "
+            "and MQL5 here (any mix is fine), then go set up 03 Prop Rules and 04 Risk the "
+            "way you want them, and come back here and click RUN BATCH TEST when you're "
+            "ready. VIEW CODE / CONFIG shows the saved source for a selected "
+            "Python/PineScript/MQL5 strategy, or the built config for whatever's currently "
+            "set up in Manual mode.",
             bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
         ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        # ------------------------------------------------------------
+        # Batch test queue -- staged strategies waiting on RUN BATCH TEST
+        # ------------------------------------------------------------
+        queue_section = self._section(
+            f, "Batch test queue",
+            "Strategies staged here run one after another through the same backtest -> "
+            "prop-sim -> Monte Carlo -> report pipeline as Run & Report, using whatever "
+            "Prop Rules (03) and Risk (04) are set at the moment you click RUN BATCH TEST "
+            "-- one saved report per strategy, all showing up on the Dashboard afterward. "
+            "Highlight a row and click REMOVE SELECTED FROM QUEUE if something got added "
+            "by mistake.",
+        )
+        queue_list_frame = Frame(queue_section, bg=PANEL)
+        queue_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 8))
+
+        self.batch_queue_listbox = Listbox(
+            queue_list_frame,
+            height=6,
+            selectmode=EXTENDED,
+            exportselection=False,
+            bg=PANEL_3,
+            fg=TEXT,
+            selectbackground=BORDER_LIGHT,
+            selectforeground=METAL_BRIGHT,
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            font=(MONO, 9),
+        )
+        self.batch_queue_listbox.pack(side="left", fill="both", expand=True)
+        queue_scrollbar = ttk.Scrollbar(
+            queue_list_frame, orient="vertical", command=self.batch_queue_listbox.yview,
+            style="T58.Vertical.TScrollbar",
+        )
+        queue_scrollbar.pack(side="right", fill="y")
+        self.batch_queue_listbox.config(yscrollcommand=queue_scrollbar.set)
+
+        queue_btn_row = Frame(queue_section, bg=PANEL)
+        queue_btn_row.pack(anchor="w", padx=18, pady=(0, 4))
+        self._button(
+            queue_btn_row, "REMOVE SELECTED FROM QUEUE", self._remove_selected_from_batch_queue
+        ).pack(side="left")
+        self._button(
+            queue_btn_row, "CLEAR QUEUE", self._clear_batch_queue
+        ).pack(side="left", padx=8)
+        self._button(
+            queue_btn_row, "RUN BATCH TEST", self._run_batch_queue_clicked, primary=True
+        ).pack(side="left")
+
+        self.batch_queue_status = Label(
+            queue_section, text="Queue is empty -- select strategies above and click "
+            "ADD SELECTED TO BATCH QUEUE.", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8),
+        )
+        self.batch_queue_status.pack(anchor="w", padx=18, pady=(0, 10))
 
         lib_btn_row_2 = Frame(library_section, bg=PANEL)
         lib_btn_row_2.pack(anchor="w", padx=18, pady=(0, 10))
@@ -3563,14 +3629,72 @@ class MainWindow:
 
         return win, append
 
-    def _test_selected_library_strategies_batch(self):
-        mode = self.strategy_mode.get()
+    def _add_selected_to_batch_queue(self):
+        """Stages the currently highlighted library row(s) into the Batch
+        test queue below, instead of running anything immediately. This is
+        deliberately a separate step from RUN BATCH TEST so Prop Rules (03)
+        and Risk (04) can be configured *after* picking strategies but
+        *before* the run actually starts."""
         items = self._selected_library_items()
-        if mode not in STRATEGY_TYPES or not items:
+        if not items:
             messagebox.showinfo(
                 "No selection",
-                "Select one or more saved Python/PineScript/MQL5 strategies from the list first "
-                "(Ctrl/Cmd-click or Shift-click for more than one).",
+                "Select one or more saved Python/PineScript/MQL5 strategies from the list "
+                "above first (Ctrl/Cmd-click or Shift-click for more than one).",
+            )
+            return
+        existing = {(s.strategy_type, s.name) for s in self._batch_queue}
+        added = 0
+        skipped_dupe = 0
+        for item in items:
+            key = (item.strategy_type, item.name)
+            if key in existing:
+                skipped_dupe += 1
+                continue
+            self._batch_queue.append(item)
+            existing.add(key)
+            self.batch_queue_listbox.insert(END, f"  [{item.strategy_type}] {item.name}")
+            added += 1
+        self._refresh_batch_queue_status(added=added, skipped_dupe=skipped_dupe)
+
+    def _refresh_batch_queue_status(self, added: int = 0, skipped_dupe: int = 0):
+        n = len(self._batch_queue)
+        if n == 0:
+            self.batch_queue_status.config(
+                text="Queue is empty -- select strategies above and click "
+                "ADD SELECTED TO BATCH QUEUE.",
+                fg=TEXT_DIM,
+            )
+            return
+        bits = [f"{n} strategy(ies) queued"]
+        if added:
+            bits.append(f"+{added} just added")
+        if skipped_dupe:
+            bits.append(f"{skipped_dupe} already in queue, skipped")
+        self.batch_queue_status.config(text="  •  ".join(bits) + " -- click RUN BATCH TEST when ready.", fg=GREEN)
+
+    def _remove_selected_from_batch_queue(self):
+        sel = list(self.batch_queue_listbox.curselection())
+        if not sel:
+            messagebox.showinfo("No selection", "Select one or more rows in the queue below first.")
+            return
+        for i in reversed(sel):
+            self.batch_queue_listbox.delete(i)
+            del self._batch_queue[i]
+        self._refresh_batch_queue_status()
+
+    def _clear_batch_queue(self):
+        self.batch_queue_listbox.delete(0, END)
+        self._batch_queue = []
+        self._refresh_batch_queue_status()
+
+    def _run_batch_queue_clicked(self):
+        items = list(self._batch_queue)
+        if not items:
+            messagebox.showinfo(
+                "Queue is empty",
+                "Nothing is queued yet. Select one or more saved strategies above and click "
+                "ADD SELECTED TO BATCH QUEUE first.",
             )
             return
         if not self.csv_paths:
@@ -3578,15 +3702,18 @@ class MainWindow:
             return
         win, append = self._open_progress_window(f"Testing {len(items)} strategy(ies)...")
         threading.Thread(
-            target=self._run_library_batch_test_pipeline, args=(mode, items, append), daemon=True,
+            target=self._run_library_batch_test_pipeline, args=(items, append), daemon=True,
         ).start()
 
-    def _run_library_batch_test_pipeline(self, mode, items, log):
-        """Runs every selected Strategy Library item through
+    def _run_library_batch_test_pipeline(self, items, log):
+        """Runs every queued Strategy Library item through
         app.orchestration.batch_test.run_batch_test -- the same pipeline
-        Bulk Backtest already uses, just sourced from the library's
-        multi-select instead of a fresh file upload, and recording each
-        result back onto that strategy's own library metadata."""
+        Bulk Backtest already uses, just sourced from the Batch test queue
+        instead of a fresh file upload, and recording each result back onto
+        that strategy's own library metadata. Prop Rules and Risk are read
+        fresh right here, so whatever is set on 03/04 at the moment RUN
+        BATCH TEST is clicked is what every queued strategy gets tested
+        against."""
         try:
             log(f"Loading {len(self.csv_paths)} market data file(s)...")
             per_file_results = []
@@ -3618,28 +3745,44 @@ class MainWindow:
                 except Exception as exc:
                     log(f"  Skipped {item.name} -- could not load: {exc}")
                     continue
-                batch_items.append(BatchTestItem(label=item.name, strategy=strategy, library_ref=(mode, item.name)))
+                batch_items.append(
+                    BatchTestItem(label=item.name, strategy=strategy, library_ref=(item.strategy_type, item.name))
+                )
 
             if not batch_items:
-                log("\nNothing to test -- every selected strategy failed to load.")
+                log("\nNothing to test -- every queued strategy failed to load.")
                 return
+
+            modes_present = {item.strategy_type for item in items}
+            prefix_mode = modes_present.pop() if len(modes_present) == 1 else "mixed"
 
             summary = run_batch_test(
                 df, batch_items, risk, rules, OUTPUT_DIR,
                 instrument=instrument, mc_sims=n_sims, mc_method=method,
-                basename_prefix=f"library_{mode}", progress_cb=log,
+                basename_prefix=f"library_{prefix_mode}", progress_cb=log,
             )
             if summary.succeeded:
                 ranked = sorted(summary.succeeded, key=lambda o: o.eval_pass_probability, reverse=True)
                 log("\nRanked by eval pass probability:")
                 for o in ranked:
                     log(f"  {o.eval_pass_probability:5.1f}%  ${o.net_profit:>12,.2f}   {o.label}")
+            # This whole method runs on a background thread (see
+            # _run_batch_queue_clicked) -- Tkinter widgets can only safely
+            # be touched from the main thread, so both refreshes are handed
+            # to the mainloop via root.after instead of being called here
+            # directly. Calling them straight from a worker thread is what
+            # produces the occasional glitchy/frozen UI after a batch run.
+            def _refresh_after_run():
+                try:
+                    self._refresh_dashboard()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_strategy_library()
+                except Exception:
+                    pass
             try:
-                self._refresh_dashboard()
-            except Exception:
-                pass
-            try:
-                self._refresh_strategy_library()
+                self.root.after(0, _refresh_after_run)
             except Exception:
                 pass
         except Exception:

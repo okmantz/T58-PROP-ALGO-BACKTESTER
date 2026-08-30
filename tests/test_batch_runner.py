@@ -117,7 +117,7 @@ def test_run_search_persists_every_stage_to_db(tmp_path, small_family_space):
 
 def test_run_search_empty_stage1_survivors_is_handled_gracefully(tmp_path, small_family_space):
     df = _trending_df()
-    # Impossible filter -- nothing can pass Stage 1.
+    # Impossible filter -- nothing can pass Stage 1, even after auto-relax.
     cfg = _fast_stage_cfg(min_trades=10**9)
     summary = run_search(
         df, RiskConfig(), PropRules(), small_family_space, cfg,
@@ -128,6 +128,40 @@ def test_run_search_empty_stage1_survivors_is_handled_gracefully(tmp_path, small
     assert summary.stage3_survivors == 0
     assert summary.champion_candidate_id is None
     assert summary.leaderboard == []
+
+
+def test_run_search_auto_relaxes_stage1_filters_instead_of_giving_up(tmp_path, small_family_space):
+    """A strict-but-not-impossible filter (more trades than this small,
+    short-lived candidate pool will realistically produce) should trigger
+    the auto-relax path and still find candidates to advance, rather than
+    the search dead-ending at Stage 1 the way it used to."""
+    df = _trending_df()
+    logs = []
+    cfg = _fast_stage_cfg(min_trades=50, min_profit_factor=50.0)
+    summary = run_search(
+        df, RiskConfig(), PropRules(), small_family_space, cfg,
+        db_path=str(tmp_path / "search.db"), instrument="TEST", timeframe="5m",
+        progress_cb=logs.append,
+    )
+    assert summary.stage1_survivors > 0
+    assert any("auto-relax" in line.lower() for line in logs)
+
+
+def test_run_search_records_stage3_results_onto_the_dashboard(tmp_path, small_family_space, monkeypatch):
+    from app.reports import run_history
+
+    monkeypatch.setattr(run_history, "history_path", lambda: tmp_path / "run_history.json")
+
+    df = _trending_df()
+    before = len(run_history.load_runs())
+    summary = run_search(
+        df, RiskConfig(), PropRules(), small_family_space, _fast_stage_cfg(),
+        db_path=str(tmp_path / "search.db"), instrument="TEST", timeframe="5m",
+    )
+    after = run_history.load_runs()
+    assert summary.stage3_survivors > 0
+    assert len(after) == before + summary.stage3_survivors
+    assert all(r["strategy_name"].startswith("[Search Lab]") for r in after[before:])
 
 
 def test_run_search_leaderboard_candidates_all_reached_stage3(tmp_path, small_family_space):

@@ -225,3 +225,64 @@ def test_python_strategy_with_lookahead_bug_shows_warning_banner():
     finally:
         for f in REPORTS_DIR.glob("report_*"):
             f.unlink()
+
+
+def test_view_saved_strategy_code_route(tmp_path, monkeypatch):
+    from app.strategy import library
+
+    monkeypatch.setattr(library, "get_app_base_dir", lambda: tmp_path)
+    library.save_strategy_text("STOP_LOSS_PIPS = 20\n", "view_me.py", "python")
+
+    client = app.test_client()
+    r = client.get("/strategies/view-code?strategy_type=python&filename=view_me.py")
+    assert r.status_code == 200
+    assert "STOP_LOSS_PIPS" in r.get_data(as_text=True)
+
+
+def test_view_saved_strategy_code_route_missing_file(tmp_path, monkeypatch):
+    from app.strategy import library
+
+    monkeypatch.setattr(library, "get_app_base_dir", lambda: tmp_path)
+    client = app.test_client()
+    r = client.get("/strategies/view-code?strategy_type=python&filename=nope.py")
+    assert r.status_code == 404
+
+
+def test_batch_test_route_produces_one_report_per_checked_strategy(tmp_path, monkeypatch):
+    from app.strategy import library
+
+    monkeypatch.setattr(library, "get_app_base_dir", lambda: tmp_path)
+    src = (
+        "STRATEGY_NAME = \"Web Batch Test\"\nEMA_FAST = 5\nEMA_SLOW = 15\n"
+        "STOP_LOSS_PIPS = 20\nTAKE_PROFIT_PIPS = 40\n\n"
+        "def generate_signals(df):\n"
+        "    fast = df[\"close\"].ewm(span=EMA_FAST, adjust=False).mean()\n"
+        "    slow = df[\"close\"].ewm(span=EMA_SLOW, adjust=False).mean()\n"
+        "    return (fast > slow).astype(int) - (fast < slow).astype(int)\n"
+    )
+    library.save_strategy_text(src, "web_batch_a.py", "python")
+    library.save_strategy_text(src, "web_batch_b.py", "python")
+
+    client = app.test_client()
+    sample_csv = Path(__file__).resolve().parent.parent / "data" / "examples" / "EURUSD_5M_sample.csv"
+    with open(sample_csv, "rb") as f:
+        data = {
+            "csv_file": (f, "EURUSD_5M_sample.csv"),
+            "batch_items": ["python::web_batch_a.py", "python::web_batch_b.py"],
+            "account_size": "100000", "profit_target": "8", "daily_loss": "5", "max_dd": "10",
+            "dd_type": "trailing", "consistency": "30", "min_days": "5", "payout_freq": "14",
+            "payout_threshold": "0", "buffer": "0", "payout_cap": "",
+            "initial_balance": "100000", "risk_mode": "percent", "risk_value": "1.0",
+            "max_trades_day": "10", "commission": "0", "slippage_pips": "0.5",
+            "spread_pips": "1.0", "pip_size": "0.0001",
+            "n_sims": "50", "mc_method": "bootstrap",
+        }
+        r = client.post("/strategies/batch-test", data=data, content_type="multipart/form-data")
+
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "Batch test results" in body
+    assert "web_batch_a.py" in body and "web_batch_b.py" in body
+
+    for f in REPORTS_DIR.glob("webbatch_*"):
+        f.unlink()

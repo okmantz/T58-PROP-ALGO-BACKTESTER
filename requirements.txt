@@ -6,6 +6,12 @@ alpaca-py>=0.33.0
 keyring>=24.0.0
 qrcode[pil]==8.2
 requests>=2.31.0
+# Research library (research/ folder) -- extracts text from PDF papers you
+# drop in there so the Ollama AI assist can be grounded in them. Optional
+# in spirit: if this isn't installed, PDF papers are silently skipped
+# (.txt/.md papers still work with no extra dependency at all) rather than
+# the app failing to start.
+pypdf>=4.0.0
 # Forward Test (MT5 Demo) tab only -- talks to a locally-running MT5
 # terminal, which only exists on Windows. Harmless to leave in on
 # other platforms: pip simply skips it there, and the Forward Test tab

@@ -59,6 +59,19 @@ def test_build_prompt_includes_failure_analysis_when_given():
     assert "20-30" in prompt
 
 
+def test_build_prompt_without_research_excerpts_has_no_research_section():
+    prompt = _build_prompt("Test", "python", _genes(), {}, {}, 2)
+    assert "research library" not in prompt.lower()
+
+
+def test_build_prompt_includes_research_excerpts_when_given():
+    excerpts = [{"source": "momentum.pdf", "text": "Momentum persists over 3-12 month horizons.", "score": 1.0}]
+    prompt = _build_prompt("Test", "python", _genes(), {}, {}, 2, research_excerpts=excerpts)
+    assert "research library" in prompt.lower()
+    assert "momentum.pdf" in prompt
+    assert "3-12 month" in prompt
+
+
 # ---------------------------------------------------------------------------
 # Response parsing
 # ---------------------------------------------------------------------------

@@ -77,8 +77,17 @@ from app.strategy.library import (
     list_all_markets, list_all_tags, list_misplaced_files, list_saved_strategies,
     load_strategy_text, record_backtest_result, record_lookahead_result, record_search_result,
     rename_saved_strategy, save_strategy_bytes, save_strategy_metadata,
-    save_strategy_path, set_strategy_status, set_strategy_tags,
+    save_strategy_path, save_strategy_text, set_strategy_status, set_strategy_tags, status_label,
 )
+
+# Display <-> storage-slug maps for the strategy status lifecycle (draft,
+# tested_failed, tested_passed, validated, ready_for_demo, ready_for_live)
+# -- built once from STRATEGY_STATUSES so every dropdown/listbox/badge
+# shows the same human-readable label ("TESTED / FAILED") while the file
+# on disk keeps the plain slug ("tested_failed").
+STATUS_KEY_TO_LABEL: dict[str, str] = {s: status_label(s) for s in STRATEGY_STATUSES}
+STATUS_LABEL_TO_KEY: dict[str, str] = {v: k for k, v in STATUS_KEY_TO_LABEL.items()}
+STATUS_LABELS_ORDERED: list[str] = [STATUS_KEY_TO_LABEL[s] for s in STRATEGY_STATUSES]
 from app.strategy.lookahead_check import check_for_lookahead
 from app.strategy.manual import ManualStrategy
 from app.strategy.mql5 import MQL5Strategy
@@ -899,13 +908,14 @@ class MainWindow:
         self.tab_forwardtest = Frame(self.content, bg=BG)
         self.tab_deploylive = Frame(self.content, bg=BG)
         self.tab_livemarket = Frame(self.content, bg=BG)
+        self.tab_genstrat = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
-            self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket,
+            self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket, self.tab_genstrat,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -943,6 +953,7 @@ class MainWindow:
 
             (None, None, "FINDING AN EDGE", None, None),
             ("ensemble", "", "14  Ensemble", self.tab_ensemble, NEON_MAGENTA),
+            ("genstrat", "", "Generate Strategies (AI)", self.tab_genstrat, NEON_MAGENTA),
 
             (None, None, "ALL-IN-ONE", None, None),
             ("fullpipeline", "", "15  Full Pipeline", self.tab_fullpipeline, NEON_AMBER),
@@ -973,6 +984,7 @@ class MainWindow:
         self._build_multiobj_tab()
         self._build_wfga_tab()
         self._build_ensemble_tab()
+        self._build_generate_strategies_tab()
         self._build_full_pipeline_tab()
         self._build_forward_test_tab()
         self._build_deploy_live_tab()
@@ -2878,7 +2890,7 @@ class MainWindow:
         self.strategy_filter_tag.combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_strategy_library())
 
         self.strategy_filter_status = LabeledCombo(
-            filter_row, "Browse status", ["All statuses", *STRATEGY_STATUSES], default="All statuses"
+            filter_row, "Browse status", ["All statuses", *STATUS_LABELS_ORDERED], default="All statuses"
         )
         self.strategy_filter_status.combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_strategy_library())
 
@@ -2999,14 +3011,26 @@ class MainWindow:
         queue_btn_row = Frame(queue_section, bg=PANEL)
         queue_btn_row.pack(anchor="w", padx=18, pady=(0, 4))
         self._button(
-            queue_btn_row, "REMOVE SELECTED FROM QUEUE", self._remove_selected_from_batch_queue
+            queue_btn_row, "LOAD SELECTED FROM QUEUE", self._load_selected_from_batch_queue, primary=True
         ).pack(side="left")
+        self._button(
+            queue_btn_row, "REMOVE SELECTED FROM QUEUE", self._remove_selected_from_batch_queue
+        ).pack(side="left", padx=8)
         self._button(
             queue_btn_row, "CLEAR QUEUE", self._clear_batch_queue
         ).pack(side="left", padx=8)
         self._button(
             queue_btn_row, "RUN BATCH TEST", self._run_batch_queue_clicked, primary=True
         ).pack(side="left")
+
+        Label(
+            queue_section, text="LOAD SELECTED FROM QUEUE puts one queued strategy into the "
+            "STRATEGY SOURCE slot above -- so 15 Full Pipeline, 06 Refinement, 08 Walk-Forward "
+            "Opt, 10 Sensitivity, and 12 Multi-Objective (which each only ever run against ONE "
+            "loaded strategy) can step through this same queue one at a time, instead of you "
+            "re-browsing/re-selecting for each one.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(4, 0))
 
         self.batch_queue_status = Label(
             queue_section, text="Queue is empty -- select strategies above and click "
@@ -3044,7 +3068,9 @@ class MainWindow:
         self.strategy_meta_description = LabeledEntry(meta_frame, "Description", "")
         self.strategy_meta_market = LabeledEntry(meta_frame, "Market / timeframe", "")
         self.strategy_meta_tags = LabeledEntry(meta_frame, "Tags (comma-separated)", "")
-        self.strategy_meta_status = LabeledCombo(meta_frame, "Status", list(STRATEGY_STATUSES), default="draft")
+        self.strategy_meta_status = LabeledCombo(
+            meta_frame, "Status", STATUS_LABELS_ORDERED, default=STATUS_KEY_TO_LABEL["draft"]
+        )
 
         self._button(
             meta_frame, "SAVE INFO TO SELECTED", self._save_selected_library_metadata
@@ -3346,7 +3372,7 @@ class MainWindow:
             query=query,
             market=None if market_filter in ("", "All markets") else market_filter,
             tag=None if tag_filter in ("", "All tags") else tag_filter,
-            status=None if status_filter in ("", "All statuses") else status_filter,
+            status=None if status_filter in ("", "All statuses") else STATUS_LABEL_TO_KEY.get(status_filter, status_filter),
         )
         for item in self._strategy_library_items:
             kb = item.size_bytes / 1024
@@ -3359,9 +3385,11 @@ class MainWindow:
                 badge = "  ✓clean"
             else:
                 badge = "  ⚠LOOKAHEAD"
+            idx = self.strategy_library_listbox.size()
             self.strategy_library_listbox.insert(
-                END, f"  [{item.status.upper()}]  {item.name}  ({kb:.1f} KB){badge}{suffix}"
+                END, f"  [{item.status_display}]  {item.name}  ({kb:.1f} KB){badge}{suffix}"
             )
+            self.strategy_library_listbox.itemconfig(idx, fg=self._status_color(item.status))
 
         d = get_strategy_library_dir(mode)
         total = len(list_saved_strategies(mode))
@@ -3396,6 +3424,20 @@ class MainWindow:
             )
         self._clear_strategy_metadata_panel()
 
+    def _status_color(self, status: str) -> str:
+        """Rough color cue for a strategy's lifecycle status, so it reads
+        at a glance in the library listbox instead of only via the text
+        label -- resolved at call time (not module load) since GREEN/RED/
+        AMBER/etc. are theme globals that apply_theme() can overwrite."""
+        return {
+            "draft": TEXT_DIM,
+            "tested_failed": RED,
+            "tested_passed": AMBER,
+            "validated": BLUE,
+            "ready_for_demo": GREEN,
+            "ready_for_live": GREEN,
+        }.get(status, TEXT_DIM)
+
     def _selected_library_item(self):
         """First selected item, for actions that only make sense on one at
         a time (load, rename, edit info)."""
@@ -3416,7 +3458,7 @@ class MainWindow:
             self.strategy_meta_description.var.set("")
             self.strategy_meta_market.var.set("")
             self.strategy_meta_tags.var.set("")
-            self.strategy_meta_status.var.set("draft")
+            self.strategy_meta_status.var.set(STATUS_KEY_TO_LABEL["draft"])
             self.strategy_meta_last_run.config(text="")
 
     def _on_library_selection_changed(self):
@@ -3433,7 +3475,7 @@ class MainWindow:
         self.strategy_meta_description.var.set(item.metadata.get("description", ""))
         self.strategy_meta_market.var.set(item.metadata.get("market", ""))
         self.strategy_meta_tags.var.set(", ".join(item.tags))
-        self.strategy_meta_status.var.set(item.status)
+        self.strategy_meta_status.var.set(item.status_display)
 
         lines = []
         last_run = item.metadata.get("last_run")
@@ -3462,21 +3504,49 @@ class MainWindow:
         })
         tags_raw = self.strategy_meta_tags.get_str().strip()
         set_strategy_tags(mode, item.name, [t.strip() for t in tags_raw.split(",")] if tags_raw else [])
-        set_strategy_status(mode, item.name, self.strategy_meta_status.get_str())
+        status_label_selected = self.strategy_meta_status.get_str()
+        set_strategy_status(mode, item.name, STATUS_LABEL_TO_KEY.get(status_label_selected, status_label_selected))
         self._refresh_strategy_library()
 
+    def _load_library_item_into_active_slot(self, item):
+        """Loads a StoredStrategy (from the main library list OR the Batch
+        test queue) into the single 'active strategy' slot at the top of
+        Step 02 Strategy -- the slot Full Pipeline (15), Refinement (06),
+        Walk-Forward Opt (08), Sensitivity (10), and Multi-Objective (12)
+        all read via _build_strategy(). Switches the STRATEGY SOURCE mode
+        too, so loading a PineScript item while Python is the active tab
+        still works -- that's what lets you step through a mixed-language
+        Batch test queue and run each one through those single-strategy
+        tabs without re-browsing for the file."""
+        if self.strategy_mode.get() != item.strategy_type:
+            self._set_strategy_mode(item.strategy_type)
+        self.strategy_py_path = str(item.path)
+        self._active_library_strategy = (item.strategy_type, item.name)
+        self.strategy_file_status.config(
+            text=f"Loaded from library: {item.name}  [{item.status_display}]",
+            fg=GREEN,
+        )
+
     def _load_selected_library_strategy(self):
-        mode = self.strategy_mode.get()
         item = self._selected_library_item()
         if item is None:
             messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
             return
-        self.strategy_py_path = str(item.path)
-        self._active_library_strategy = (mode, item.name)
-        self.strategy_file_status.config(
-            text=f"Loaded from library: {item.name}",
-            fg=GREEN,
-        )
+        self._load_library_item_into_active_slot(item)
+
+    def _load_selected_from_batch_queue(self):
+        """LOAD SELECTED FROM QUEUE -- picks the first highlighted row in
+        the Batch test queue and loads it into the top active-strategy
+        slot, so you can build the queue once and then step through it,
+        one strategy at a time, for Full Pipeline / Refinement /
+        Walk-Forward Opt / Sensitivity / Multi-Objective -- the
+        single-strategy tabs that RUN BATCH TEST doesn't cover."""
+        sel = list(self.batch_queue_listbox.curselection())
+        if not sel:
+            messagebox.showinfo("No selection", "Select a row in the Batch test queue below first.")
+            return
+        item = self._batch_queue[sel[0]]
+        self._load_library_item_into_active_slot(item)
 
     def _rename_selected_library_strategy(self):
         mode = self.strategy_mode.get()
@@ -3653,7 +3723,7 @@ class MainWindow:
                 continue
             self._batch_queue.append(item)
             existing.add(key)
-            self.batch_queue_listbox.insert(END, f"  [{item.strategy_type}] {item.name}")
+            self.batch_queue_listbox.insert(END, f"  [{item.strategy_type}] [{item.status_display}] {item.name}")
             added += 1
         self._refresh_batch_queue_status(added=added, skipped_dupe=skipped_dupe)
 
@@ -6641,6 +6711,184 @@ class MainWindow:
             self.ensemble_progress.stop()
 
     # -----------------------------------------------------------------------
+    # Generate Strategies (AI) -- draft new strategy code from a plain-
+    # language idea via a local Ollama model, grounded in research/ papers
+    # and your own best existing strategies. See
+    # app.ai.strategy_generator for the full safety rationale: every
+    # result lands in the library tagged DRAFT, never higher, and nothing
+    # here ever runs generated code automatically.
+    # -----------------------------------------------------------------------
+
+    def _build_generate_strategies_tab(self):
+        f = self._scrollable(self.tab_genstrat)
+        self._page_header(
+            f,
+            "Finding an Edge / AI",
+            "Generate Strategies",
+            "Drafts a NEW strategy's source code from a plain-language idea, using a local "
+            "Ollama model -- grounded in whatever papers you've dropped into the research/ "
+            "folder and in your own best-performing saved strategies of the same language, "
+            "so it matches this app's actual code style and constraints instead of guessing. "
+            "Every strategy this produces is saved tagged DRAFT and has to earn its way "
+            "through the normal backtest -> validation ladder like anything else -- nothing "
+            "is ever run automatically.",
+        )
+
+        warn = Frame(f, bg="#3A2E0E", highlightthickness=1, highlightbackground=AMBER)
+        warn.pack(fill="x", padx=24, pady=(0, 16))
+        Label(
+            warn, text="Read before using: a local model can write code that LOOKS reasonable "
+            "but has a lookahead bug, an unsupported PineScript/MQL5 construct, or exit logic "
+            "that silently never fires. Treat every generated strategy as a rough first draft, "
+            "not a finished one -- run it through 05 Run & Report and ideally 15 Full Pipeline "
+            "before trusting any of its numbers, exactly like a stranger's strategy you found "
+            "online.",
+            bg="#3A2E0E", fg=AMBER, font=_safe_font(9), wraplength=900, justify="left",
+        ).pack(anchor="w", padx=16, pady=12)
+
+        idea_section = self._section(
+            f, "Strategy idea",
+            "Describe entry/exit logic, indicators, market/timeframe, and anything else you "
+            "want reflected -- the more specific, the better the draft. Research excerpts and "
+            "your own prior strategies (if any exist yet for the chosen language) are added "
+            "automatically as grounding.",
+            emphasize=True,
+        )
+        self.genstrat_language = LabeledCombo(idea_section, "Language", list(STRATEGY_TYPES), "python")
+        self.genstrat_idea = Text(
+            idea_section, height=6, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.genstrat_idea.pack(fill="x", padx=18, pady=(4, 12))
+
+        self._build_ai_assist_section(f, prefix="genstrat_ai")
+
+        btn_row = Frame(f, bg=BG)
+        btn_row.pack(fill="x", padx=24, pady=(2, 10))
+        self.genstrat_run_btn = self._button(btn_row, "GENERATE DRAFT", self._genstrat_generate_clicked, primary=True)
+        self.genstrat_run_btn.pack(side="left")
+        self.genstrat_progress = NeuralProgress(f)
+        self.genstrat_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Generated code", "Nothing has been saved yet -- review it below first.")
+        self.genstrat_filename = LabeledEntry(output_section, "Filename (no extension)", "")
+        self.genstrat_output = Text(
+            output_section, height=22, wrap="none", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.genstrat_output.pack(fill="both", expand=True, padx=18, pady=(3, 10))
+
+        out_btn_row = Frame(output_section, bg=PANEL)
+        out_btn_row.pack(anchor="w", padx=18, pady=(0, 6))
+        self.genstrat_save_btn = self._button(
+            out_btn_row, "SAVE TO LIBRARY AS DRAFT", self._genstrat_save_clicked, primary=True
+        )
+        self.genstrat_save_btn.config(state="disabled")
+        self.genstrat_save_btn.pack(side="left")
+        Label(
+            output_section, text="Saved strategies land in the Strategy Library (02 Strategy) tagged "
+            "DRAFT -- open that tab, LOAD SELECTED (or ADD TO BATCH QUEUE), and run it through "
+            "05 Run & Report / 15 Full Pipeline like anything else before trusting it.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=900, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 12))
+
+        self.genstrat_status = Label(
+            f, text="", bg=BG, fg=TEXT_DIM, font=_safe_font(9), wraplength=900, justify="left",
+        )
+        self.genstrat_status.pack(anchor="w", padx=26, pady=(0, 20))
+
+        self._genstrat_last_result = None
+
+    def _genstrat_generate_clicked(self):
+        idea = self.genstrat_idea.get("1.0", END).strip()
+        if not idea:
+            messagebox.showinfo("Describe the idea first", "Type a strategy idea in the box above first.")
+            return
+        language = self.genstrat_language.get_str()
+        settings = self._build_ollama_settings(prefix="genstrat_ai")
+        if not settings.is_usable:
+            messagebox.showwarning(
+                "Ollama not enabled",
+                "Turn on 'Enable AI Assist for this run' above (and confirm TEST CONNECTION works) first.",
+            )
+            return
+        self.genstrat_output.delete("1.0", END)
+        self.genstrat_filename.var.set("")
+        self.genstrat_save_btn.config(state="disabled")
+        self.genstrat_status.config(text="Generating... this can take a while on a local model.", fg=AMBER)
+        self.genstrat_run_btn.config(state="disabled")
+        self.genstrat_progress.start(10)
+        threading.Thread(target=self._genstrat_run, args=(settings, language, idea), daemon=True).start()
+
+    def _genstrat_run(self, settings, language, idea):
+        from app.ai.strategy_generator import generate_strategy
+
+        try:
+            result = generate_strategy(settings, language, idea)
+        except Exception as exc:
+            result = None
+            error = f"Unexpected error: {exc}"
+        else:
+            error = result.error
+
+        def _finish():
+            self.genstrat_progress.stop()
+            self.genstrat_run_btn.config(state="normal")
+            if result is None or result.code is None:
+                self.genstrat_status.config(text=error or "Generation failed.", fg=RED)
+                return
+            self._genstrat_last_result = result
+            self.genstrat_output.insert("1.0", result.code)
+            self.genstrat_filename.var.set(result.filename_hint or "generated_strategy")
+            self.genstrat_save_btn.config(state="normal")
+            self.genstrat_status.config(
+                text="Draft generated -- review the code below (it is NOT saved or tested yet), "
+                "then SAVE TO LIBRARY AS DRAFT when you're ready.",
+                fg=GREEN,
+            )
+
+        try:
+            self.root.after(0, _finish)
+        except Exception:
+            pass
+
+    def _genstrat_save_clicked(self):
+        if self._genstrat_last_result is None or not self._genstrat_last_result.code:
+            return
+        language = self.genstrat_language.get_str()
+        filename_stem = self.genstrat_filename.get_str().strip() or self._genstrat_last_result.filename_hint or "generated_strategy"
+        filename_stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", filename_stem).strip("_") or "generated_strategy"
+        ext = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}[language]
+        filename = f"{filename_stem}{ext}"
+        # Whatever's currently in the text box wins -- lets you hand-edit
+        # the draft before saving without re-generating.
+        code_text = self.genstrat_output.get("1.0", END).rstrip("\n")
+        try:
+            saved_path = self._save_to_library_with_overwrite_prompt(
+                lambda overwrite: save_strategy_text(code_text, filename, language, overwrite=overwrite),
+                fallback_path=Path(filename),
+            )
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        if saved_path is None:
+            return
+        # Always DRAFT, regardless of anything else -- see
+        # app.ai.strategy_generator's module docstring for why an
+        # AI-generated strategy is never allowed to start higher than this.
+        try:
+            set_strategy_status(language, saved_path.name, "draft")
+            save_strategy_metadata(language, saved_path.name, {
+                "description": f"AI-drafted from idea: {self.genstrat_idea.get('1.0', END).strip()[:200]}",
+            })
+        except Exception:
+            pass
+        self.genstrat_status.config(
+            text=f"Saved as {saved_path.name}  [DRAFT]. Open 02 Strategy to load and test it.", fg=GREEN,
+        )
+        self._refresh_strategy_library()
+
+    # -----------------------------------------------------------------------
     # Tab 15 — Full Pipeline (run everything, hand back the champion)
     # -----------------------------------------------------------------------
 
@@ -6658,9 +6906,10 @@ class MainWindow:
             "Carlo, checks it holds up across several distinct historical stretches with "
             "no further re-tuning, and produces one final report with a plain READY / "
             "MARGINAL / NOT READY verdict. For Python/PineScript/MQL5 strategies, the "
-            "winning source is also saved straight into the Strategy Library, tagged "
-            "'validated', ready to use. Uses the strategy, data, prop rules, and risk "
-            "settings already configured in Steps 01-04.",
+            "winning source is also saved straight into the Strategy Library, auto-tagged "
+            "TESTED / PASSED, VALIDATED, or TESTED / FAILED based on that verdict (or "
+            "whatever fixed status you pick below), ready to use. Uses the strategy, data, "
+            "prop rules, and risk settings already configured in Steps 01-04.",
         )
 
         settings = self._section(
@@ -6692,8 +6941,13 @@ class MainWindow:
         self.fp_save_to_library = LabeledCheckbox(
             library_section, "Save the winning strategy to the Strategy Library when finished", True,
         )
+        _AUTO_STATUS_LABEL = "Auto (based on READY / MARGINAL / NOT READY verdict)"
+        self._fp_status_label_to_key = {_AUTO_STATUS_LABEL: None}
+        self._fp_status_label_to_key.update({status_label(s): s for s in STRATEGY_STATUSES})
         self.fp_library_status = LabeledCombo(
-            library_section, "Status to tag it with", list(STRATEGY_STATUSES), "validated",
+            library_section, "Status to tag it with",
+            [_AUTO_STATUS_LABEL] + [status_label(s) for s in STRATEGY_STATUSES],
+            _AUTO_STATUS_LABEL,
         )
 
         self._build_ai_assist_section(f)
@@ -6725,7 +6979,7 @@ class MainWindow:
 
         self._last_fullpipeline_html_path = None
 
-    def _build_ai_assist_section(self, parent):
+    def _build_ai_assist_section(self, parent, prefix: str = "ai"):
         """Optional local-Ollama AI assistant (see app.ai.ollama_client):
         off by default and everywhere. When enabled, Step 2's search asks
         a local Ollama model for candidate parameter values once per
@@ -6736,7 +6990,15 @@ class MainWindow:
         backtest/prop-sim/Monte Carlo evaluation as any other candidate.
         Any failure to reach Ollama (not running, wrong host, model not
         pulled) degrades silently to the search running exactly as if
-        this were disabled."""
+        this were disabled.
+
+        `prefix` namespaces the widget attributes (e.g. "genstrat_ai" ->
+        self.genstrat_ai_enabled) so more than one tab can each have its
+        own independent copy of this section without colliding -- the
+        Generate Strategies tab uses this for actual code generation
+        (see app.ai.strategy_generator), a materially different, riskier
+        use of the same underlying Ollama connection than the numeric-only
+        parameter suggestions this section was originally written for."""
         section = self._section(
             parent, "AI Assist (optional, local Ollama)",
             "Off by default. When enabled, a local Ollama model suggests parameter values "
@@ -6747,42 +7009,59 @@ class MainWindow:
             "anywhere except to the host you configure below.",
         )
         saved = ollama_settings_module.load_settings()
-        self.ai_enabled = LabeledCheckbox(section, "Enable AI Assist for this run", saved.enabled)
-        self.ai_host = LabeledEntry(section, "Ollama host", saved.host)
-        self.ai_model = LabeledEntry(section, "Model (must already be pulled, e.g. `ollama pull llama3.1`)", saved.model)
-        self.ai_api_key = LabeledEntry(section, "API key (optional -- only for a remote/proxied Ollama)", saved.api_key, secret=True)
+        setattr(self, f"{prefix}_enabled", LabeledCheckbox(section, "Enable AI Assist for this run", saved.enabled))
+        setattr(self, f"{prefix}_host", LabeledEntry(section, "Ollama host", saved.host))
+        setattr(self, f"{prefix}_model", LabeledEntry(
+            section, "Model (must already be pulled, e.g. `ollama pull llama3.1`)", saved.model,
+        ))
+        setattr(self, f"{prefix}_api_key", LabeledEntry(
+            section, "API key (optional -- only for a remote/proxied Ollama)", saved.api_key, secret=True,
+        ))
 
         btn_row = Frame(section, bg=PANEL)
         btn_row.pack(anchor="w", padx=18, pady=(2, 8))
-        self.ai_test_btn = self._button(btn_row, "TEST CONNECTION", self._test_ollama_connection, primary=True)
-        self.ai_test_btn.pack(side="left")
-        self.ai_status = Label(section, text="", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left")
-        self.ai_status.pack(anchor="w", padx=18, pady=(0, 12))
+        test_btn = self._button(btn_row, "TEST CONNECTION", lambda: self._test_ollama_connection(prefix), primary=True)
+        test_btn.pack(side="left")
+        setattr(self, f"{prefix}_test_btn", test_btn)
+        status = Label(section, text="", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left")
+        status.pack(anchor="w", padx=18, pady=(0, 12))
+        setattr(self, f"{prefix}_status", status)
 
-    def _build_ollama_settings(self) -> "OllamaSettings":
+    def _build_ollama_settings(self, prefix: str = "ai") -> "OllamaSettings":
         settings = OllamaSettings(
-            enabled=self.ai_enabled.get(),
-            host=self.ai_host.get_str().strip() or ollama_settings_module.DEFAULT_HOST,
-            model=self.ai_model.get_str().strip() or ollama_settings_module.DEFAULT_MODEL,
-            api_key=self.ai_api_key.get_str().strip(),
+            enabled=getattr(self, f"{prefix}_enabled").get(),
+            host=getattr(self, f"{prefix}_host").get_str().strip() or ollama_settings_module.DEFAULT_HOST,
+            model=getattr(self, f"{prefix}_model").get_str().strip() or ollama_settings_module.DEFAULT_MODEL,
+            api_key=getattr(self, f"{prefix}_api_key").get_str().strip(),
         )
         ollama_settings_module.save_settings(settings)
         return settings
 
-    def _test_ollama_connection(self):
+    def _test_ollama_connection(self, prefix: str = "ai"):
         from app.ai.ollama_client import OllamaClient
 
-        settings = self._build_ollama_settings()
-        self.ai_test_btn.config(state="disabled")
-        self.ai_status.config(text="Testing connection...", fg=AMBER)
+        settings = self._build_ollama_settings(prefix)
+        test_btn = getattr(self, f"{prefix}_test_btn")
+        status = getattr(self, f"{prefix}_status")
+        test_btn.config(state="disabled")
+        status.config(text="Testing connection...", fg=AMBER)
 
         def run():
             try:
                 ok, message = OllamaClient(settings).test_connection()
             except Exception as exc:
                 ok, message = False, f"Unexpected error: {exc}"
-            self.ai_status.config(text=message, fg=GREEN if ok else RED)
-            self.ai_test_btn.config(state="normal")
+
+            def _finish():
+                status.config(text=message, fg=GREEN if ok else RED)
+                test_btn.config(state="normal")
+
+            # Runs on a background thread -- Tkinter widgets are only safe
+            # to touch from the main thread, so hand the update back to it.
+            try:
+                self.root.after(0, _finish)
+            except Exception:
+                pass
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -6826,7 +7105,7 @@ class MainWindow:
                 oos_check_folds=self.fp_folds.get_int(4),
                 random_seed=self.fp_seed.get_int(42),
                 save_to_library=self.fp_save_to_library.var.get(),
-                library_status=self.fp_library_status.get_str(),
+                library_status=self._fp_status_label_to_key.get(self.fp_library_status.get_str()),
             )
 
             self._log_fullpipeline(f"Starting Full Pipeline for '{_strategy_display_name(strategy)}'...\n")
@@ -7340,15 +7619,34 @@ class MainWindow:
             emphasize=True,
         )
 
-        self.lm_source = LabeledCombo(section, "Source", ["mt5", "alpaca", "replay"], "mt5")
-        self.lm_source.combo.bind("<<ComboboxSelected>>", lambda _e: self._lm_sync_source_fields())
-        self.lm_symbol = LabeledEntry(section, "Symbol (MT5 / Alpaca)", "XAUUSD")
+        # Pick a sane default source instead of always defaulting to "mt5"
+        # -- this mirrors the exact fallback the Flask page itself uses
+        # (see live_market_page() in app/web/server.py), which used to
+        # only ever kick in when NO source was passed in the URL at all.
+        # Since OPEN LIVE CHART always sent an explicit source= param, an
+        # un-configured MT5 (the common case -- MT5 needs Windows + a
+        # running terminal) meant every click silently requested MT5 data,
+        # which fails with an empty bar list and a permanently blank chart
+        # (status badge stuck on UNAVAILABLE) -- with no error, indistin-
+        # guishable from the chart "just not opening".
         try:
             saved_mt5 = mt5_settings_module.load_settings()
-            if saved_mt5.is_usable:
-                self.lm_symbol.var.set(saved_mt5.symbol)
         except Exception:
-            pass
+            saved_mt5 = None
+        mt5_usable = bool(
+            saved_mt5 is not None and saved_mt5.is_usable and mt5_connector_module.is_available()
+        )
+        try:
+            has_alpaca = bool(alpaca_credentials.load_credentials())
+        except Exception:
+            has_alpaca = False
+        default_source = "mt5" if mt5_usable else ("alpaca" if has_alpaca else "replay")
+
+        self.lm_source = LabeledCombo(section, "Source", ["mt5", "alpaca", "replay"], default_source)
+        self.lm_source.combo.bind("<<ComboboxSelected>>", lambda _e: self._lm_sync_source_fields())
+        self.lm_symbol = LabeledEntry(section, "Symbol (MT5 / Alpaca)", "XAUUSD")
+        if saved_mt5 is not None and saved_mt5.is_usable:
+            self.lm_symbol.var.set(saved_mt5.symbol)
         self.lm_timeframe = LabeledCombo(
             section, "Timeframe (minutes)", [str(m) for m in (1, 5, 15, 30, 60, 240, 1440)], "15",
         )
@@ -7359,11 +7657,9 @@ class MainWindow:
             status_lines.append("MT5 package: available.")
         else:
             status_lines.append("MT5 package: not available on this platform (Windows + MT5 terminal required).")
-        try:
-            has_alpaca = bool(alpaca_credentials.load_credentials())
-        except Exception:
-            has_alpaca = False
         status_lines.append(f"Alpaca keys saved: {'yes' if has_alpaca else 'no (set them on the 01 DATA tab)'}.")
+        status_lines.append(f"Source defaulted to '{default_source}' based on what's actually configured above -- "
+                             "switch it manually any time.")
         Label(
             section, text="  •  ".join(status_lines), bg=PANEL, fg=TEXT_MUTED,
             font=_safe_font(8), wraplength=820, justify="left",
@@ -7474,8 +7770,18 @@ class MainWindow:
         if self._lm_open_in_native_window(url):
             self.lm_status.config(text="Opened in a live chart window.", fg=GREEN)
         else:
-            webbrowser.open(url)
-            self.lm_status.config(text=f"Opened in your browser: {url}", fg=GREEN)
+            opened = webbrowser.open(url)
+            if opened:
+                self.lm_status.config(text=f"Opened in your browser: {url}", fg=GREEN)
+            else:
+                # webbrowser.open() returning False means it couldn't find/launch
+                # anything -- previously this branch showed "Opened in your
+                # browser" regardless, which looked exactly like "nothing
+                # happened" with no indication of why. Surface the URL instead
+                # so it can be opened by hand.
+                self.lm_status.config(
+                    text=f"Couldn't auto-launch a browser -- open this URL manually: {url}", fg=AMBER,
+                )
 
     # -----------------------------------------------------------------------
     # Tab 18 — Deploy Live

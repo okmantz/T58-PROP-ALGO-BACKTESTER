@@ -55,9 +55,12 @@ it:
 
 ## What's actually in this folder
 
-Nothing is bundled here by default -- this is intentionally empty aside
-from this README until you add your own papers. Good candidates: papers
-on momentum/mean-reversion/trend-following mechanics, market
+Included are research papers covering everything from validation and 
+over-fitting, to different strategies and prop firm economics. The
+sources included are all verified research papers from validated sources
+such as the Federal Reserve, ICMA Centre, and other University research centers.
+
+Other good candidates: papers on momentum/mean-reversion/trend-following mechanics, market
 microstructure, walk-forward validation and overfitting (the kind of
 thing already referenced in `app/validation/icir.py`'s docstrings),
 volatility regime detection, or anything specific to the instruments and

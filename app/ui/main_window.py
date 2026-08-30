@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import webbrowser
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -47,6 +48,8 @@ from app.forward_test.mt5_settings import MT5Settings
 from app.forward_test import mt5_connector as mt5_connector_module
 from app.forward_test.journal import ForwardTestJournal
 from app.forward_test.engine import ForwardTestConfig, ForwardTestSession
+from app.live_deploy import prop_firms as live_deploy_prop_firms
+from app.live_deploy import live_settings as live_deploy_settings
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.parameter_space import RefinementError, apply_genome, extract_genome
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_iterative_refinement
@@ -84,6 +87,7 @@ from app.ui.condition_builder import ConditionList
 from app.validation.cpcv import CPCVError, compute_pbo, run_cpcv
 from app.validation.sensitivity import compute_1d_sensitivity, compute_2d_heatmap, list_tunable_parameters
 from app.validation.walk_forward_opt import run_walk_forward_optimization
+from app.web import live_market
 import random
 
 OUTPUT_DIR = Path.cwd() / "reports"
@@ -872,13 +876,15 @@ class MainWindow:
         self.tab_ensemble = Frame(self.content, bg=BG)
         self.tab_fullpipeline = Frame(self.content, bg=BG)
         self.tab_forwardtest = Frame(self.content, bg=BG)
+        self.tab_livemarket = Frame(self.content, bg=BG)
+        self.tab_deploylive = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
-            self.tab_forwardtest,
+            self.tab_forwardtest, self.tab_livemarket, self.tab_deploylive,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -906,6 +912,8 @@ class MainWindow:
             ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline, NEON_AMBER),
             (None, None, None, None, None),  # divider — going live
             ("forwardtest", "\u25D4", "16  LIVE DEMO TEST", self.tab_forwardtest, NEON_LIME),
+            ("livemarket", "\u25CF", "17  LIVE MARKET", self.tab_livemarket, NEON_CYAN),
+            ("deploylive", "\u26A0", "18  DEPLOY LIVE", self.tab_deploylive, RED),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -930,6 +938,8 @@ class MainWindow:
         self._build_ensemble_tab()
         self._build_full_pipeline_tab()
         self._build_forward_test_tab()
+        self._build_live_market_tab()
+        self._build_deploy_live_tab()
 
         self._show_page("dashboard")
 
@@ -6788,9 +6798,465 @@ class MainWindow:
         self.ft_kill_btn.config(state="disabled")
         self.ft_progress.stop()
 
+    # -----------------------------------------------------------------------
+    # Tab 17 — Live Market
+    # -----------------------------------------------------------------------
+
+    def _build_live_market_tab(self):
+        f = self._scrollable(self.tab_livemarket)
+        self._page_header(
+            f,
+            "17 / Live Market",
+            "Live Market",
+            "A real-time-style candlestick chart -- candlesticks, volume, EMA 20/50, VWAP, a "
+            "crosshair OHLC readout, and trade markers from your Live Demo Test sessions -- "
+            "powered by TradingView's Lightweight Charts. This runs in your normal web browser: "
+            "this app starts a small local server on your own machine (nothing leaves it) and "
+            "opens a browser tab pointed at it, since Tkinter has no way to run real JavaScript "
+            "charts itself.",
+        )
+
+        section = self._section(
+            f, "Data source",
+            "Live (MT5) is used automatically when your Live Demo Test MT5 account is "
+            "configured; Alpaca is used if you've saved API keys on the Data tab; with neither, "
+            "the chart replays an already-imported local CSV bar by bar so there's always "
+            "something real on screen.",
+            emphasize=True,
+        )
+
+        self.lm_source = LabeledCombo(section, "Source", ["mt5", "alpaca", "replay"], "mt5")
+        self.lm_source.combo.bind("<<ComboboxSelected>>", lambda _e: self._lm_sync_source_fields())
+        self.lm_symbol = LabeledEntry(section, "Symbol (MT5 / Alpaca)", "XAUUSD")
+        try:
+            saved_mt5 = mt5_settings_module.load_settings()
+            if saved_mt5.is_usable:
+                self.lm_symbol.var.set(saved_mt5.symbol)
+        except Exception:
+            pass
+        self.lm_timeframe = LabeledCombo(
+            section, "Timeframe (minutes)", [str(m) for m in (1, 5, 15, 30, 60, 240, 1440)], "15",
+        )
+        self.lm_dataset = LabeledCombo(section, "Dataset (Replay only)", [""], "")
+
+        status_lines = []
+        if mt5_connector_module.is_available():
+            status_lines.append("MT5 package: available.")
+        else:
+            status_lines.append("MT5 package: not available on this platform (Windows + MT5 terminal required).")
+        try:
+            has_alpaca = bool(alpaca_credentials.load_credentials())
+        except Exception:
+            has_alpaca = False
+        status_lines.append(f"Alpaca keys saved: {'yes' if has_alpaca else 'no (set them on the 01 DATA tab)'}.")
+        Label(
+            section, text="  •  ".join(status_lines), bg=PANEL, fg=TEXT_MUTED,
+            font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        btn_row = Frame(section, bg=PANEL)
+        btn_row.pack(anchor="w", padx=18, pady=(0, 14))
+        self._button(btn_row, "REFRESH DATASETS", self._lm_refresh_datasets).pack(side="left")
+        self.lm_open_btn = self._button(btn_row, "OPEN LIVE CHART", self._lm_open_chart, primary=True)
+        self.lm_open_btn.pack(side="left", padx=8)
+
+        self.lm_status = Label(
+            f, text="Not started yet -- click OPEN LIVE CHART.", bg=BG, fg=TEXT_MUTED,
+            font=_safe_font(9), wraplength=900, justify="left",
+        )
+        self.lm_status.pack(anchor="w", padx=26, pady=(4, 20))
+
+        self._lm_refresh_datasets()
+        self._lm_sync_source_fields()
+
+    def _lm_sync_source_fields(self):
+        is_replay = self.lm_source.get_str() == "replay"
+        state = "disabled" if is_replay else "normal"
+        self.lm_symbol.entry.config(state=state)
+
+    def _lm_refresh_datasets(self):
+        try:
+            names = live_market.list_replay_datasets()
+        except Exception:
+            names = []
+        self.lm_dataset.combo.config(values=names or [""])
+        if names:
+            self.lm_dataset.var.set(names[0])
+
+    def _lm_ensure_server(self) -> int:
+        if getattr(self, "_lm_port", None):
+            return self._lm_port
+        import socket
+
+        from werkzeug.serving import make_server
+
+        from app.web.server import app as flask_app
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        server = make_server("127.0.0.1", port, flask_app, threaded=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self._lm_port = port
+        self._lm_server = server
+        return port
+
+    def _lm_open_chart(self):
+        self.lm_status.config(text="Starting local server...", fg=AMBER)
+        self.root.update_idletasks()
+        try:
+            port = self._lm_ensure_server()
+        except Exception as exc:
+            self.lm_status.config(text=f"Couldn't start the local server: {exc}", fg=RED)
+            return
+
+        source = self.lm_source.get_str()
+        symbol = self.lm_dataset.get_str() if source == "replay" else self.lm_symbol.get_str().strip()
+        if not symbol:
+            self.lm_status.config(text="Enter a symbol (or pick a dataset for Replay) first.", fg=AMBER)
+            return
+        params = urllib.parse.urlencode({
+            "source": source, "symbol": symbol, "timeframe": self.lm_timeframe.get_str(),
+            "theme": CURRENT_THEME,
+        })
+        url = f"http://127.0.0.1:{port}/live-market?{params}"
+        webbrowser.open(url)
+        self.lm_status.config(text=f"Opened in your browser: {url}", fg=GREEN)
+
+    # -----------------------------------------------------------------------
+    # Tab 18 — Deploy Live
+    # -----------------------------------------------------------------------
+
+    def _build_deploy_live_tab(self):
+        f = self._scrollable(self.tab_deploylive)
+        self._page_header(
+            f,
+            "18 / Going Live For Real",
+            "Deploy Live",
+            "Connect a validated strategy directly to a real, funded prop-firm account for "
+            "automated live trading -- no manual clicking required once it's running.",
+        )
+
+        warn_wrap = Frame(f, bg="#3A0E14", highlightthickness=1, highlightbackground=RED)
+        warn_wrap.pack(fill="x", padx=24, pady=(0, 16))
+        Label(
+            warn_wrap, text="⚠  THIS TRADES REAL MONEY -- READ BEFORE CONNECTING ANY ACCOUNT",
+            bg="#3A0E14", fg="#FF8FA0", font=_safe_font(10, "bold"),
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+        Label(
+            warn_wrap,
+            text="This is not the same as 16 LIVE DEMO TEST. An account connected here places real "
+                 "orders against real capital in a live or funded prop-firm account. Before using this:\n"
+                 "  1) Confirm your prop firm's rules actually PERMIT automated/EA trading on this "
+                 "account -- many firms restrict or ban certain automation, and violating that can get "
+                 "a funded account terminated regardless of performance.\n"
+                 "  2) Validate the strategy thoroughly first (15 FULL PIPELINE) and run it on 16 LIVE "
+                 "DEMO TEST for a meaningful stretch before ever pointing this at real capital.\n"
+                 "  3) Never share account credentials anywhere else -- this app stores the password "
+                 "locally via your OS's secure credential store (the same mechanism as the Live Demo "
+                 "Test tab), the same way, for this reason.\n"
+                 "  4) Start with the smallest account/position size your firm allows.",
+            bg="#3A0E14", fg="#F0C7CC", font=_safe_font(8), wraplength=900, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 14))
+
+        # ---- How this actually connects to a prop firm ---------------------
+        info_section = self._section(
+            f, "How this connects to a prop firm -- read this first",
+            "",
+            emphasize=True,
+        )
+        Label(
+            info_section,
+            text="There is no single universal \"prop firm API\" this app can plug into -- each firm "
+                 "provides one of a small number of trading platforms for its funded accounts, and this "
+                 "app connects the same way a human trader using that platform would:\n\n"
+                 "  •  MT4 / MT5 (by far the most common) -- the exact same connection this app already "
+                 "uses for 16 LIVE DEMO TEST, just pointed at your live/funded login instead of a demo "
+                 "one. This is the only path fully wired up below today.\n"
+                 "  •  cTrader (a growing number of firms) -- cTrader has its own Open API (OAuth-based, "
+                 "different from MT5 entirely). Not implemented yet -- see the note below.\n"
+                 "  •  DXtrade / Match-Trader / proprietary platforms -- each would need its own "
+                 "integration; none are implemented yet.\n\n"
+                 "Practically: if your prop firm gives you an MT5 login for your funded account (most "
+                 "do), you can connect it below today. If they use cTrader or something else, that "
+                 "account isn't supported yet -- let me know which platform your firm uses and that's "
+                 "the next one to wire up.",
+            bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9), wraplength=900, justify="left",
+        ).pack(anchor="w", padx=18, pady=(2, 14))
+
+        # ---- Saved live accounts --------------------------------------------
+        accounts_section = self._section(
+            f, "Live prop-firm accounts",
+            "Each saved account remembers its prop firm, platform, and login -- the password is "
+            "stored the same secure way as the Live Demo Test tab (OS keyring), never in plain text.",
+            emphasize=True,
+        )
+
+        list_frame = Frame(accounts_section, bg=PANEL)
+        list_frame.pack(fill="both", padx=18, pady=(2, 8))
+        self.dl_accounts_listbox = Listbox(
+            list_frame, height=6, selectmode=SINGLE, exportselection=False,
+            bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+            font=(MONO, 9),
+        )
+        self.dl_accounts_listbox.pack(side="left", fill="both", expand=True)
+        dl_scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.dl_accounts_listbox.yview, style="T58.Vertical.TScrollbar",
+        )
+        dl_scrollbar.pack(side="right", fill="y")
+        self.dl_accounts_listbox.config(yscrollcommand=dl_scrollbar.set)
+        self.dl_accounts_listbox.bind("<<ListboxSelect>>", self._dl_on_account_selected)
+
+        list_btn_row = Frame(accounts_section, bg=PANEL)
+        list_btn_row.pack(anchor="w", padx=18, pady=(0, 14))
+        self._button(list_btn_row, "DELETE SELECTED", self._dl_delete_account).pack(side="left")
+
+        # ---- Add / edit an account -------------------------------------------
+        add_section = self._section(
+            f, "Add / edit an account",
+            "Pick your prop firm (or Other) and platform, then enter the login details from your "
+            "firm's account-issued email or dashboard.",
+            emphasize=True,
+        )
+
+        firm_names = [firm.name for firm in live_deploy_prop_firms.PROP_FIRMS]
+        self.dl_firm = LabeledCombo(add_section, "Prop firm", firm_names, firm_names[0] if firm_names else "Other")
+        self.dl_firm.combo.bind("<<ComboboxSelected>>", lambda _e: self._dl_on_firm_changed())
+        self.dl_platform = LabeledCombo(
+            add_section, "Platform",
+            ["MT5", "MT4", "cTrader (not yet supported)", "Tradovate (not yet supported)",
+             "Rithmic (not yet supported)", "NinjaTrader (not yet supported)", "Other (not yet supported)"],
+            "MT5",
+        )
+        self.dl_nickname = LabeledEntry(add_section, "Account nickname (yours, e.g. 'FTMO 100k #1')", "")
+        self.dl_login = LabeledEntry(add_section, "Login / account number", "")
+        self.dl_server = LabeledEntry(add_section, "Server (from your firm's account email)", "")
+        self.dl_password = LabeledEntry(add_section, "Password", "", secret=True)
+        self.dl_terminal_path = LabeledEntry(add_section, "Terminal path (optional, only if auto-detect fails)", "")
+
+        firm_note_row = Frame(add_section, bg=PANEL)
+        firm_note_row.pack(anchor="w", padx=18, pady=(0, 8))
+        self.dl_firm_note = Label(
+            firm_note_row, text="", bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        )
+        self.dl_firm_note.pack(anchor="w")
+
+        confirm_row = Frame(add_section, bg=PANEL)
+        confirm_row.pack(anchor="w", padx=18, pady=(2, 4))
+        self.dl_confirm_var = BooleanVar(value=False)
+        Checkbutton(
+            confirm_row, variable=self.dl_confirm_var, bg=PANEL, activebackground=PANEL,
+            selectcolor=PANEL_3, highlightthickness=0,
+            text="I understand this account will trade with real capital, and I've confirmed my prop "
+                 "firm permits automated trading on it.",
+            fg=TEXT_MUTED, font=_safe_font(8), wraplength=780, justify="left", anchor="w",
+        ).pack(anchor="w")
+
+        add_btn_row = Frame(add_section, bg=PANEL)
+        add_btn_row.pack(anchor="w", padx=18, pady=(8, 14))
+        self._button(add_btn_row, "SAVE ACCOUNT", self._dl_save_account, primary=True).pack(side="left")
+        self._button(add_btn_row, "AUTO-DETECT TERMINAL", self._dl_auto_detect_terminal).pack(side="left", padx=8)
+        self._button(add_btn_row, "BROWSE...", self._dl_browse_terminal).pack(side="left")
+
+        # ---- Connect + deploy -------------------------------------------------
+        deploy_section = self._section(
+            f, "Connect and deploy",
+            "Same underlying engine as 16 LIVE DEMO TEST -- pick a saved account above, pick a "
+            "validated strategy from the Strategy Library, and start. The kill switch works "
+            "identically.",
+            emphasize=True,
+        )
+        self.dl_strategy_combo = LabeledCombo(deploy_section, "Strategy (from Strategy Library)", [""], "")
+        deploy_btn_row = Frame(deploy_section, bg=PANEL)
+        deploy_btn_row.pack(anchor="w", padx=18, pady=(6, 6))
+        self._button(deploy_btn_row, "TEST CONNECTION", self._dl_test_connection).pack(side="left")
+        self.dl_start_btn = self._button(deploy_btn_row, "START LIVE TRADING", self._dl_start_clicked, primary=True)
+        self.dl_start_btn.pack(side="left", padx=8)
+        self.dl_start_btn.config(state="disabled")
+        self.dl_kill_btn = self._button(deploy_btn_row, "KILL SWITCH — FLATTEN & STOP", self._dl_kill_clicked)
+        self.dl_kill_btn.config(state="disabled", fg="#FF8FA0")
+
+        self.dl_status = Label(
+            deploy_section, text="Not implemented yet: live order placement is scaffolded but disabled "
+                                 "pending your go-ahead -- see the note in CHANGES_SUMMARY.",
+            bg=PANEL, fg=AMBER, font=_safe_font(9), wraplength=900, justify="left",
+        )
+        self.dl_status.pack(anchor="w", padx=18, pady=(2, 16))
+
+        self._dl_accounts: list = []
+        self._dl_editing_id: str | None = None
+        self._dl_refresh_accounts()
+        self._dl_on_firm_changed()
+        self._dl_refresh_strategy_list()
+
+    def _dl_on_firm_changed(self):
+        name = self.dl_firm.get_str()
+        firm = live_deploy_prop_firms.find(name)
+        if firm is None:
+            self.dl_firm_note.config(text="")
+            return
+        connectable_note = (
+            "" if firm.connectable_today else
+            " ⚠ None of this firm's platforms are supported by this app yet -- you can save the "
+            "account details below, but connecting/trading won't work until that platform is added."
+        )
+        self.dl_firm_note.config(
+            text=f"Platform(s): {', '.join(firm.platforms)}. {firm.notes}{connectable_note} Always "
+                 f"confirm the exact server name from your own account-issued email -- server names "
+                 f"change and vary by region/account type even within one firm.",
+            fg=TEXT_DIM if firm.connectable_today else AMBER,
+        )
+        preferred = next((p for p in firm.platforms if p in ("MT4", "MT5")), firm.platforms[0] if firm.platforms else "")
+        matching = next(
+            (v for v in self.dl_platform.combo.cget("values") if v == preferred or v.startswith(preferred + " ")),
+            None,
+        )
+        if matching:
+            self.dl_platform.var.set(matching)
+
+    def _dl_refresh_accounts(self):
+        self._dl_accounts = live_deploy_settings.load_accounts()
+        self.dl_accounts_listbox.delete(0, END)
+        for acct in self._dl_accounts:
+            self.dl_accounts_listbox.insert(
+                END, f"{acct.nickname}  —  {acct.firm_name} ({acct.platform})  —  login {acct.login}",
+            )
+
+    def _dl_on_account_selected(self, _event=None):
+        sel = self.dl_accounts_listbox.curselection()
+        if not sel:
+            return
+        acct = self._dl_accounts[sel[0]]
+        self._dl_editing_id = acct.id
+        self.dl_firm.var.set(acct.firm_name)
+        self.dl_platform.var.set(acct.platform)
+        self.dl_nickname.var.set(acct.nickname)
+        self.dl_login.var.set(acct.login)
+        self.dl_server.var.set(acct.server)
+        self.dl_terminal_path.var.set(acct.terminal_path)
+        self.dl_firm_note.config(text="Editing this saved account. Password is never re-displayed -- leave it "
+                                       "blank to keep the existing one, or enter a new one to replace it.")
+
+    def _dl_delete_account(self):
+        sel = self.dl_accounts_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Delete account", "Select an account in the list first.")
+            return
+        acct = self._dl_accounts[sel[0]]
+        if not messagebox.askyesno("Delete account", f"Remove the saved connection for '{acct.nickname}'? This does not affect the account at your prop firm itself."):
+            return
+        live_deploy_settings.delete_account(acct.id)
+        self._dl_refresh_accounts()
+
+    def _dl_browse_terminal(self):
+        path = filedialog.askopenfilename(
+            title="Locate your MT5/MT4 terminal executable",
+            filetypes=[("Terminal executable", "terminal64.exe terminal.exe"), ("All files", "*.*")],
+        )
+        if path:
+            self.dl_terminal_path.var.set(path)
+
+    def _dl_auto_detect_terminal(self):
+        candidates = mt5_connector_module.find_terminal_candidates()
+        if not candidates:
+            messagebox.showinfo("Auto-detect", "Couldn't find a terminal in any common install location. Use Browse... instead.")
+            return
+        self.dl_terminal_path.var.set(candidates[0])
+
+    def _dl_save_account(self):
+        platform = self.dl_platform.get_str()
+        if "(not yet supported)" in platform:
+            messagebox.showwarning(
+                "Not supported yet",
+                f"{platform.split(' (')[0]} accounts aren't wired up yet -- this app can only place "
+                "live orders through MT4/MT5 today. Saving these account details now so they're "
+                "ready the moment that integration exists, but START LIVE TRADING will stay disabled "
+                "for this account until then.",
+            )
+        if not self.dl_confirm_var.get():
+            messagebox.showwarning(
+                "Confirmation required",
+                "Check the confirmation box above before saving a live account -- this is a real-money "
+                "account, not a demo.",
+            )
+            return
+        if not self.dl_nickname.get_str().strip() or not self.dl_login.get_str().strip() or not self.dl_server.get_str().strip():
+            messagebox.showwarning("Missing fields", "Nickname, login, and server are all required.")
+            return
+        live_deploy_settings.save_account(live_deploy_settings.LiveAccount(
+            id=getattr(self, "_dl_editing_id", None),
+            nickname=self.dl_nickname.get_str().strip(),
+            firm_name=self.dl_firm.get_str(),
+            platform=platform,
+            login=self.dl_login.get_str().strip(),
+            server=self.dl_server.get_str().strip(),
+            password=self.dl_password.get_str(),
+            terminal_path=self.dl_terminal_path.get_str().strip(),
+        ))
+        self._dl_editing_id = None
+        self.dl_password.var.set("")
+        self.dl_confirm_var.set(False)
+        self._dl_refresh_accounts()
+        messagebox.showinfo("Saved", "Account saved. Select it in the list above, then Test Connection.")
+
+    def _dl_refresh_strategy_list(self):
+        try:
+            names = [f"{s.strategy_type}: {s.filename}" for s in list_saved_strategies()]
+        except Exception:
+            names = []
+        self.dl_strategy_combo.combo.config(values=names or [""])
+        if names:
+            self.dl_strategy_combo.var.set(names[0])
+
+    def _dl_test_connection(self):
+        sel = self.dl_accounts_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Test connection", "Select a saved account first.")
+            return
+        acct = self._dl_accounts[sel[0]]
+        if "(not yet supported)" in acct.platform:
+            self.dl_status.config(text=f"{acct.platform} isn't supported yet -- see the note above.", fg=AMBER)
+            return
+        if not mt5_connector_module.is_available():
+            self.dl_status.config(text=mt5_connector_module.unavailable_reason(), fg=AMBER)
+            return
+        self.dl_status.config(text="Connecting...", fg=AMBER)
+        self.root.update_idletasks()
+
+        def run():
+            connector = mt5_connector_module.MT5Connector(acct.login, acct.password, acct.server, acct.terminal_path)
+            result = connector.connect()
+            if result.ok:
+                msg = (f"Connected: account {result.account_login} @ {result.account_server} — "
+                       f"balance {result.balance:,.2f} {result.currency}, equity {result.equity:,.2f}. "
+                       f"START LIVE TRADING is still disabled -- see the note below.")
+                connector.disconnect()
+                color = GREEN
+            else:
+                msg, color = result.message, RED
+            self.root.after(0, lambda: self.dl_status.config(text=msg, fg=color))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _dl_start_clicked(self):
+        messagebox.showinfo(
+            "Not enabled yet",
+            "Live order placement is intentionally disabled in this build. The account-management "
+            "and connection-testing above are fully working; wiring START LIVE TRADING to actually "
+            "place live orders (reusing the same engine as Live Demo Test) is the next step once "
+            "you've confirmed you want that turned on.",
+        )
+
+    def _dl_kill_clicked(self):
+        pass
+
 
 def launch():
     root = Tk()
     MainWindow(root)
     root.mainloop()
+
 

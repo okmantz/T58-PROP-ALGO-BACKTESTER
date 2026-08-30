@@ -138,6 +138,15 @@ class ForwardTestJournal:
             "SELECT * FROM trades WHERE session_id=? ORDER BY entry_time DESC", (session_id,)
         )
 
+    def latest_session_for_symbol(self, symbol: str) -> Optional[int]:
+        """Used by the Live Market page to find which session's trades to
+        show as chart markers -- the most recent session run against this
+        exact symbol, regardless of whether it has ended."""
+        row = self._conn.execute(
+            "SELECT id FROM sessions WHERE symbol=? ORDER BY started_at DESC LIMIT 1", (symbol,),
+        ).fetchone()
+        return row[0] if row else None
+
     def recent_events(self, session_id: int, limit: int = 200) -> list[tuple]:
         cur = self._conn.execute(
             "SELECT ts, level, message FROM events WHERE session_id=? ORDER BY ts DESC LIMIT ?",

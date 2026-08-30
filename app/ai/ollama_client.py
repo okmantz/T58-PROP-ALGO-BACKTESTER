@@ -49,6 +49,7 @@ def _build_prompt(
     prop_rules_summary: dict,
     n_suggestions: int,
     failure_analysis_lines: list[str] | None = None,
+    research_excerpts: list[dict] | None = None,
 ) -> str:
     """Pure function: describes the strategy's tunable parameters and how
     it's currently performing, and asks for a strict-JSON response. Kept
@@ -64,6 +65,14 @@ def _build_prompt(
     prompt tokens -- the model's job stays limited to turning "avoid this
     region, lean into that one" into concrete next candidates, never to
     doing the analysis itself.
+
+    research_excerpts: optional, pre-retrieved (systematic keyword search,
+    not AI -- see app.ai.research_library) short excerpts from papers you've
+    dropped into the research/ folder, relevant to this strategy. Same
+    principle as failure_analysis_lines: the RETRIEVAL is deterministic and
+    free; only the resulting excerpt text is spent as prompt tokens, so
+    Ollama's job stays "use this grounding to suggest better numbers,"
+    never "search my training data and hope it's accurate."
     """
     gene_lines = "\n".join(
         f'  - "{g.label}": currently {g.base_value} (allowed range {g.lo} to {g.hi}, '
@@ -82,6 +91,17 @@ avoid repeating the poorly-scoring regions, lean toward the promising ones):
 {feedback_body}
 """
 
+    research_section = ""
+    if research_excerpts:
+        excerpt_body = "\n\n".join(
+            f"  [{i + 1}] (from {e['source']}): {e['text']}" for i, e in enumerate(research_excerpts)
+        )
+        research_section = f"""
+Relevant excerpts from your research library (use these as grounding where \
+they genuinely apply -- ignore anything that doesn't fit this specific strategy):
+{excerpt_body}
+"""
+
     return f"""You are helping tune the numeric parameters of an existing algorithmic \
 trading strategy called "{strategy_name}" ({source_type}). You are NOT being asked to \
 write or modify any code -- only to propose new numeric values for the parameters \
@@ -95,7 +115,7 @@ Current (baseline) backtest performance:
 
 Prop-firm rules this strategy must pass:
 {rules_lines}
-{feedback_section}
+{feedback_section}{research_section}
 Propose {n_suggestions} different candidate parameter sets you think are worth trying \
 to improve profitability and the odds of passing evaluation and reaching payout. Each \
 candidate must give a value for every parameter listed above, in the same order, \
@@ -204,6 +224,7 @@ class OllamaClient:
         prop_rules_summary: dict,
         n_suggestions: int = DEFAULT_N_SUGGESTIONS,
         failure_analysis_lines: list[str] | None = None,
+        research_excerpts: list[dict] | None = None,
     ) -> AISuggestionResult:
         """Asks the model for `n_suggestions` candidate genomes. Returns an
         empty, non-fatal result (with `.error` explaining why) on any
@@ -216,6 +237,11 @@ class OllamaClient:
         summary_lines(). Passing this turns each call into the loop
         framework's Stage 4 feedback step; omitting it (the default)
         behaves exactly as before this parameter existed.
+
+        research_excerpts: optional pre-retrieved (non-AI keyword search)
+        excerpts from your research/ folder -- see
+        app.ai.research_library.find_relevant_excerpts(). Omitting it
+        behaves exactly as before this parameter existed.
         """
         import requests
 
@@ -224,7 +250,7 @@ class OllamaClient:
 
         prompt = _build_prompt(
             strategy_name, source_type, genes, baseline_stats, prop_rules_summary, n_suggestions,
-            failure_analysis_lines=failure_analysis_lines,
+            failure_analysis_lines=failure_analysis_lines, research_excerpts=research_excerpts,
         )
         host = (self.settings.host or "").rstrip("/")
         try:

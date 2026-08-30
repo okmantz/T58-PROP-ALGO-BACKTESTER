@@ -65,6 +65,7 @@ from app.strategy.manual import ManualStrategy
 from app.strategy.mql5 import MQL5Strategy
 from app.strategy.pinescript import PineScriptStrategy
 from app.strategy.python import PythonStrategy
+from app.web import live_market
 
 # get_app_base_dir() already knows how to find a persistent, writable
 # folder next to the running .exe when frozen (see app/data/storage.py),
@@ -681,6 +682,68 @@ def serve_report(filename):
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Live Market -- a real-time (or best-available) candlestick chart backed by
+# TradingView's Lightweight Charts library, fed from whichever data source
+# is actually available: a connected MT5 demo terminal, saved Alpaca keys,
+# or (with neither) a steady bar-by-bar replay of an already-imported CSV so
+# the page always has something real to draw.
+# ---------------------------------------------------------------------------
+
+@app.route("/live-market")
+def live_market_page():
+    mt5 = live_market.mt5_status()
+    has_alpaca = bool(alpaca_credentials.load_credentials())
+    replay_datasets = live_market.list_replay_datasets()
+    return render_template(
+        "live_market.html",
+        mt5_status=mt5,
+        has_alpaca=has_alpaca,
+        replay_datasets=replay_datasets,
+        timeframe_choices=live_market.TIMEFRAME_CHOICES_MINUTES,
+        theme=request.args.get("theme", "dark"),
+        initial_symbol=request.args.get("symbol") or mt5["default_symbol"] or "XAUUSD",
+        initial_timeframe=request.args.get("timeframe", type=int) or mt5["default_timeframe_minutes"] or 15,
+        initial_source=request.args.get("source") or ("mt5" if mt5["configured"] else ("alpaca" if has_alpaca else "replay")),
+    )
+
+
+@app.route("/api/live-market/status")
+def api_live_market_status():
+    return jsonify({
+        "mt5": live_market.mt5_status(),
+        "alpaca_configured": bool(alpaca_credentials.load_credentials()),
+        "replay_datasets": live_market.list_replay_datasets(),
+    })
+
+
+@app.route("/api/live-market/bars")
+def api_live_market_bars():
+    source = request.args.get("source", "replay")
+    symbol = request.args.get("symbol", "")
+    timeframe = request.args.get("timeframe", 15, type=int)
+    seed = request.args.get("seed", "0") == "1"  # first request for this symbol/timeframe this page-load
+
+    if source == "mt5":
+        bars = live_market.fetch_mt5_bars(symbol, timeframe)
+        status = "live" if bars else ("connecting" if live_market.mt5_status()["configured"] else "unavailable")
+    elif source == "alpaca":
+        asset_class = request.args.get("asset_class", "Stock")
+        bars = live_market.fetch_alpaca_bars(symbol, asset_class, timeframe)
+        status = "delayed" if bars else "unavailable"
+    else:
+        bars, finished = live_market.fetch_replay_bars(symbol, advance=not seed)
+        status = "replay-finished" if finished else "replay"
+
+    return jsonify({"bars": bars, "status": status})
+
+
+@app.route("/api/live-market/trades")
+def api_live_market_trades():
+    symbol = request.args.get("symbol", "")
+    return jsonify({"markers": live_market.recent_trade_markers(symbol)})
 
 
 # ---------------------------------------------------------------------------

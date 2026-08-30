@@ -297,6 +297,7 @@ def run_full_pipeline(
     ai_suggest_cb = None
     if ollama_settings is not None and ollama_settings.is_usable:
         from app.ai.ollama_client import OllamaClient
+        from app.ai.research_library import find_relevant_excerpts
         from app.optimize.gene_fitness_analysis import analyze_gene_fitness_correlation
 
         ollama_client = OllamaClient(ollama_settings)
@@ -337,6 +338,19 @@ def run_full_pipeline(
             # keeps this "systematic first, AI only where it must be."
             analysis = analyze_gene_fitness_correlation(genes, population)
             feedback_lines = analysis.summary_lines(top_n=3)
+
+            # Same "retrieval is free, AI is only for the last step"
+            # principle as the gene-fitness analysis above: a plain
+            # keyword search over whatever's in the research/ folder,
+            # queried on the strategy's name and its genes' own labels
+            # (e.g. "EMA period", "session filter") since those are
+            # exactly the terms a relevant paper would use. Costs nothing
+            # extra beyond folder-mtime bookkeeping and returns [] with
+            # an empty research/ folder -- identical to this feature not
+            # existing at all.
+            research_query = f"{display_name} {strategy.source_type} " + " ".join(g.label for g in genes)
+            research_excerpts = find_relevant_excerpts(research_query, max_excerpts=2)
+
             result = ollama_client.suggest_parameter_adjustments(
                 strategy_name=display_name,
                 source_type=strategy.source_type,
@@ -344,6 +358,7 @@ def run_full_pipeline(
                 baseline_stats=baseline_stats_summary,
                 prop_rules_summary=prop_rules_summary,
                 failure_analysis_lines=feedback_lines,
+                research_excerpts=research_excerpts,
             )
             if result.error:
                 log(f"  AI assist: {result.error}")

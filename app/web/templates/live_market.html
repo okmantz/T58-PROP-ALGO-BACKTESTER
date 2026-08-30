@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="{{ theme }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live Market — T58 Prop Algo Backtester</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  /* Live Market page only -- self-contained light/dark variables so this
+     one page can follow the desktop app's theme toggle without touching
+     theme.css (which every other web page uses and is dark-only today). */
+  html[data-theme="dark"] {
+    --lm-bg: var(--bg); --lm-panel: var(--panel); --lm-panel-2: var(--panel-2);
+    --lm-border: var(--border); --lm-text: var(--text); --lm-text-muted: var(--text-muted);
+    --lm-text-dim: var(--text-dim); --lm-up: #3ed685; --lm-down: #f0596a;
+    --lm-grid: rgba(255,255,255,0.05); --lm-accent: var(--teal);
+  }
+  html[data-theme="light"] {
+    --lm-bg: #f4f5f7; --lm-panel: #ffffff; --lm-panel-2: #f1f2f5;
+    --lm-border: #d9dce3; --lm-text: #14161b; --lm-text-muted: #565d6b;
+    --lm-text-dim: #8b909c; --lm-up: #0e9b5e; --lm-down: #d23b52;
+    --lm-grid: rgba(0,0,0,0.06); --lm-accent: #0089a3;
+  }
+  html[data-theme="light"] body { background: var(--lm-bg); color: var(--lm-text); }
+  html[data-theme="light"] .t58-sidebar,
+  html[data-theme="light"] .t58-card,
+  html[data-theme="light"] .lm-panel { background: var(--lm-panel) !important; border-color: var(--lm-border) !important; }
+  html[data-theme="light"] .t58-nav-item { color: var(--lm-text-muted); }
+  html[data-theme="light"] .lm-toolbar select,
+  html[data-theme="light"] .lm-toolbar input { background: var(--lm-panel-2); color: var(--lm-text); border-color: var(--lm-border); }
+
+  .t58-main.lm-main { max-width: none; padding: 16px 20px; }
+
+  .lm-toolbar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    margin-bottom: 12px; padding: 10px 14px; background: var(--lm-panel-2);
+    border: 1px solid var(--lm-border); border-radius: 10px;
+  }
+  .lm-toolbar select, .lm-toolbar input {
+    background: var(--lm-panel); color: var(--lm-text); border: 1px solid var(--lm-border);
+    border-radius: 6px; padding: 6px 9px; font-size: 12px;
+  }
+  .lm-toolbar label { font-size: 11px; color: var(--lm-text-muted); display: flex; align-items: center; gap: 6px; }
+  .lm-btn {
+    background: var(--lm-panel); color: var(--lm-text); border: 1px solid var(--lm-border);
+    border-radius: 6px; padding: 6px 12px; font-size: 11px; font-weight: 600; cursor: pointer;
+    letter-spacing: .03em;
+  }
+  .lm-btn:hover { border-color: var(--lm-accent); color: var(--lm-accent); }
+  .lm-spacer { flex: 1; }
+
+  .lm-status-badge {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700;
+    padding: 5px 10px; border-radius: 999px; letter-spacing: .04em; text-transform: uppercase;
+    border: 1px solid var(--lm-border);
+  }
+  .lm-status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .lm-status-live { color: var(--lm-up); box-shadow: 0 0 0 rgba(62,214,133,0.5); animation: lm-pulse 1.6s infinite; }
+  .lm-status-delayed { color: #f0b429; }
+  .lm-status-replay { color: var(--lm-accent); }
+  .lm-status-error { color: var(--lm-down); }
+  @keyframes lm-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(62,214,133,0.45); }
+    70%  { box-shadow: 0 0 0 7px rgba(62,214,133,0); }
+    100% { box-shadow: 0 0 0 0 rgba(62,214,133,0); }
+  }
+
+  .lm-chart-wrap {
+    position: relative; background: var(--lm-panel); border: 1px solid var(--lm-border);
+    border-radius: 12px; overflow: hidden;
+  }
+  #lm-chart { width: 100%; height: 560px; }
+
+  .lm-hud {
+    position: absolute; top: 12px; left: 14px; z-index: 3; pointer-events: none;
+    font-variant-numeric: tabular-nums; font-size: 12px; line-height: 1.55;
+    color: var(--lm-text); background: rgba(0,0,0,0.0);
+  }
+  html[data-theme="light"] .lm-hud { color: var(--lm-text); }
+  .lm-hud .sym { font-size: 15px; font-weight: 700; letter-spacing: .01em; }
+  .lm-hud .row { display: flex; gap: 10px; color: var(--lm-text-muted); }
+  .lm-hud .row b { color: var(--lm-text); font-weight: 600; }
+  .lm-hud .chg-up { color: var(--lm-up); }
+  .lm-hud .chg-down { color: var(--lm-down); }
+
+  .lm-watermark {
+    position: absolute; right: 16px; bottom: 14px; z-index: 2; pointer-events: none;
+    opacity: 0.16; width: 120px;
+  }
+  html[data-theme="light"] .lm-watermark { opacity: 0.10; }
+
+  .lm-legend-toggle {
+    position: absolute; top: 12px; right: 14px; z-index: 3; display: flex; gap: 6px;
+  }
+  .lm-chip {
+    font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--lm-border); color: var(--lm-text-muted); background: var(--lm-panel-2);
+    user-select: none;
+  }
+  .lm-chip.on { color: #05070a; }
+  .lm-chip[data-series="ema20"].on  { background: #35e0b0; border-color: #35e0b0; }
+  .lm-chip[data-series="ema50"].on  { background: #8b7cff; border-color: #8b7cff; color: #fff; }
+  .lm-chip[data-series="vwap"].on   { background: #f0b429; border-color: #f0b429; }
+  .lm-chip[data-series="volume"].on { background: #6f7684; border-color: #6f7684; color: #fff; }
+
+  .lm-below {
+    display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-top: 12px;
+  }
+  .lm-note { font-size: 11px; color: var(--lm-text-dim); margin-top: 10px; line-height: 1.5; }
+</style>
+</head>
+<body>
+{% set active_page = 'live_market' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main lm-main">
+
+<div class="t58-page-header">
+  <h1>Live Market</h1>
+  <p>Real-time-style candlestick chart, powered by TradingView's Lightweight Charts. New bars stream in with
+     <code>series.update()</code> -- the chart never redraws from scratch.</p>
+</div>
+
+<div class="lm-toolbar">
+  <label>Source
+    <select id="lm-source">
+      <option value="mt5" {{ 'selected' if initial_source == 'mt5' }} {{ 'disabled' if not mt5_status.configured }}>MT5 {{ '(connected)' if mt5_status.configured else '(not configured)' }}</option>
+      <option value="alpaca" {{ 'selected' if initial_source == 'alpaca' }} {{ 'disabled' if not has_alpaca }}>Alpaca {{ '' if has_alpaca else '(no saved keys)' }}</option>
+      <option value="replay" {{ 'selected' if initial_source == 'replay' }}>Replay (local CSV)</option>
+    </select>
+  </label>
+
+  <label id="lm-symbol-wrap">Symbol
+    <input id="lm-symbol" type="text" value="{{ initial_symbol }}" size="10">
+  </label>
+
+  <label id="lm-replay-wrap" style="display:none;">Dataset
+    <select id="lm-dataset">
+      {% for d in replay_datasets %}
+      <option value="{{ d }}">{{ d }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label id="lm-timeframe-wrap">Timeframe
+    <select id="lm-timeframe">
+      {% for tf in timeframe_choices %}
+      <option value="{{ tf }}" {{ 'selected' if tf == initial_timeframe }}>
+        {{ tf }}{{ 'm' if tf < 60 else ('h' if tf < 1440 else 'd') }}
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <button class="lm-btn" id="lm-apply">APPLY</button>
+  <button class="lm-btn" id="lm-fit">FIT CHART</button>
+
+  <div class="lm-spacer"></div>
+  <span class="lm-status-badge lm-status-replay" id="lm-status-badge"><span class="lm-status-dot"></span><span id="lm-status-text">CONNECTING</span></span>
+</div>
+
+<div class="lm-chart-wrap">
+  <div class="lm-hud" id="lm-hud">
+    <div class="sym" id="lm-hud-symbol">{{ initial_symbol }}</div>
+    <div class="row"><span id="lm-hud-ohlc">O -- H -- L -- C --</span></div>
+    <div class="row"><span id="lm-hud-change">-- (--%)</span> <span id="lm-hud-time" style="margin-left:8px;"></span></div>
+  </div>
+  <div class="lm-legend-toggle">
+    <span class="lm-chip on" data-series="ema20">EMA 20</span>
+    <span class="lm-chip on" data-series="ema50">EMA 50</span>
+    <span class="lm-chip on" data-series="vwap">VWAP</span>
+    <span class="lm-chip on" data-series="volume">VOL</span>
+  </div>
+  <div id="lm-chart"></div>
+  <img class="lm-watermark" src="/static/t58-mark-transparent.png" alt="">
+</div>
+
+<div class="lm-below">
+  <div class="t58-stat"><div class="label">Session High</div><div class="value" id="lm-stat-high" style="font-size:16px;">--</div></div>
+  <div class="t58-stat"><div class="label">Session Low</div><div class="value" id="lm-stat-low" style="font-size:16px;">--</div></div>
+  <div class="t58-stat"><div class="label">Bars Loaded</div><div class="value" id="lm-stat-bars" style="font-size:16px;">--</div></div>
+  <div class="t58-stat"><div class="label">Open Trade Markers</div><div class="value" id="lm-stat-trades" style="font-size:16px;">--</div></div>
+</div>
+
+<p class="lm-note">
+  MT5 gives a genuinely live feed (including the still-forming candle). Alpaca's free tier is exchange-delayed,
+  not real-time. With neither connected, this replays an already-imported local CSV bar by bar so there's always
+  something real on screen. Trade markers (when present) come from the Live Demo Test journal for this exact symbol.
+</p>
+
+</div>
+</div>
+
+<script>
+(function () {
+  const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  const css = getComputedStyle(document.documentElement);
+  const colors = {
+    bg: css.getPropertyValue('--lm-panel').trim(),
+    text: css.getPropertyValue('--lm-text').trim(),
+    textMuted: css.getPropertyValue('--lm-text-muted').trim(),
+    grid: css.getPropertyValue('--lm-grid').trim(),
+    border: css.getPropertyValue('--lm-border').trim(),
+    up: css.getPropertyValue('--lm-up').trim(),
+    down: css.getPropertyValue('--lm-down').trim(),
+  };
+
+  const chartEl = document.getElementById('lm-chart');
+  const chart = LightweightCharts.createChart(chartEl, {
+    layout: { background: { color: colors.bg }, textColor: colors.textMuted },
+    grid: { vertLines: { color: colors.grid }, horzLines: { color: colors.grid } },
+    rightPriceScale: { borderColor: colors.border },
+    timeScale: { borderColor: colors.border, timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    watermark: { visible: false },
+    autoSize: true,
+  });
+
+  const candleSeries = chart.addCandlestickSeries({
+    upColor: colors.up, downColor: colors.down, borderVisible: false,
+    wickUpColor: colors.up, wickDownColor: colors.down,
+  });
+
+  const volumeSeries = chart.addHistogramSeries({
+    priceFormat: { type: 'volume' }, priceScaleId: 'lm-volume', color: colors.textMuted,
+  });
+  chart.priceScale('lm-volume').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+  const ema20Series = chart.addLineSeries({ color: '#35e0b0', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+  const ema50Series = chart.addLineSeries({ color: '#8b7cff', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+  const vwapSeries  = chart.addLineSeries({ color: '#f0b429', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
+
+  let lastPriceLine = null;
+  let sessionHighLine = null, sessionLowLine = null;
+  let history = []; // full bar history this chart currently holds, for EMA/VWAP recompute
+
+  function ema(values, period) {
+    const k = 2 / (period + 1);
+    let prev = null;
+    return values.map(v => {
+      prev = prev === null ? v : v * k + prev * (1 - k);
+      return prev;
+    });
+  }
+
+  function vwapSeriesFromBars(bars) {
+    let cumPV = 0, cumVol = 0;
+    return bars.map(b => {
+      const typical = (b.high + b.low + b.close) / 3;
+      cumPV += typical * (b.volume || 0);
+      cumVol += (b.volume || 0);
+      return cumVol > 0 ? cumPV / cumVol : b.close;
+    });
+  }
+
+  function recomputeOverlays() {
+    if (history.length === 0) return;
+    const closes = history.map(b => b.close);
+    const ema20 = ema(closes, 20);
+    const ema50 = ema(closes, 50);
+    const vwap = vwapSeriesFromBars(history);
+    ema20Series.setData(history.map((b, i) => ({ time: b.time, value: ema20[i] })));
+    ema50Series.setData(history.map((b, i) => ({ time: b.time, value: ema50[i] })));
+    vwapSeries.setData(history.map((b, i) => ({ time: b.time, value: vwap[i] })));
+
+    let high = -Infinity, low = Infinity;
+    history.forEach(b => { high = Math.max(high, b.high); low = Math.min(low, b.low); });
+    document.getElementById('lm-stat-high').textContent = high.toFixed(5).replace(/0+$/, '').replace(/\.$/, '');
+    document.getElementById('lm-stat-low').textContent = low.toFixed(5).replace(/0+$/, '').replace(/\.$/, '');
+    document.getElementById('lm-stat-bars').textContent = history.length;
+
+    if (sessionHighLine) candleSeries.removePriceLine(sessionHighLine);
+    if (sessionLowLine) candleSeries.removePriceLine(sessionLowLine);
+    sessionHighLine = candleSeries.createPriceLine({ price: high, color: colors.textMuted, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'HIGH' });
+    sessionLowLine = candleSeries.createPriceLine({ price: low, color: colors.textMuted, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'LOW' });
+  }
+
+  function updateHud(bar, prevClose) {
+    document.getElementById('lm-hud-ohlc').innerHTML =
+      `O <b>${bar.open}</b> H <b>${bar.high}</b> L <b>${bar.low}</b> C <b>${bar.close}</b>`;
+    const change = prevClose ? bar.close - prevClose : 0;
+    const pct = prevClose ? (change / prevClose) * 100 : 0;
+    const el = document.getElementById('lm-hud-change');
+    el.textContent = `${change >= 0 ? '+' : ''}${change.toFixed(5)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`;
+    el.className = change >= 0 ? 'chg-up' : 'chg-down';
+    const d = new Date(bar.time * 1000);
+    document.getElementById('lm-hud-time').textContent = d.toLocaleString();
+  }
+
+  chart.subscribeCrosshairMove(param => {
+    if (!param.time || !param.seriesData) return;
+    const bar = param.seriesData.get(candleSeries);
+    if (!bar) return;
+    const idx = history.findIndex(b => b.time === param.time);
+    const prevClose = idx > 0 ? history[idx - 1].close : null;
+    updateHud(bar, prevClose);
+  });
+
+  document.querySelectorAll('.lm-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const key = chip.dataset.series;
+      const seriesMap = { ema20: ema20Series, ema50: ema50Series, vwap: vwapSeries, volume: volumeSeries };
+      const s = seriesMap[key];
+      const on = chip.classList.toggle('on');
+      s.applyOptions({ visible: on });
+    });
+  });
+
+  document.getElementById('lm-fit').addEventListener('click', () => chart.timeScale().fitContent());
+
+  // ------------------------------------------------------------------
+  // Data polling loop
+  // ------------------------------------------------------------------
+  const sourceSel = document.getElementById('lm-source');
+  const symbolInput = document.getElementById('lm-symbol');
+  const datasetSel = document.getElementById('lm-dataset');
+  const timeframeSel = document.getElementById('lm-timeframe');
+  const symbolWrap = document.getElementById('lm-symbol-wrap');
+  const replayWrap = document.getElementById('lm-replay-wrap');
+  const timeframeWrap = document.getElementById('lm-timeframe-wrap');
+
+  function syncSourceUI() {
+    const isReplay = sourceSel.value === 'replay';
+    symbolWrap.style.display = isReplay ? 'none' : 'flex';
+    replayWrap.style.display = isReplay ? 'flex' : 'none';
+    timeframeWrap.style.display = isReplay ? 'none' : 'flex';
+  }
+  syncSourceUI();
+  sourceSel.addEventListener('change', syncSourceUI);
+
+  let pollTimer = null;
+  let seeded = false;
+
+  function currentSymbolParam() {
+    return sourceSel.value === 'replay' ? datasetSel.value : symbolInput.value.trim();
+  }
+
+  function setStatus(status) {
+    const badge = document.getElementById('lm-status-badge');
+    const text = document.getElementById('lm-status-text');
+    const map = {
+      live: ['lm-status-live', 'LIVE'],
+      delayed: ['lm-status-delayed', 'DELAYED'],
+      replay: ['lm-status-replay', 'REPLAY'],
+      'replay-finished': ['lm-status-replay', 'REPLAY (END)'],
+      connecting: ['lm-status-replay', 'CONNECTING'],
+      unavailable: ['lm-status-error', 'UNAVAILABLE'],
+    };
+    const [cls, label] = map[status] || ['lm-status-error', 'ERROR'];
+    badge.className = 'lm-status-badge ' + cls;
+    text.textContent = label;
+  }
+
+  function fetchBars() {
+    const symbol = currentSymbolParam();
+    if (!symbol) return;
+    const params = new URLSearchParams({
+      source: sourceSel.value, symbol: symbol, timeframe: timeframeSel.value,
+      seed: seeded ? '0' : '1',
+    });
+    fetch('/api/live-market/bars?' + params.toString())
+      .then(r => r.json())
+      .then(data => {
+        setStatus(data.status);
+        if (!data.bars || data.bars.length === 0) return;
+        seeded = true;
+        if (history.length === 0 || data.bars.length > 30) {
+          // Full (re)seed -- either first load or a source/symbol change.
+          history = data.bars;
+          candleSeries.setData(history);
+          volumeSeries.setData(history.map(b => ({
+            time: b.time, value: b.volume || 0,
+            color: b.close >= b.open ? colors.up : colors.down,
+          })));
+          chart.timeScale().fitContent();
+        } else {
+          // Incremental: update only the last bar(s) via the native
+          // series.update() mechanism -- this is the whole point of
+          // Lightweight Charts' real-time API: no full redraw.
+          data.bars.forEach(bar => {
+            const existingIdx = history.findIndex(b => b.time === bar.time);
+            if (existingIdx >= 0) history[existingIdx] = bar; else history.push(bar);
+            candleSeries.update(bar);
+            volumeSeries.update({ time: bar.time, value: bar.volume || 0, color: bar.close >= bar.open ? colors.up : colors.down });
+          });
+        }
+        recomputeOverlays();
+        const last = history[history.length - 1];
+        const prev = history.length > 1 ? history[history.length - 2].close : null;
+        updateHud(last, prev);
+        document.getElementById('lm-hud-symbol').textContent = symbol.split('/').pop().replace(/\.csv$/i, '');
+        if (lastPriceLine) candleSeries.removePriceLine(lastPriceLine);
+        lastPriceLine = candleSeries.createPriceLine({
+          price: last.close, color: last.close >= (prev || last.close) ? colors.up : colors.down,
+          lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'LAST',
+        });
+      })
+      .catch(() => setStatus('unavailable'));
+  }
+
+  function fetchTrades() {
+    const symbol = currentSymbolParam();
+    if (!symbol || sourceSel.value === 'replay') return;
+    fetch('/api/live-market/trades?symbol=' + encodeURIComponent(symbol))
+      .then(r => r.json())
+      .then(data => {
+        const markers = data.markers || [];
+        candleSeries.setMarkers(markers);
+        document.getElementById('lm-stat-trades').textContent = markers.length;
+      })
+      .catch(() => {});
+  }
+
+  function restart() {
+    seeded = false;
+    history = [];
+    candleSeries.setMarkers([]);
+    fetchBars();
+    fetchTrades();
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => { fetchBars(); fetchTrades(); }, 1500);
+  }
+
+  document.getElementById('lm-apply').addEventListener('click', restart);
+  restart();
+})();
+</script>
+</body>
+</html>

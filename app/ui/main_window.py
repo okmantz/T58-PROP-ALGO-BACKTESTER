@@ -855,6 +855,7 @@ class MainWindow:
         self.content.pack(side="left", fill="both", expand=True, padx=(14, 0))
 
         self.tab_dashboard = Frame(self.content, bg=BG)
+        self.tab_manual = Frame(self.content, bg=BG)
         self.tab_data = Frame(self.content, bg=BG)
         self.tab_strategy = Frame(self.content, bg=BG)
         self.tab_prop = Frame(self.content, bg=BG)
@@ -873,7 +874,7 @@ class MainWindow:
         self.tab_forwardtest = Frame(self.content, bg=BG)
 
         for f in (
-            self.tab_dashboard, self.tab_data, self.tab_strategy, self.tab_prop,
+            self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
@@ -883,6 +884,7 @@ class MainWindow:
 
         self._nav_items = [
             ("dashboard", "\u25A3", "DASHBOARD", self.tab_dashboard, NEON_VIOLET),
+            ("manual", "\u2753", "USER MANUAL", self.tab_manual, METAL_BRIGHT),
             (None, None, None, None, None),  # divider
             ("data", "\u25A4", "01  DATA", self.tab_data, NEON_CYAN),
             ("strategy", "\u2699", "02  STRATEGY", self.tab_strategy, NEON_CYAN),
@@ -903,7 +905,7 @@ class MainWindow:
             (None, None, None, None, None),  # divider — All-In-One
             ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline, NEON_AMBER),
             (None, None, None, None, None),  # divider — going live
-            ("forwardtest", "\u25D4", "16  FORWARD TEST", self.tab_forwardtest, NEON_LIME),
+            ("forwardtest", "\u25D4", "16  LIVE DEMO TEST", self.tab_forwardtest, NEON_LIME),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -911,6 +913,7 @@ class MainWindow:
         self.active_page = "dashboard"
 
         self._build_dashboard_tab()
+        self._build_manual_tab()
         self._build_data_tab()
         self._build_strategy_tab()
         self._build_prop_tab()
@@ -1421,15 +1424,31 @@ class MainWindow:
         border/halo color (defaults to matching `color`, the value text
         color), so callers that only cared about text color before still
         work unchanged. `color`'s default is resolved here (call time),
-        not bound into the signature, so it follows theme toggles."""
+        not bound into the signature, so it follows theme toggles.
+
+        `value` can be a short number (a Sharpe ratio, a count) or a long
+        strategy name (the Leader card) -- rather than one fixed font
+        size and a card that clips anything past its edge, long text
+        drops to a smaller size, wraps within the card, and the card
+        itself grows a bit taller so the FULL value is always visible
+        instead of being cut off mid-word.
+        """
         color = color if color is not None else ACCENT_HOVER
-        card = GlowCard(parent, accent=accent or color, height=92)
+        text = str(value)
+        if len(text) <= 10:
+            value_font_size, card_height = 20, 92
+        elif len(text) <= 22:
+            value_font_size, card_height = 15, 108
+        else:
+            value_font_size, card_height = 12, 124
+        card = GlowCard(parent, accent=accent or color, height=card_height)
         Label(card.body, text=label.upper(), bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(8, "bold")).pack(
             anchor="w", padx=14, pady=(12, 3)
         )
-        Label(card.body, text=value, bg=PANEL_2, fg=(accent or color), font=_safe_font(20, "bold")).pack(
-            anchor="w", padx=14, pady=(0, 10)
-        )
+        Label(
+            card.body, text=text, bg=PANEL_2, fg=(accent or color), font=_safe_font(value_font_size, "bold"),
+            wraplength=190, justify="left", anchor="w",
+        ).pack(anchor="w", fill="x", padx=14, pady=(0, 10))
         return card
 
     def _ring_stat_card(self, parent, label, pct, accent):
@@ -1878,6 +1897,282 @@ class MainWindow:
                 x0 = left_pad + hr * cell_w
                 y0 = 2 + d * cell_h
                 c.create_rectangle(x0, y0, x0 + cell_w - 1, y0 + cell_h - 1, fill=color, outline="")
+
+    # -----------------------------------------------------------------------
+    # User Manual
+    # -----------------------------------------------------------------------
+
+    def _build_manual_tab(self):
+        f = self.tab_manual
+        self._page_header(
+            f, "GUIDE", "User Manual",
+            "A dummy-proof, step-by-step walkthrough of the whole app -- start to finish, "
+            "from importing your first candle of data to reading a Full Pipeline verdict.",
+        )
+
+        wrap = Frame(f, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        wrap.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+
+        text = Text(
+            wrap, wrap="word", bg=PANEL, fg=TEXT, relief="flat", bd=0,
+            highlightthickness=0, font=_safe_font(9), padx=22, pady=18, cursor="arrow",
+            spacing1=1, spacing3=1,
+        )
+        scrollbar = ttk.Scrollbar(wrap, orient="vertical", command=text.yview, style="T58.Vertical.TScrollbar")
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            text.bind(seq, lambda e: self._generic_text_wheel(text, e))
+
+        text.tag_configure("h1", font=_safe_font(17, "bold"), foreground=ACCENT_HOVER, spacing1=4, spacing3=10)
+        text.tag_configure("h2", font=_safe_font(12, "bold"), foreground=NEON_CYAN, spacing1=20, spacing3=8)
+        text.tag_configure("h3", font=_safe_font(10, "bold"), foreground=METAL_BRIGHT, spacing1=12, spacing3=4)
+        text.tag_configure("body", font=_safe_font(9), foreground=TEXT_MUTED, spacing3=5, lmargin1=2, lmargin2=2)
+        text.tag_configure("bullet", font=_safe_font(9), foreground=TEXT_MUTED, lmargin1=22, lmargin2=38, spacing3=4)
+        text.tag_configure("numstep", font=_safe_font(9, "bold"), foreground=TEXT, lmargin1=4, lmargin2=26, spacing1=8, spacing3=2)
+        text.tag_configure("substep", font=_safe_font(9), foreground=TEXT_MUTED, lmargin1=30, lmargin2=46, spacing3=3)
+        text.tag_configure("mono", font=(MONO, 9), foreground=NEON_LIME)
+        text.tag_configure("warn", font=_safe_font(9, "bold"), foreground=AMBER, lmargin1=4, lmargin2=20, spacing1=8, spacing3=8)
+        text.tag_configure("tip", font=_safe_font(9), foreground=GREEN, lmargin1=4, lmargin2=20, spacing1=6, spacing3=8)
+        text.tag_configure("divider", font=_safe_font(4), foreground=BORDER, spacing3=14)
+
+        def h1(t):
+            text.insert(END, t + "\n", "h1")
+
+        def h2(t):
+            text.insert(END, t + "\n", "h2")
+
+        def h3(t):
+            text.insert(END, t + "\n", "h3")
+
+        def body(t):
+            text.insert(END, t + "\n", "body")
+
+        def bullet(t):
+            text.insert(END, "•  " + t + "\n", "bullet")
+
+        def numstep(n, t):
+            text.insert(END, f"{n}.  " + t + "\n", "numstep")
+
+        def substep(t):
+            text.insert(END, "–  " + t + "\n", "substep")
+
+        def warn(t):
+            text.insert(END, "⚠  " + t + "\n", "warn")
+
+        def tip(t):
+            text.insert(END, "✓  " + t + "\n", "tip")
+
+        def rule():
+            text.insert(END, "―" * 90 + "\n", "divider")
+
+        # -------------------------------------------------------------
+        # Quick Start (short version) -- up top, for anyone who just
+        # wants the fastest path and already knows their way around a
+        # backtester.
+        # -------------------------------------------------------------
+        h1("QUICK START (SHORT VERSION)")
+        body(
+            "For anyone in a hurry: this is the whole app in five clicks. If any of these "
+            "words don't mean anything yet, skip down to the FULL WALKTHROUGH below -- it "
+            "explains every one of these in plain terms."
+        )
+        numstep(1, "01 DATA — import a CSV, or fetch data with a free Alpaca key, then select it.")
+        numstep(2, "02 STRATEGY — pick Manual / Python / PineScript / MQL5 and set it up.")
+        numstep(3, "03 PROP RULES — enter your prop firm's account size, targets, and drawdown rules.")
+        numstep(4, "04 RISK — set your risk per trade and starting balance (defaults are fine to start).")
+        numstep(5, "15 FULL PIPELINE — click RUN FULL PIPELINE and read the READY / MARGINAL / NOT READY verdict.")
+        tip(
+            "That's it. Steps 06-14 (Refinement, Search Lab, Validation Lab, Ensemble) are all "
+            "optional extra tools for later — you do not need them for a first pass."
+        )
+        rule()
+
+        # -------------------------------------------------------------
+        # Full walkthrough
+        # -------------------------------------------------------------
+        h1("FULL WALKTHROUGH (STEP BY STEP)")
+        body(
+            "Follow these in order the first time. Every tab is numbered in the sidebar on "
+            "the left in the same order as this guide."
+        )
+
+        h2("STEP 1 — Import your market data (01 DATA)")
+        body("The backtester needs historical price candles (open/high/low/close/volume) before anything else can run.")
+        numstep(1, "Click 01 DATA in the sidebar.")
+        numstep(2, "If you already have a CSV file of price data, click IMPORT CSV(S) and select it.")
+        substep("A CSV needs columns for timestamp, open, high, low, and close (volume is optional). Headers are "
+                "auto-detected — 'time'/'date', 'o'/'open', etc. all work.")
+        substep(
+            "You can select more than one timeframe at once (Ctrl/Cmd-click or Shift-click) for multi-timeframe "
+            "strategies — e.g. a 60-minute file for bias plus a 5-minute file for entries. Ignore this at first."
+        )
+        numstep(3, "Don't have a CSV? Use the built-in Alpaca fetch instead — see the box below.")
+        numstep(4, "Click a dataset in the list to select it. That's the data every later tab will use.")
+        tip("Tip: you can also drop CSV files straight into the app's data/raw/ folder and click REFRESH LIST.")
+
+        h3("Getting a free Alpaca API key (for fetching data without a CSV)")
+        body(
+            "Alpaca is a brokerage that gives out free market data through an API — you do not need to fund "
+            "an account or place any real trades to use this."
+        )
+        numstep(1, "Go to alpaca.markets and sign up for a free account (choose Paper Trading, not a live account).")
+        numstep(2, "In the Alpaca dashboard, generate an API Key ID and a Secret Key (usually under 'API Keys' "
+                    "or 'Paper Trading' settings).")
+        numstep(3, "Back in this app, on the 01 DATA tab, paste both into the 'Fetch data from Alpaca' section.")
+        numstep(4, "Click TEST CONNECTION to confirm the keys work.")
+        numstep(5, "Choose an asset class, symbol, and timeframe, then click FETCH & SAVE. It's saved locally as "
+                    "a CSV, so you only need to fetch it once.")
+        tip("Your keys are saved locally on this computer so you don't have to re-enter them every time.")
+        rule()
+
+        h2("STEP 2 — Build or upload a strategy (02 STRATEGY)")
+        body("This is the trading logic that will be tested against your data. Four options:")
+        bullet("MANUAL — a visual, no-code builder: pick indicators and entry/exit conditions from dropdowns.")
+        bullet("PYTHON — upload your own .py strategy file, or load one from the built-in Strategy Library.")
+        bullet("PINESCRIPT — upload a TradingView-style .pine strategy (a supported subset of syntax).")
+        bullet("MQL5 — upload a MetaTrader .mq5 Expert Advisor (a supported subset of syntax).")
+        numstep(1, "Click 02 STRATEGY and pick one of the four buttons at the top.")
+        numstep(2, "MANUAL: fill in the visual builder — indicators, then entry/exit rules, then a stop-loss/"
+                    "take-profit. PYTHON/PINESCRIPT/MQL5: upload a file, or load a saved one from the Strategy Library.")
+        tip(
+            "New to this? Start with MANUAL and a simple moving-average crossover — it's the fastest way to "
+            "see the whole app work end to end before bringing in your own code."
+        )
+        rule()
+
+        h2("STEP 3 — Enter your prop firm's rules (03 PROP RULES)")
+        body(
+            "These numbers come straight from your prop firm's rulebook — check their FAQ/PDF, since getting "
+            "this wrong makes every result downstream meaningless."
+        )
+        bullet("Account size, evaluation profit target %, daily loss limit %, maximum drawdown %.")
+        bullet("Drawdown type (trailing vs static) and drawdown check mode (intrabar vs end-of-day) — match "
+               "these exactly to what your firm documents.")
+        bullet("Optional: payout threshold/cap/frequency, minimum trading days, position size limits.")
+        rule()
+
+        h2("STEP 4 — Set risk & execution (04 RISK)")
+        body("Position sizing, trading costs, and execution assumptions used by the backtest engine.")
+        bullet("Initial balance, risk mode (percent of equity vs fixed), and risk per trade.")
+        bullet("Spread/slippage/commission — leave at realistic defaults unless your broker publishes different numbers.")
+        tip("Not sure what to put here? The defaults are sane starting points — you can always come back and tune them.")
+        rule()
+
+        h2("STEP 5 — Run a single backtest (05 RUN & REPORT)")
+        body(
+            "This runs your strategy exactly as configured, once, and produces one HTML report: "
+            "Backtest → Prop Simulation → Monte Carlo → Report."
+        )
+        numstep(1, "Click 05 RUN & REPORT, set the number of Monte Carlo simulations (10,000 is a good default).")
+        numstep(2, "Click RUN FULL PIPELINE on this tab, then OPEN HTML REPORT once it finishes.")
+        warn(
+            "This tab's button is also labeled RUN FULL PIPELINE, but it is NOT the same as the 15 FULL "
+            "PIPELINE tab below — this one just runs your strategy once, as-is. The 15 FULL PIPELINE tab "
+            "(Step 9 in this guide) automatically searches for a better configuration and validates it out-"
+            "of-sample before giving you a verdict. For a first pass, most people skip straight to Step 9."
+        )
+        rule()
+
+        h2("STEPS 6-8, 10-14 — optional deeper validation tools")
+        body(
+            "Everything between here and the Full Pipeline tab is optional and can be safely skipped on a "
+            "first pass through the app:"
+        )
+        bullet("06 REFINEMENT / 13 WALK-FORWARD GA — automatically search for better parameter values.")
+        bullet("07 SEARCH LAB — generate and test many strategy variants at once.")
+        bullet("08 WALK-FORWARD OPT / 09 CPCV-PBO / 10 SENSITIVITY / 12 MULTI-OBJECTIVE — deeper robustness "
+               "checks quants use to catch overfitting.")
+        bullet("11 PORTFOLIO — backtest several strategies/instruments together as one portfolio.")
+        bullet("14 ENSEMBLE — combine several strategies' signals into one.")
+        tip(
+            "These are all genuinely useful once you have a strategy worth digging into further — just not "
+            "required to get your first result. The 15 FULL PIPELINE tab below already runs a solid, "
+            "automated version of parameter search and out-of-sample validation on its own."
+        )
+        rule()
+
+        h2("STEP 9 — Run the Full Pipeline (15 FULL PIPELINE) — the recommended one-button path")
+        body(
+            "This is the fastest way to get a trustworthy answer: it backtests your strategy as given, "
+            "automatically searches for a configuration that generalizes (scored only on data it wasn't "
+            "tuned on), re-validates the winner with a fresh Monte Carlo run, checks it holds up across "
+            "several different historical stretches, and gives you one plain verdict."
+        )
+        numstep(1, "Make sure Steps 1-4 above are filled in (data selected, strategy built, prop rules and risk set).")
+        numstep(2, "Click 15 FULL PIPELINE, leave the default settings for a first run, and click RUN FULL PIPELINE.")
+        numstep(3, "Watch the live progress log — it can take anywhere from under a minute to several minutes "
+                    "depending on your data size and settings.")
+        numstep(4, "Read the VERDICT box at the top once it finishes:")
+        substep("READY — passed every check: Monte Carlo pass probability, drawdown, out-of-sample stability, "
+                "and the signal-quality (ICIR) gate.")
+        substep("MARGINAL — passed some but not all checks — worth a closer look before trusting it.")
+        substep("NOT READY — failed enough checks that this configuration isn't trustworthy as-is; check the "
+                "listed reasons for exactly why.")
+        substep("The Verdict box lists the specific reason for every pass/fail — scroll down within the box "
+                "(or the page) if the full list runs long.")
+        tip(
+            "For Python/PineScript/MQL5 strategies, the winning version is automatically saved into the "
+            "Strategy Library, tagged 'validated', ready to use again later or take straight into 16 LIVE "
+            "DEMO TEST."
+        )
+        rule()
+
+        h2("STEP 10 — Live Demo Test on a real broker feed (16 LIVE DEMO TEST)")
+        body(
+            "Once a strategy looks good in the Full Pipeline, this deploys it to a free MetaTrader 5 (MT5) "
+            "demo account so you can watch it trade forward against real, live broker prices — still no real "
+            "money, no live/funded order path exists in this app."
+        )
+        h3("One-time MT5 setup")
+        numstep(1, "Download and install the MT5 terminal (64-bit) — any MT5-supporting broker's website offers "
+                    "a free download, or your prop firm's own site if they provide one.")
+        numstep(2, "Open the terminal and create a free demo account from within it (File → Open an Account → "
+                    "choose a demo account) — this gives you a login number, server name, and password.")
+        numstep(3, "In this app's 16 LIVE DEMO TEST tab, enter that login, server, and password under "
+                    "'MT5 Demo Account'.")
+        numstep(4, "Click SAVE & TEST CONNECTION.")
+        substep(
+            "If it fails saying the terminal wasn't found, click AUTO-DETECT first (it searches the common "
+            "Windows install locations), or BROWSE... to point directly at terminal64.exe if MT5 is installed "
+            "somewhere unusual."
+        )
+        substep("This tab only works on Windows with the MT5 terminal actually installed and running.")
+        h3("Running a session")
+        numstep(1, "Pick a saved strategy from the Strategy Library dropdown.")
+        numstep(2, "Set the symbol (must match the exact name in your MT5 broker's Market Watch, e.g. 'XAUUSD') "
+                    "and your risk settings.")
+        numstep(3, "Click START LIVE DEMO TEST. Watch trades appear in the trade journal and live log as they happen.")
+        warn(
+            "The red KILL SWITCH — FLATTEN & STOP button immediately closes every open position and stops the "
+            "session. Use it any time something looks wrong."
+        )
+        rule()
+
+        # -------------------------------------------------------------
+        # Short version recap
+        # -------------------------------------------------------------
+        h1("SHORT VERSION — RECAP")
+        body("Once you've done the full walkthrough once, this is all you need to remember for next time:")
+        numstep(1, "01 DATA → select or fetch your data.")
+        numstep(2, "02 STRATEGY → pick/build your strategy.")
+        numstep(3, "03 PROP RULES + 04 RISK → confirm these still match your firm/settings.")
+        numstep(4, "15 FULL PIPELINE → RUN FULL PIPELINE → read the verdict.")
+        numstep(5, "If READY and you want to see it trade live → 16 LIVE DEMO TEST.")
+        tip("That's the whole loop. Everything else in the sidebar is there for when you want to dig deeper.")
+
+        text.config(state="disabled")
+
+    def _generic_text_wheel(self, text_widget, event):
+        delta = -1 if getattr(event, "delta", 0) > 0 else 1
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        text_widget.yview_scroll(delta * 3, "units")
+        return "break"
 
     # -----------------------------------------------------------------------
     # Tab 1 — Market Data
@@ -5891,9 +6186,9 @@ class MainWindow:
         verdict_section = self._section(f, "Verdict", "Filled in once a run completes.")
         self.fullpipeline_verdict_label = Label(
             verdict_section, text="No run yet.", bg=PANEL, fg=TEXT_DIM,
-            font=_safe_font(11, "bold"), justify="left",
+            font=_safe_font(11, "bold"), justify="left", wraplength=820, anchor="w",
         )
-        self.fullpipeline_verdict_label.pack(anchor="w", padx=18, pady=(2, 10))
+        self.fullpipeline_verdict_label.pack(anchor="w", fill="x", padx=18, pady=(2, 10))
 
         output_section = self._section(f, "Full Pipeline output", "Live progress log.")
         self.fullpipeline_output = Text(
@@ -6068,7 +6363,7 @@ class MainWindow:
 
 
     # -----------------------------------------------------------------------
-    # Tab 16 — Forward Test (MT5 Demo)
+    # Tab 16 — Live Demo Test (MT5 Demo)
     # -----------------------------------------------------------------------
 
     def _build_forward_test_tab(self):
@@ -6079,7 +6374,7 @@ class MainWindow:
         self._page_header(
             f,
             "16 / Going Live",
-            "Forward Test (MT5 Demo)",
+            "Live Demo Test (MT5 Demo)",
             "Deploy any Strategy Library strategy to a free MetaTrader 5 demo account and "
             "watch it trade forward, bar by bar, against real broker prices instead of a "
             "CSV. Uses the exact same signal engine and position-sizing math as the "
@@ -6098,7 +6393,7 @@ class MainWindow:
                 text="To use this tab: run the app on Windows with an MT5 terminal installed "
                      "and logged into a demo account (any MT5 broker's site offers a free demo "
                      "account signup), and make sure `pip install MetaTrader5` succeeded. The "
-                     "rest of this tab still works for entering settings -- Start Forward Test "
+                     "rest of this tab still works for entering settings -- Start Live Demo Test "
                      "will just fail with a clear message until MT5 is reachable.",
                 bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
             ).pack(anchor="w", padx=18, pady=(0, 12))
@@ -6183,7 +6478,7 @@ class MainWindow:
         control_section = self._section(f, "Session control", "")
         btn_row = Frame(control_section, bg=PANEL)
         btn_row.pack(fill="x", padx=18, pady=(2, 4))
-        self.ft_start_btn = self._button(btn_row, "START FORWARD TEST", self._ft_start_clicked, primary=True)
+        self.ft_start_btn = self._button(btn_row, "START LIVE DEMO TEST", self._ft_start_clicked, primary=True)
         self.ft_start_btn.pack(side="left")
         self.ft_stop_btn = self._button(btn_row, "STOP", self._ft_stop_clicked)
         self.ft_stop_btn.pack(side="left", padx=8)
@@ -6249,7 +6544,7 @@ class MainWindow:
             return PineScriptStrategy(text)
         if item.strategy_type == "mql5":
             return MQL5Strategy(text)
-        raise StrategyError(f"Unsupported strategy type for forward test: {item.strategy_type}")
+        raise StrategyError(f"Unsupported strategy type for live demo test: {item.strategy_type}")
 
     def _ft_timeframe_minutes(self) -> int:
         mapping = {

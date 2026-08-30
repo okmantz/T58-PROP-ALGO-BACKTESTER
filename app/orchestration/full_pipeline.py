@@ -57,6 +57,7 @@ reason, never allowed to take down a run that otherwise succeeded.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,8 +268,18 @@ def run_full_pipeline(
     progress_cb: ProgressCallback | None = None,
     instrument: str = "unknown",
     ollama_settings: "OllamaSettings | None" = None,
+    report_basename: str = "full_pipeline_report",
 ) -> FullPipelineResult:
     """
+    report_basename: filename stem (no extension) for the written report,
+    e.g. "full_pipeline_report" -> full_pipeline_report.html /
+    full_pipeline_report.json in `output_dir`. Defaults to the fixed name
+    every single-strategy run has always used. IMPORTANT for callers that
+    run this in a loop (see run_full_pipeline_batch below): every call
+    with the same output_dir AND the same report_basename overwrites the
+    previous call's report -- pass a distinct report_basename per
+    strategy when running more than one against the same output_dir.
+
     ollama_settings: optional. When provided and `.is_usable` (enabled,
     with a host configured -- see app.ai.ollama_settings), Step 2's
     walk-forward-aware GA asks a local Ollama model for candidate
@@ -566,7 +577,7 @@ def run_full_pipeline(
             final_bt, final_single_run, final_mc, final_holdout,
             oos_validation, oos_skip_reason, icir_gate, icir_gate_skip_reason, verdict, verdict_reasons,
             df, prop_rules, risk, cfg, elapsed, warnings, log, output_dir,
-            instrument,
+            instrument, report_basename,
         )
     finally:
         if final_tmp_dir is not None:
@@ -580,7 +591,7 @@ def _finish(
     final_bt, final_single_run, final_mc, final_holdout,
     oos_validation, oos_skip_reason, icir_gate, icir_gate_skip_reason, verdict, verdict_reasons,
     df, prop_rules, risk, cfg, elapsed, warnings, log, output_dir,
-    instrument="unknown",
+    instrument="unknown", report_basename="full_pipeline_report",
 ) -> FullPipelineResult:
     """Writes the report + (for code strategies) saves the winner into the
     Strategy Library. Split out of run_full_pipeline only to keep that
@@ -608,7 +619,7 @@ def _finish(
         prop_rules=prop_rules,
         prop_single_run=final_single_run,
         monte_carlo_result=final_mc,
-        basename="full_pipeline_report",
+        basename=report_basename,
         holdout_comparison=final_holdout,
         risk_config=risk,
         price_df=df,
@@ -684,3 +695,139 @@ def _finish(
         elapsed_seconds=elapsed,
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch Full Pipeline -- run the WHOLE 7-step pipeline (not just a plain
+# backtest) against every strategy in a list, one after another.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FullPipelineBatchItem:
+    label: str                                    # display name (e.g. the library filename)
+    strategy: Strategy
+    library_ref: tuple[str, str] | None = None     # (strategy_type, filename) -- library-sourced items only
+
+
+@dataclass
+class FullPipelineBatchOutcome:
+    label: str
+    ok: bool
+    reason: str | None = None                      # set when ok is False
+    verdict: str | None = None                      # "READY" / "MARGINAL" / "NOT READY"
+    trades: int = 0
+    net_profit: float = 0.0
+    eval_pass_probability: float = 0.0
+    report_html: Path | None = None
+    result: "FullPipelineResult | None" = None
+
+
+@dataclass
+class FullPipelineBatchSummary:
+    outcomes: list = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+
+    @property
+    def succeeded(self) -> list:
+        return [o for o in self.outcomes if o.ok]
+
+    @property
+    def failed(self) -> list:
+        return [o for o in self.outcomes if not o.ok]
+
+
+def run_full_pipeline_batch(
+    df: pd.DataFrame,
+    items: list[FullPipelineBatchItem],
+    risk: RiskConfig,
+    prop_rules: PropRules,
+    output_dir: str | Path,
+    cfg: FullPipelineConfig | None = None,
+    instrument: str = "unknown",
+    ollama_settings: "OllamaSettings | None" = None,
+    progress_cb: ProgressCallback | None = None,
+) -> FullPipelineBatchSummary:
+    """Runs app.orchestration.full_pipeline.run_full_pipeline (the full
+    baseline -> walk-forward-aware GA -> final validation -> OOS check ->
+    holdout check -> ICIR gate -> report pipeline, not just a plain
+    backtest) against every item in `items`, one after another, writing
+    one full report per strategy and recording each result back onto its
+    own Strategy Library metadata exactly like a single Full Pipeline run
+    already does.
+
+    This exists specifically because Strategy Library multi-select +
+    the batch queue previously only ever fed app.orchestration.batch_test
+    (a plain backtest -> prop-sim -> Monte Carlo pipeline) -- there was no
+    way to run the full 7-step Full Pipeline against more than one
+    strategy without loading and running each one individually. This is
+    the batch equivalent of that: same idea as run_batch_test, just
+    calling the heavier, more thorough pipeline per item instead.
+
+    One bad strategy (backtest error, zero trades, a GA/validation step
+    that fails) is recorded as a failed outcome and the rest of the batch
+    keeps going -- it never aborts the whole run. Every item uses the same
+    `cfg` (GA population/generations/etc.) and the same `risk`/`prop_rules`
+    -- whatever is configured on the Full Pipeline tab at the moment the
+    batch is started."""
+    def log(msg: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+
+    cfg = cfg or FullPipelineConfig()
+    t0 = time.time()
+    outcomes: list[FullPipelineBatchOutcome] = []
+
+    for i, item in enumerate(items, start=1):
+        log(f"\n===== [{i}/{len(items)}] Full Pipeline: {item.label} =====")
+
+        def item_log(msg: str, _label=item.label) -> None:
+            log(f"  {msg}")
+
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", item.label) or f"strategy_{i}"
+        try:
+            result = run_full_pipeline(
+                df, item.strategy, risk, prop_rules, output_dir, cfg,
+                progress_cb=item_log, instrument=instrument, ollama_settings=ollama_settings,
+                report_basename=f"full_pipeline_{i:03d}_{safe_name}",
+            )
+        except Exception as exc:  # noqa: BLE001 -- one bad strategy must not stop the batch
+            log(f"  Skipped -- Full Pipeline error: {exc}")
+            outcomes.append(FullPipelineBatchOutcome(item.label, ok=False, reason=str(exc)))
+            continue
+
+        if item.library_ref is not None:
+            try:
+                from app.strategy.library import record_backtest_result
+                record_backtest_result(item.library_ref[0], item.library_ref[1], {
+                    "trades": len(result.final_bt.trades),
+                    "net_profit": round(result.final_bt.statistics.net_profit, 2),
+                    "win_rate": round(result.final_bt.statistics.win_rate, 1),
+                    "max_dd": round(result.final_bt.statistics.max_drawdown_pct, 2),
+                    "eval_pass_probability": round(result.final_mc.evaluation_pass_probability, 1),
+                    "first_payout_probability": round(result.final_mc.first_payout_probability, 1),
+                    "verdict": result.verdict,
+                    "report_html": str(result.report_paths["html"]),
+                })
+            except Exception:  # noqa: BLE001 -- recording to the library is a convenience, not core output
+                pass
+
+        log(
+            f"  Verdict: {result.verdict}  |  Trades: {len(result.final_bt.trades)}  |  "
+            f"Net profit: ${result.final_bt.statistics.net_profit:,.2f}  |  "
+            f"Eval pass probability: {result.final_mc.evaluation_pass_probability:.1f}%  |  "
+            f"Report: {result.report_paths['html'].name}"
+        )
+        outcomes.append(FullPipelineBatchOutcome(
+            item.label, ok=True, verdict=result.verdict,
+            trades=len(result.final_bt.trades),
+            net_profit=result.final_bt.statistics.net_profit,
+            eval_pass_probability=result.final_mc.evaluation_pass_probability,
+            report_html=result.report_paths["html"], result=result,
+        ))
+
+    elapsed = time.time() - t0
+    log(
+        f"\nBatch Full Pipeline complete in {elapsed:.1f}s. {len(items)} strategy(ies) attempted, "
+        f"{sum(1 for o in outcomes if o.ok)} produced a report."
+    )
+    return FullPipelineBatchSummary(outcomes=outcomes, elapsed_seconds=elapsed)

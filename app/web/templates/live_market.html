@@ -165,6 +165,7 @@
 
   <button class="lm-btn" id="lm-apply">APPLY</button>
   <button class="lm-btn" id="lm-fit">FIT CHART</button>
+  <button class="lm-btn" id="lm-tradingview" title="Opens the real tradingview.com chart for this symbol in a new tab -- no local data source needed.">OPEN IN TRADINGVIEW</button>
 
   <div class="lm-spacer"></div>
   <span class="lm-status-badge lm-status-replay" id="lm-status-badge"><span class="lm-status-dot"></span><span id="lm-status-text">CONNECTING</span></span>
@@ -327,6 +328,27 @@
   });
 
   document.getElementById('lm-fit').addEventListener('click', () => chart.timeScale().fitContent());
+
+  // Rough symbol -> TradingView-ticker mapping for the common cases this
+  // app already deals with -- mirrors the desktop app's
+  // _tradingview_symbol_for() (see app/ui/main_window.py) so the two
+  // "open in TradingView" buttons behave the same. Anything not
+  // recognized is passed through as-is; TradingView still does a
+  // best-effort search on a bare ticker.
+  const TV_SYMBOL_MAP = {
+    XAUUSD: 'OANDA:XAUUSD', XAGUSD: 'OANDA:XAGUSD',
+    EURUSD: 'OANDA:EURUSD', GBPUSD: 'OANDA:GBPUSD', USDJPY: 'OANDA:USDJPY',
+    USDCHF: 'OANDA:USDCHF', USDCAD: 'OANDA:USDCAD', AUDUSD: 'OANDA:AUDUSD',
+    NZDUSD: 'OANDA:NZDUSD', EURJPY: 'OANDA:EURJPY', GBPJPY: 'OANDA:GBPJPY',
+    EURGBP: 'OANDA:EURGBP',
+    US30: 'OANDA:US30USD', NAS100: 'OANDA:NAS100USD', SPX500: 'OANDA:SPX500USD',
+    USOIL: 'OANDA:WTICOUSD', BTCUSD: 'COINBASE:BTCUSD', ETHUSD: 'COINBASE:ETHUSD',
+  };
+  document.getElementById('lm-tradingview').addEventListener('click', () => {
+    const raw = (symbolInput.value || 'XAUUSD').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const tvSymbol = TV_SYMBOL_MAP[raw] || raw || 'OANDA:XAUUSD';
+    window.open('https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(tvSymbol), '_blank');
+  });
 
   // ------------------------------------------------------------------
   // Data polling loop

@@ -33,14 +33,42 @@ generates the code.
 """
 from __future__ import annotations
 
+import json
 import re
+import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from app.ai.ollama_settings import OllamaSettings
 
-DEFAULT_TIMEOUT_SECONDS = 180  # code generation runs longer than a short numeric suggestion
+# This is a STALL timeout (max seconds of silence between streamed tokens),
+# not a total-runtime timeout -- see generate_strategy(). A local model can
+# legitimately take several minutes to draft a whole file; what actually
+# indicates trouble is the model going quiet mid-response.
+DEFAULT_TIMEOUT_SECONDS = 180
+# Hard ceiling on total wall-clock time even while tokens keep arriving, so a
+# model that's technically still "responding" (one token every few seconds,
+# forever) can't hang the UI indefinitely.
+DEFAULT_MAX_TOTAL_SECONDS = 900
 DEFAULT_N_RESEARCH_EXCERPTS = 3
 DEFAULT_N_PRIOR_EXAMPLES = 2
+
+# Deliberately modest defaults -- "use minimal resources but get the job
+# done." A strategy file this app can actually load is at most a few hundred
+# lines, so neither a huge context window nor a huge output cap buys
+# anything here; both just cost RAM/VRAM and time on whatever machine Ollama
+# is running on. Raised these only if generation keeps visibly getting cut
+# off mid-file for a particular idea/model.
+DEFAULT_NUM_CTX = 4096
+DEFAULT_NUM_PREDICT = 1800
+
+# Model unloads from memory this long after the request finishes, instead of
+# lingering resident indefinitely (Ollama's own default keep_alive is 5
+# minutes, which is fine to stay explicit about here rather than depend on
+# whatever the local install's default happens to be).
+KEEP_ALIVE = "5m"
+
+ProgressCallback = Callable[[int, float], None]  # (tokens_so_far, elapsed_seconds)
 
 LANGUAGE_EXTENSIONS = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}
 
@@ -273,6 +301,10 @@ def generate_strategy(
     n_research_excerpts: int = DEFAULT_N_RESEARCH_EXCERPTS,
     n_prior_examples: int = DEFAULT_N_PRIOR_EXAMPLES,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_total_seconds: int = DEFAULT_MAX_TOTAL_SECONDS,
+    num_ctx: int = DEFAULT_NUM_CTX,
+    num_predict: int = DEFAULT_NUM_PREDICT,
+    progress_cb: ProgressCallback | None = None,
 ) -> GenerationResult:
     """Asks the configured local Ollama model to draft a new strategy file
     for the given language, grounded in your research/ folder (systematic
@@ -281,7 +313,20 @@ def generate_strategy(
     GenerationResult (with `.error` explaining why) on any failure --
     never raises. The caller is responsible for saving the result (always
     as a "draft" -- see app.strategy.library.DEFAULT_STATUS) and for ever
-    actually testing/running it; nothing here does either."""
+    actually testing/running it; nothing here does either.
+
+    Streams the response instead of waiting for one giant reply: `timeout`
+    is a STALL timeout (max seconds of silence between tokens) rather than
+    a wall-clock deadline on the whole generation, since a small local
+    model can legitimately take minutes to write a few hundred lines --
+    what actually signals trouble is the model going quiet mid-response,
+    not simply taking a while. `max_total_seconds` is a separate hard
+    ceiling so a model that's technically still trickling out tokens
+    forever still eventually gets cut off. `num_ctx`/`num_predict` are
+    passed to Ollama to keep this one-off call's memory/compute footprint
+    modest (see the module-level DEFAULT_NUM_CTX/DEFAULT_NUM_PREDICT
+    comment) -- raise them from the UI only if a particular idea/model
+    keeps visibly getting cut off mid-file."""
     import requests
 
     if language not in _CONTRACTS:
@@ -304,20 +349,79 @@ def generate_strategy(
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"
 
+    payload = {
+        "model": settings.model,
+        "prompt": prompt,
+        "stream": True,
+        "keep_alive": KEEP_ALIVE,
+        "options": {
+            # Keep resource usage minimal: a small context window and a
+            # capped output length are both plenty for a strategy file
+            # this app's own parsers can actually load, and both directly
+            # reduce RAM/VRAM and per-token compute versus a model's
+            # (often much larger) defaults.
+            "num_ctx": max(512, int(num_ctx)),
+            "num_predict": max(64, int(num_predict)),
+            "temperature": 0.2,
+        },
+    }
+
+    raw_text_parts: list[str] = []
+    t0 = time.monotonic()
+    last_progress = t0
     try:
+        # timeout=(connect, read): the read half applies PER SOCKET READ
+        # while streaming, not to the request as a whole -- so as long as
+        # another token/chunk keeps arriving within `timeout` seconds, the
+        # request keeps going even past `timeout` seconds of total elapsed
+        # time. This is what actually fixes "didn't respond in time" for a
+        # slow local model that's still working, as opposed to one that's
+        # genuinely stuck.
         resp = requests.post(
-            f"{host}/api/generate",
-            headers=headers,
-            json={"model": settings.model, "prompt": prompt, "stream": False},
-            timeout=timeout,
+            f"{host}/api/generate", headers=headers, json=payload,
+            stream=True, timeout=(10, timeout),
         )
         resp.raise_for_status()
-        raw_text = resp.json().get("response", "")
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            elapsed = time.monotonic() - t0
+            if elapsed > max_total_seconds:
+                resp.close()
+                return GenerationResult(
+                    error=f"Ollama at {host} has been generating for over "
+                          f"{max_total_seconds // 60} minutes without finishing -- stopped it. "
+                          f"Try a smaller/more specific idea or a smaller, faster model.",
+                    rationale="".join(raw_text_parts)[:1000],
+                )
+            try:
+                chunk = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            piece = chunk.get("response", "")
+            if piece:
+                raw_text_parts.append(piece)
+                if progress_cb and (time.monotonic() - last_progress) >= 1.5:
+                    last_progress = time.monotonic()
+                    try:
+                        progress_cb(len(raw_text_parts), elapsed)
+                    except Exception:
+                        pass
+            if chunk.get("error"):
+                return GenerationResult(error=f"Ollama error: {chunk['error']}")
+            if chunk.get("done"):
+                break
+        raw_text = "".join(raw_text_parts)
     except requests.exceptions.ConnectionError:
         return GenerationResult(error=f"Couldn't reach Ollama at {host} (is it running?).")
     except requests.exceptions.Timeout:
-        return GenerationResult(error=f"Ollama at {host} didn't respond in time -- code generation can take a while "
-                                       f"on a local model; try a smaller idea or a faster model.")
+        return GenerationResult(
+            error=f"Ollama at {host} went quiet for over {timeout}s mid-generation (no new output at "
+                  f"all in that window) -- the model may be stuck, or the machine is out of resources. "
+                  f"Try a smaller idea, a smaller/faster model, or lowering the context/output-length "
+                  f"settings above.",
+            rationale="".join(raw_text_parts)[:1000],
+        )
     except Exception as exc:
         return GenerationResult(error=f"Ollama request failed: {exc}")
 

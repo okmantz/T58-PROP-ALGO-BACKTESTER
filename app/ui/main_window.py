@@ -33,6 +33,7 @@ from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig, suggest_pip_size
 import app.ai.ollama_settings as ollama_settings_module
 from app.ai.ollama_settings import OllamaSettings
+import app.ai.strategy_generator as strategy_generator_module
 from app.data import alpaca_credentials
 from app.data.alpaca_source import (
     ASSET_CLASSES, ADJUSTMENT_CHOICES, FEED_CHOICES, TIMEFRAME_LABELS,
@@ -56,7 +57,9 @@ from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_itera
 from app.optimize.multi_objective import DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
-from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
+from app.orchestration.full_pipeline import (
+    FullPipelineBatchItem, FullPipelineConfig, run_full_pipeline, run_full_pipeline_batch,
+)
 from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
@@ -3022,12 +3025,28 @@ class MainWindow:
         self._button(
             queue_btn_row, "RUN BATCH TEST", self._run_batch_queue_clicked, primary=True
         ).pack(side="left")
+        self._button(
+            queue_btn_row, "RUN FULL PIPELINE (BATCH)", self._run_full_pipeline_queue_clicked, primary=True
+        ).pack(side="left", padx=8)
 
         Label(
+            queue_section, text="RUN BATCH TEST runs every queued strategy through the plain "
+            "backtest -> prop-sim -> Monte Carlo pipeline (fast). RUN FULL PIPELINE (BATCH) runs "
+            "every queued strategy through the FULL 15 Full Pipeline instead (baseline -> "
+            "walk-forward-aware GA search -> re-validated Monte Carlo -> out-of-sample check -> "
+            "holdout check -> ICIR gate -> verdict) -- slower per strategy since it includes the "
+            "GA search, but this is how you batch-test hundreds of selected strategies through "
+            "the full validation ladder without opening and running Full Pipeline on each one by "
+            "hand. Either way: one saved report per strategy, using whatever settings are "
+            "currently configured on 03 Prop Rules / 04 Risk (and, for the Full Pipeline batch, "
+            "15 Full Pipeline's own GA/AI Assist settings) at the moment you click.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(4, 0))
+        Label(
             queue_section, text="LOAD SELECTED FROM QUEUE puts one queued strategy into the "
-            "STRATEGY SOURCE slot above -- so 15 Full Pipeline, 06 Refinement, 08 Walk-Forward "
-            "Opt, 10 Sensitivity, and 12 Multi-Objective (which each only ever run against ONE "
-            "loaded strategy) can step through this same queue one at a time, instead of you "
+            "STRATEGY SOURCE slot above -- for the single-strategy tabs (06 Refinement, 08 "
+            "Walk-Forward Opt, 10 Sensitivity, 12 Multi-Objective) that only ever run against ONE "
+            "loaded strategy, so you can step through this same queue one at a time instead of "
             "re-browsing/re-selecting for each one.",
             bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
         ).pack(anchor="w", padx=18, pady=(4, 0))
@@ -3842,6 +3861,145 @@ class MainWindow:
             # to the mainloop via root.after instead of being called here
             # directly. Calling them straight from a worker thread is what
             # produces the occasional glitchy/frozen UI after a batch run.
+            def _refresh_after_run():
+                try:
+                    self._refresh_dashboard()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_strategy_library()
+                except Exception:
+                    pass
+            try:
+                self.root.after(0, _refresh_after_run)
+            except Exception:
+                pass
+        except Exception:
+            log("\nUnexpected error:\n" + traceback.format_exc())
+
+    def _run_full_pipeline_queue_clicked(self):
+        items = list(self._batch_queue)
+        if not items:
+            messagebox.showinfo(
+                "Queue is empty",
+                "Nothing is queued yet. Select one or more saved strategies above and click "
+                "ADD SELECTED TO BATCH QUEUE first.",
+            )
+            return
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1 before testing strategies.")
+            return
+        proceed = messagebox.askokcancel(
+            "Run Full Pipeline on multiple strategies?",
+            f"This runs the FULL Full Pipeline (baseline, walk-forward-aware GA search, "
+            f"re-validated Monte Carlo, out-of-sample check, holdout check, ICIR gate) for all "
+            f"{len(items)} queued strategy(ies), one after another. This is much slower per "
+            f"strategy than RUN BATCH TEST -- for a large queue (dozens to hundreds) this can "
+            f"run for a long time in the background. Continue?",
+        )
+        if not proceed:
+            return
+        win, append = self._open_progress_window(f"Full Pipeline: {len(items)} strategy(ies)...")
+        threading.Thread(
+            target=self._run_library_full_pipeline_batch, args=(items, append), daemon=True,
+        ).start()
+
+    def _run_library_full_pipeline_batch(self, items, log):
+        """Runs every queued Strategy Library item through
+        app.orchestration.full_pipeline.run_full_pipeline_batch -- the same
+        FULL 7-step pipeline the 15 Full Pipeline tab's single-strategy
+        RUN FULL PIPELINE button uses, just looped over every strategy
+        staged in the Batch test queue instead of one loaded strategy.
+        GA population/generations/etc. and AI Assist settings are read
+        fresh from the 15 Full Pipeline tab's own widgets, so whatever is
+        configured there (and on 03/04) at the moment this is clicked is
+        what every queued strategy runs with."""
+        try:
+            log(f"Loading {len(self.csv_paths)} market data file(s)...")
+            per_file_results = []
+            for p in self.csv_paths:
+                result = import_csv(p)
+                if not result.is_valid:
+                    log(f"Import errors ({os.path.basename(p)}):\n" + "\n".join(result.errors))
+                    return
+                per_file_results.append((p, result))
+            if len(per_file_results) == 1:
+                df = per_file_results[0][1].dataframe
+            else:
+                df, _labels = merge_multi_timeframe([r.dataframe for _, r in per_file_results])
+            log(f"Loaded {len(df)} bars.\n")
+
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            instrument = (
+                os.path.basename(self.csv_paths[0]) if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+
+            # Same settings the 15 Full Pipeline tab's own RUN FULL PIPELINE
+            # button reads -- see _fullpipeline_run_pipeline. Falls back to
+            # FullPipelineConfig()'s defaults if that tab was never opened
+            # this session (its widgets are only created once the tab is
+            # built, which happens unconditionally at startup, so this
+            # should always be available in practice).
+            try:
+                metric_key = self._fp_metric_label_to_key.get(self.fp_metric.get_str(), "composite_prop_score")
+                cfg = FullPipelineConfig(
+                    n_folds=self.fp_folds.get_int(4),
+                    window_mode=self.fp_window_mode.get_str(),
+                    ga_population=self.fp_population.get_int(12),
+                    ga_generations=self.fp_generations.get_int(6),
+                    ga_search_mc_sims=self.fp_search_mc_sims.get_int(200),
+                    fitness_metric=metric_key,
+                    final_mc_sims=self.fp_final_mc_sims.get_int(10000),
+                    holdout_frac=self.fp_holdout_frac.get_float(0.2),
+                    oos_check_folds=self.fp_folds.get_int(4),
+                    random_seed=self.fp_seed.get_int(42),
+                    save_to_library=self.fp_save_to_library.var.get(),
+                    library_status=self._fp_status_label_to_key.get(self.fp_library_status.get_str()),
+                )
+                ollama_settings = self._build_ollama_settings()
+            except Exception:
+                cfg = FullPipelineConfig()
+                ollama_settings = None
+            log(
+                f"Using Full Pipeline settings from the 15 Full Pipeline tab: "
+                f"population={cfg.ga_population}, generations={cfg.ga_generations}, "
+                f"folds={cfg.n_folds}.\n"
+            )
+
+            batch_items = []
+            for item in items:
+                try:
+                    strategy = self._load_bulk_strategy(item.path)
+                except Exception as exc:
+                    log(f"  Skipped {item.name} -- could not load: {exc}")
+                    continue
+                batch_items.append(
+                    FullPipelineBatchItem(label=item.name, strategy=strategy, library_ref=(item.strategy_type, item.name))
+                )
+
+            if not batch_items:
+                log("\nNothing to test -- every queued strategy failed to load.")
+                return
+
+            summary = run_full_pipeline_batch(
+                df, batch_items, risk, rules, OUTPUT_DIR / "full_pipeline",
+                cfg=cfg, instrument=instrument, ollama_settings=ollama_settings, progress_cb=log,
+            )
+            if summary.succeeded:
+                ranked = sorted(summary.succeeded, key=lambda o: o.eval_pass_probability, reverse=True)
+                log("\nRanked by eval pass probability:")
+                for o in ranked:
+                    log(f"  {o.eval_pass_probability:5.1f}%  ${o.net_profit:>12,.2f}   [{o.verdict}]   {o.label}")
+            if summary.failed:
+                log("\nFailed / skipped:")
+                for o in summary.failed:
+                    log(f"  {o.label}: {o.reason}")
+
+            # Background thread -- see _run_library_batch_test_pipeline for
+            # why these refreshes are routed through root.after instead of
+            # called directly.
             def _refresh_after_run():
                 try:
                     self._refresh_dashboard()
@@ -6763,6 +6921,26 @@ class MainWindow:
 
         self._build_ai_assist_section(f, prefix="genstrat_ai")
 
+        resource_section = self._section(
+            f, "Resource usage (local Ollama)",
+            "Keeps this one-off code-generation call lean on a local machine -- a smaller "
+            "context window and output cap mean less RAM/VRAM used and a faster response, "
+            "without materially limiting a strategy file (a few hundred lines fits "
+            "comfortably within these defaults). The request also streams its response "
+            "instead of waiting for one giant reply, so a slow model that's still actively "
+            "producing tokens won't get cut off just for taking a while -- only a model that "
+            "goes fully quiet mid-response, or runs past the hard time cap below, does. Raise "
+            "these only if generation keeps visibly getting cut off mid-file.",
+        )
+        self.genstrat_num_ctx = LabeledEntry(resource_section, "Context window (tokens)", strategy_generator_module.DEFAULT_NUM_CTX)
+        self.genstrat_num_predict = LabeledEntry(resource_section, "Max output length (tokens)", strategy_generator_module.DEFAULT_NUM_PREDICT)
+        self.genstrat_stall_timeout = LabeledEntry(
+            resource_section, "Stall timeout -- seconds of total silence before giving up", strategy_generator_module.DEFAULT_TIMEOUT_SECONDS,
+        )
+        self.genstrat_max_total = LabeledEntry(
+            resource_section, "Hard time cap (seconds, even if still generating)", strategy_generator_module.DEFAULT_MAX_TOTAL_SECONDS,
+        )
+
         btn_row = Frame(f, bg=BG)
         btn_row.pack(fill="x", padx=24, pady=(2, 10))
         self.genstrat_run_btn = self._button(btn_row, "GENERATE DRAFT", self._genstrat_generate_clicked, primary=True)
@@ -6818,13 +6996,36 @@ class MainWindow:
         self.genstrat_status.config(text="Generating... this can take a while on a local model.", fg=AMBER)
         self.genstrat_run_btn.config(state="disabled")
         self.genstrat_progress.start(10)
-        threading.Thread(target=self._genstrat_run, args=(settings, language, idea), daemon=True).start()
+        num_ctx = self.genstrat_num_ctx.get_int(strategy_generator_module.DEFAULT_NUM_CTX)
+        num_predict = self.genstrat_num_predict.get_int(strategy_generator_module.DEFAULT_NUM_PREDICT)
+        stall_timeout = self.genstrat_stall_timeout.get_int(strategy_generator_module.DEFAULT_TIMEOUT_SECONDS)
+        max_total = self.genstrat_max_total.get_int(strategy_generator_module.DEFAULT_MAX_TOTAL_SECONDS)
+        threading.Thread(
+            target=self._genstrat_run,
+            args=(settings, language, idea, num_ctx, num_predict, stall_timeout, max_total),
+            daemon=True,
+        ).start()
 
-    def _genstrat_run(self, settings, language, idea):
+    def _genstrat_progress(self, tokens: int, elapsed: float) -> None:
+        def _update():
+            self.genstrat_status.config(
+                text=f"Generating... {tokens} token(s) received so far, {elapsed:.0f}s elapsed.", fg=AMBER,
+            )
+        try:
+            self.root.after(0, _update)
+        except Exception:
+            pass
+
+    def _genstrat_run(self, settings, language, idea, num_ctx, num_predict, stall_timeout, max_total):
         from app.ai.strategy_generator import generate_strategy
 
         try:
-            result = generate_strategy(settings, language, idea)
+            result = generate_strategy(
+                settings, language, idea,
+                timeout=stall_timeout, max_total_seconds=max_total,
+                num_ctx=num_ctx, num_predict=num_predict,
+                progress_cb=self._genstrat_progress,
+            )
         except Exception as exc:
             result = None
             error = f"Unexpected error: {exc}"
@@ -7602,21 +7803,48 @@ class MainWindow:
             f,
             "17 / Live Market",
             "Live Market",
-            "A real-time-style candlestick chart -- candlesticks, volume, EMA 20/50, VWAP, a "
-            "crosshair OHLC readout, and trade markers from your Live Demo Test sessions -- "
-            "powered by TradingView's Lightweight Charts. This app starts a small local server on "
-            "your own machine (nothing leaves it) and opens the chart in its own window -- since "
-            "Tkinter can't run real JavaScript charts itself, it opens in your default browser "
-            "instead if a native chart window isn't available on this machine.",
+            "Two ways to see a live-style chart for a symbol. OPEN TRADINGVIEW CHART (recommended) "
+            "just opens the real tradingview.com chart for the symbol below in your browser -- no "
+            "local server, no MT5/Alpaca connection needed, works the same on Windows/Mac/Linux. "
+            "OPEN LIVE CHART is this app's own built-in chart (candlesticks, volume, EMA 20/50, "
+            "VWAP, trade markers from your Live Demo Test sessions) fed from MT5/Alpaca/a local "
+            "CSV replay -- it starts a small local server on your own machine and opens the chart "
+            "in its own window (or your default browser if a native chart window isn't available).",
         )
 
+        try:
+            saved_mt5 = mt5_settings_module.load_settings()
+        except Exception:
+            saved_mt5 = None
+
+        tv_section = self._section(
+            f, "TradingView chart (recommended)",
+            "Opens the real TradingView website for this symbol in your default browser. "
+            "Simplest and most reliable option -- no local server, no broker connection required, "
+            "and it always shows genuinely live data straight from TradingView.",
+            emphasize=True,
+        )
+        self.lm_tv_symbol = LabeledEntry(
+            tv_section, "Symbol", saved_mt5.symbol if (saved_mt5 is not None and saved_mt5.is_usable) else "XAUUSD",
+        )
+        tv_btn_row = Frame(tv_section, bg=PANEL)
+        tv_btn_row.pack(anchor="w", padx=18, pady=(0, 4))
+        self._button(tv_btn_row, "OPEN TRADINGVIEW CHART", self._lm_open_tradingview, primary=True).pack(side="left")
+        Label(
+            tv_section, text="Common FX/metals/index/crypto tickers (XAUUSD, EURUSD, US30, "
+            "BTCUSD, ...) are mapped to a sensible TradingView exchange automatically -- for "
+            "anything else, type whatever symbol/ticker TradingView itself would recognize.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 12))
+
         section = self._section(
-            f, "Data source",
+            f, "Built-in chart data source (advanced)",
             "Live (MT5) is used automatically when your Live Demo Test MT5 account is "
             "configured; Alpaca is used if you've saved API keys on the Data tab; with neither, "
             "the chart replays an already-imported local CSV bar by bar so there's always "
-            "something real on screen.",
-            emphasize=True,
+            "something real on screen. Requires this app's own local server; if OPEN LIVE CHART "
+            "ever errors or the native window doesn't appear (most common on Linux without the "
+            "optional GTK/QT webview packages installed), use OPEN TRADINGVIEW CHART above instead.",
         )
 
         # Pick a sane default source instead of always defaulting to "mt5"
@@ -7628,11 +7856,8 @@ class MainWindow:
         # running terminal) meant every click silently requested MT5 data,
         # which fails with an empty bar list and a permanently blank chart
         # (status badge stuck on UNAVAILABLE) -- with no error, indistin-
-        # guishable from the chart "just not opening".
-        try:
-            saved_mt5 = mt5_settings_module.load_settings()
-        except Exception:
-            saved_mt5 = None
+        # guishable from the chart "just not opening". (saved_mt5 was
+        # already loaded above, for the TradingView symbol field's default.)
         mt5_usable = bool(
             saved_mt5 is not None and saved_mt5.is_usable and mt5_connector_module.is_available()
         )
@@ -7724,7 +7949,16 @@ class MainWindow:
         build). Returns False on any failure (not installed, no supported
         native webview backend on this machine, etc.) so the caller can
         fall back to the system's default browser -- still fully
-        functional either way."""
+        functional either way.
+
+        On Linux, pywebview needs an actual GTK or QT webview backend
+        (e.g. `pip install pywebview[gtk]` plus the system
+        `python3-gi`/`gir1.2-webkit2-*` packages) -- when that's missing,
+        `webview.start()` can raise from inside the background thread
+        started below rather than at import time, which previously left
+        the person staring at "Opened in a live chart window" with no
+        window and no explanation. That failure is now caught and folded
+        into a browser fallback instead."""
         try:
             import webview
         except ImportError:
@@ -7736,17 +7970,84 @@ class MainWindow:
                 return True
 
             def run():
-                window = webview.create_window(
-                    "Live Market — T58", url, width=1300, height=880, min_size=(900, 600),
-                )
-                self._lm_webview_window = window
-                webview.start()
-                self._lm_webview_window = None  # the window was closed
+                try:
+                    window = webview.create_window(
+                        "Live Market — T58", url, width=1300, height=880, min_size=(900, 600),
+                    )
+                    self._lm_webview_window = window
+                    webview.start()
+                except Exception as exc:
+                    # The native webview backend genuinely isn't usable on
+                    # this machine (common on Linux without the GTK/QT
+                    # webview system packages installed) -- fall back to
+                    # the default browser instead of leaving the status
+                    # line claiming a window opened that never appeared.
+                    def _fallback():
+                        opened = webbrowser.open(url)
+                        self.lm_status.config(
+                            text=(f"Native chart window isn't available on this machine ({exc}) -- "
+                                  f"opened in your browser instead." if opened else
+                                  f"Native chart window isn't available on this machine ({exc}), and "
+                                  f"no browser could be auto-launched either -- open this URL "
+                                  f"manually: {url}"),
+                            fg=AMBER if opened else RED,
+                        )
+                    try:
+                        self.root.after(0, _fallback)
+                    except Exception:
+                        pass
+                finally:
+                    self._lm_webview_window = None  # the window was closed (or never opened)
 
             threading.Thread(target=run, daemon=True).start()
             return True
         except Exception:
             return False
+
+    # Rough symbol -> TradingView-ticker mapping for the most common cases
+    # this app already deals with (FX majors/gold/silver traded through a
+    # prop-firm-style broker, plus indices) -- TradingView needs an
+    # EXCHANGE:TICKER pair for its best match, and guessing a reasonable
+    # one here means OPEN TRADINGVIEW CHART works immediately for the
+    # common case without the person needing to know TradingView's symbol
+    # syntax. Anything not recognized is passed through as-is (TradingView
+    # itself still does a best-effort search on a bare ticker), and the
+    # symbol field can always just be hand-edited to whatever TradingView
+    # expects.
+    _TRADINGVIEW_FX_METALS = {
+        "XAUUSD": "OANDA:XAUUSD", "XAGUSD": "OANDA:XAGUSD",
+        "EURUSD": "OANDA:EURUSD", "GBPUSD": "OANDA:GBPUSD", "USDJPY": "OANDA:USDJPY",
+        "USDCHF": "OANDA:USDCHF", "USDCAD": "OANDA:USDCAD", "AUDUSD": "OANDA:AUDUSD",
+        "NZDUSD": "OANDA:NZDUSD", "EURJPY": "OANDA:EURJPY", "GBPJPY": "OANDA:GBPJPY",
+        "EURGBP": "OANDA:EURGBP",
+        "US30": "OANDA:US30USD", "NAS100": "OANDA:NAS100USD", "SPX500": "OANDA:SPX500USD",
+        "USOIL": "OANDA:WTICOUSD", "BTCUSD": "COINBASE:BTCUSD", "ETHUSD": "COINBASE:ETHUSD",
+    }
+
+    @classmethod
+    def _tradingview_symbol_for(cls, symbol: str) -> str:
+        s = re.sub(r"[^A-Za-z0-9]", "", (symbol or "")).upper()
+        return cls._TRADINGVIEW_FX_METALS.get(s, s or "OANDA:XAUUSD")
+
+    def _lm_open_tradingview(self):
+        """Opens the real tradingview.com chart for the current symbol in
+        the default browser -- no local Flask server, no MT5/Alpaca
+        connection, no pywebview dependency, so this always works
+        (including on Linux, and even with none of the optional live-data
+        sources configured) as long as there's internet access and a
+        browser installed. webbrowser.open() uses xdg-open/$BROWSER under
+        the hood on Linux, exactly like _open_strategy_library_folder's
+        folder-opening already relies on for that platform."""
+        raw_symbol = self.lm_tv_symbol.get_str().strip() or "XAUUSD"
+        tv_symbol = self._tradingview_symbol_for(raw_symbol)
+        url = f"https://www.tradingview.com/chart/?symbol={urllib.parse.quote(tv_symbol)}"
+        opened = webbrowser.open(url)
+        if opened:
+            self.lm_status.config(text=f"Opened TradingView chart for {tv_symbol} in your browser.", fg=GREEN)
+        else:
+            self.lm_status.config(
+                text=f"Couldn't auto-launch a browser -- open this URL manually: {url}", fg=AMBER,
+            )
 
     def _lm_open_chart(self):
         self.lm_status.config(text="Starting local server...", fg=AMBER)

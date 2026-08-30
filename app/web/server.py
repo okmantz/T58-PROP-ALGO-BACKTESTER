@@ -694,56 +694,75 @@ def health():
 
 @app.route("/live-market")
 def live_market_page():
-    mt5 = live_market.mt5_status()
-    has_alpaca = bool(alpaca_credentials.load_credentials())
-    replay_datasets = live_market.list_replay_datasets()
-    return render_template(
-        "live_market.html",
-        mt5_status=mt5,
-        has_alpaca=has_alpaca,
-        replay_datasets=replay_datasets,
-        timeframe_choices=live_market.TIMEFRAME_CHOICES_MINUTES,
-        theme=request.args.get("theme", "dark"),
-        initial_symbol=request.args.get("symbol") or mt5["default_symbol"] or "XAUUSD",
-        initial_timeframe=request.args.get("timeframe", type=int) or mt5["default_timeframe_minutes"] or 15,
-        initial_source=request.args.get("source") or ("mt5" if mt5["configured"] else ("alpaca" if has_alpaca else "replay")),
-    )
+    try:
+        mt5 = live_market.mt5_status()
+        has_alpaca = bool(alpaca_credentials.load_credentials())
+        replay_datasets = live_market.list_replay_datasets()
+        return render_template(
+            "live_market.html",
+            mt5_status=mt5,
+            has_alpaca=has_alpaca,
+            replay_datasets=replay_datasets,
+            timeframe_choices=live_market.TIMEFRAME_CHOICES_MINUTES,
+            theme=request.args.get("theme", "dark"),
+            initial_symbol=request.args.get("symbol") or mt5["default_symbol"] or "XAUUSD",
+            initial_timeframe=request.args.get("timeframe", type=int) or mt5["default_timeframe_minutes"] or 15,
+            initial_source=request.args.get("source") or ("mt5" if mt5["configured"] else ("alpaca" if has_alpaca else "replay")),
+        )
+    except Exception as exc:  # noqa: BLE001 -- a broken data source must never take the whole page down
+        return render_template(
+            "live_market.html",
+            mt5_status={"available": False, "configured": False, "connected": False,
+                        "default_symbol": "XAUUSD", "default_timeframe_minutes": 15},
+            has_alpaca=False, replay_datasets=[], timeframe_choices=live_market.TIMEFRAME_CHOICES_MINUTES,
+            theme=request.args.get("theme", "dark"), initial_symbol="XAUUSD", initial_timeframe=15,
+            initial_source="replay", load_error=str(exc),
+        )
 
 
 @app.route("/api/live-market/status")
 def api_live_market_status():
-    return jsonify({
-        "mt5": live_market.mt5_status(),
-        "alpaca_configured": bool(alpaca_credentials.load_credentials()),
-        "replay_datasets": live_market.list_replay_datasets(),
-    })
+    try:
+        return jsonify({
+            "mt5": live_market.mt5_status(),
+            "alpaca_configured": bool(alpaca_credentials.load_credentials()),
+            "replay_datasets": live_market.list_replay_datasets(),
+        })
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"mt5": {"available": False, "configured": False, "connected": False},
+                         "alpaca_configured": False, "replay_datasets": [], "error": str(exc)}), 200
 
 
 @app.route("/api/live-market/bars")
 def api_live_market_bars():
     source = request.args.get("source", "replay")
     symbol = request.args.get("symbol", "")
-    timeframe = request.args.get("timeframe", 15, type=int)
+    timeframe = request.args.get("timeframe", 15, type=int) or 15
     seed = request.args.get("seed", "0") == "1"  # first request for this symbol/timeframe this page-load
 
-    if source == "mt5":
-        bars = live_market.fetch_mt5_bars(symbol, timeframe)
-        status = "live" if bars else ("connecting" if live_market.mt5_status()["configured"] else "unavailable")
-    elif source == "alpaca":
-        asset_class = request.args.get("asset_class", "Stock")
-        bars = live_market.fetch_alpaca_bars(symbol, asset_class, timeframe)
-        status = "delayed" if bars else "unavailable"
-    else:
-        bars, finished = live_market.fetch_replay_bars(symbol, advance=not seed)
-        status = "replay-finished" if finished else "replay"
-
-    return jsonify({"bars": bars, "status": status})
+    try:
+        if source == "mt5":
+            bars = live_market.fetch_mt5_bars(symbol, timeframe)
+            status = "live" if bars else ("connecting" if live_market.mt5_status()["configured"] else "unavailable")
+        elif source == "alpaca":
+            asset_class = request.args.get("asset_class", "Stock")
+            bars = live_market.fetch_alpaca_bars(symbol, asset_class, timeframe)
+            status = "delayed" if bars else "unavailable"
+        else:
+            bars, finished = live_market.fetch_replay_bars(symbol, advance=not seed)
+            status = "replay-finished" if finished else "replay"
+        return jsonify({"bars": bars, "status": status})
+    except Exception as exc:  # noqa: BLE001 -- any data-source hiccup must surface as UNAVAILABLE, never a 500
+        return jsonify({"bars": [], "status": "unavailable", "error": str(exc)}), 200
 
 
 @app.route("/api/live-market/trades")
 def api_live_market_trades():
     symbol = request.args.get("symbol", "")
-    return jsonify({"markers": live_market.recent_trade_markers(symbol)})
+    try:
+        return jsonify({"markers": live_market.recent_trade_markers(symbol)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"markers": [], "error": str(exc)}), 200
 
 
 # ---------------------------------------------------------------------------

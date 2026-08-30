@@ -49,15 +49,24 @@ _MT5_RETRY_COOLDOWN_SECONDS = 15.0  # don't retry a broken connection on every s
 
 def mt5_status() -> dict:
     """Best-effort read of whether a live MT5 connection is usable right
-    now, without blocking on a fresh connection attempt just to check."""
-    settings = load_mt5_settings()
-    return {
-        "available": mt5_connector_module.is_available(),
-        "configured": settings.is_usable,
-        "connected": _mt5_ready,
-        "default_symbol": settings.symbol,
-        "default_timeframe_minutes": settings.timeframe_minutes,
-    }
+    now, without blocking on a fresh connection attempt just to check.
+    Never raises -- a corrupt settings file or an unexpected error from
+    the MetaTrader5 package here must not take down the whole Live
+    Market page along with it."""
+    try:
+        settings = load_mt5_settings()
+        return {
+            "available": mt5_connector_module.is_available(),
+            "configured": settings.is_usable,
+            "connected": _mt5_ready,
+            "default_symbol": settings.symbol,
+            "default_timeframe_minutes": settings.timeframe_minutes,
+        }
+    except Exception:
+        return {
+            "available": False, "configured": False, "connected": False,
+            "default_symbol": "XAUUSD", "default_timeframe_minutes": 15,
+        }
 
 
 def _ensure_mt5_connected() -> bool:
@@ -76,42 +85,55 @@ def _ensure_mt5_connected() -> bool:
         if _mt5_ready:
             return True
         _mt5_last_attempt = time.time()
-        connector = mt5_connector_module.MT5Connector(
-            settings.login, settings.password, settings.server, settings.terminal_path,
-        )
-        result = connector.connect()
-        _mt5_ready = bool(result.ok)
+        try:
+            connector = mt5_connector_module.MT5Connector(
+                settings.login, settings.password, settings.server, settings.terminal_path,
+            )
+            result = connector.connect()
+            _mt5_ready = bool(result.ok)
+        except Exception:
+            # The underlying MetaTrader5 package occasionally raises
+            # rather than returning a clean failure (seen from a
+            # background thread, which is exactly how this gets called --
+            # the Flask dev server this app starts runs in its own
+            # thread). Treat that identically to "failed to connect"
+            # rather than letting it become an unhandled 500 for the
+            # whole Live Market page.
+            _mt5_ready = False
         return _mt5_ready
 
 
 def fetch_mt5_bars(symbol: str, timeframe_minutes: int, count: int = 300) -> list[dict]:
     if not _ensure_mt5_connected():
         return []
-    import MetaTrader5 as mt5  # safe: _ensure_mt5_connected() already confirmed importability
+    try:
+        import MetaTrader5 as mt5  # safe: _ensure_mt5_connected() already confirmed importability
 
-    tf_name = MT5_TIMEFRAME_NAMES.get(timeframe_minutes, "M15")
-    tf_const = getattr(mt5, f"TIMEFRAME_{tf_name}")
-    rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, count)
-    if rates is None:
+        tf_name = MT5_TIMEFRAME_NAMES.get(timeframe_minutes, "M15")
+        tf_const = getattr(mt5, f"TIMEFRAME_{tf_name}", mt5.TIMEFRAME_M15)
+        rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, count)
+        if rates is None:
+            return []
+        bars = []
+        for r in rates:
+            volume = float(r["real_volume"]) if r["real_volume"] else float(r["tick_volume"])
+            bars.append({
+                "time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
+                "low": float(r["low"]), "close": float(r["close"]), "volume": volume,
+            })
+        return bars
+    except Exception:
         return []
-    bars = []
-    for r in rates:
-        volume = float(r["real_volume"]) if r["real_volume"] else float(r["tick_volume"])
-        bars.append({
-            "time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
-            "low": float(r["low"]), "close": float(r["close"]), "volume": volume,
-        })
-    return bars
 
 
 def fetch_alpaca_bars(symbol: str, asset_class: str, timeframe_minutes: int, count: int = 300) -> list[dict]:
     creds = alpaca_credentials.load_credentials()
-    if not creds or not creds[0] or not creds[1]:
+    if not creds or not creds.is_usable:
         return []
     from app.data.alpaca_source import fetch_bars as alpaca_fetch_bars
 
     tf_label = ALPACA_TIMEFRAME_LABELS.get(timeframe_minutes, "15Min")
-    end = pd.Timestamp.utcnow()
+    end = pd.Timestamp.now("UTC")
     # Generous lookback so `count` bars actually exist at this timeframe
     # even across weekends/market closures -- trimmed to the last `count`
     # rows below.
@@ -119,7 +141,7 @@ def fetch_alpaca_bars(symbol: str, asset_class: str, timeframe_minutes: int, cou
     start = end - pd.Timedelta(days=lookback_days)
     try:
         df = alpaca_fetch_bars(
-            creds[0], creds[1], symbol, asset_class, tf_label,
+            creds.api_key, creds.secret_key, symbol, asset_class, tf_label,
             start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
         )
     except Exception:
@@ -150,42 +172,58 @@ _REPLAY_WINDOW = 300
 
 
 def list_replay_datasets() -> list[str]:
-    return [d.name for d in list_stored_datasets()]
+    try:
+        return [d.name for d in list_stored_datasets()]
+    except Exception:
+        return []
 
 
 def fetch_replay_bars(dataset_name: str, advance: bool = True) -> tuple[list[dict], bool]:
     """Returns (bars, finished). `advance=False` re-reads the current
     window without moving the cursor forward -- used for the very first
     request after picking a dataset, so simply opening the page doesn't
-    immediately burn a bar off the replay."""
-    with _replay_lock:
-        state = _replay_cache.get(dataset_name)
-        if state is None:
-            from app.data.importer import import_csv
+    immediately burn a bar off the replay.
 
-            path = get_raw_data_dir() / dataset_name
-            result = import_csv(path)
-            if result.dataframe is None or result.dataframe.empty:
-                return [], True
-            start_cursor = max(0, len(result.dataframe) - _REPLAY_WINDOW)
-            state = _ReplayState(df=result.dataframe, cursor=start_cursor)
-            _replay_cache[dataset_name] = state
+    Never raises: a dataset that fails to parse (corrupt file, unexpected
+    encoding, a genuinely bad row) is treated as "finished, no bars" --
+    the page shows UNAVAILABLE for that dataset instead of the whole
+    request blowing up with a 500.
+    """
+    if not dataset_name:
+        return [], True
+    try:
+        with _replay_lock:
+            state = _replay_cache.get(dataset_name)
+            if state is None:
+                from app.data.importer import import_csv
 
-        if advance and not state.finished:
-            state.cursor = min(state.cursor + 1, len(state.df) - 1)
-            if state.cursor >= len(state.df) - 1:
-                state.finished = True
+                path = get_raw_data_dir() / dataset_name
+                if not path.exists():
+                    return [], True
+                result = import_csv(path)
+                if result.dataframe is None or result.dataframe.empty:
+                    return [], True
+                start_cursor = max(0, len(result.dataframe) - _REPLAY_WINDOW)
+                state = _ReplayState(df=result.dataframe, cursor=start_cursor)
+                _replay_cache[dataset_name] = state
 
-        window_start = max(0, state.cursor - _REPLAY_WINDOW + 1)
-        window = state.df.iloc[window_start: state.cursor + 1]
-        bars = []
-        for row in window.itertuples():
-            bars.append({
-                "time": int(pd.Timestamp(row.timestamp).timestamp()), "open": float(row.open),
-                "high": float(row.high), "low": float(row.low), "close": float(row.close),
-                "volume": float(getattr(row, "volume", 0) or 0),
-            })
-        return bars, state.finished
+            if advance and not state.finished:
+                state.cursor = min(state.cursor + 1, len(state.df) - 1)
+                if state.cursor >= len(state.df) - 1:
+                    state.finished = True
+
+            window_start = max(0, state.cursor - _REPLAY_WINDOW + 1)
+            window = state.df.iloc[window_start: state.cursor + 1]
+            bars = []
+            for row in window.itertuples():
+                bars.append({
+                    "time": int(pd.Timestamp(row.timestamp).timestamp()), "open": float(row.open),
+                    "high": float(row.high), "low": float(row.low), "close": float(row.close),
+                    "volume": float(getattr(row, "volume", 0) or 0),
+                })
+            return bars, state.finished
+    except Exception:
+        return [], True
 
 
 def reset_replay(dataset_name: str) -> None:
@@ -197,15 +235,15 @@ def recent_trade_markers(symbol: str, limit: int = 100) -> list[dict]:
     """Buy/sell markers for the Live Market chart's candlestick series,
     pulled from the Live Demo Test journal -- the most recent session run
     against this exact symbol, if any. Read-only; safe to call while a
-    session is actively writing to the same database file."""
+    session is actively writing to the same database file. Never raises."""
     try:
         journal = ForwardTestJournal()
-    except sqlite3.OperationalError:
+        session_id = journal.latest_session_for_symbol(symbol)
+        if session_id is None:
+            return []
+        trades = journal.all_trades(session_id)[:limit]
+    except Exception:
         return []
-    session_id = journal.latest_session_for_symbol(symbol)
-    if session_id is None:
-        return []
-    trades = journal.all_trades(session_id)[:limit]
 
     markers = []
     for t in trades:

@@ -125,6 +125,13 @@
      <code>series.update()</code> -- the chart never redraws from scratch.</p>
 </div>
 
+{% if load_error %}
+<div class="t58-card" style="border-color: var(--coral); color: var(--coral); font-size:12px;">
+  Couldn't fully load market status when this page opened ({{ load_error }}) -- source detection defaulted to
+  Replay. Try REFRESH DATASETS/APPLY below, or reopen this tab.
+</div>
+{% endif %}
+
 <div class="lm-toolbar">
   <label>Source
     <select id="lm-source">

@@ -876,44 +876,60 @@ class MainWindow:
         self.tab_ensemble = Frame(self.content, bg=BG)
         self.tab_fullpipeline = Frame(self.content, bg=BG)
         self.tab_forwardtest = Frame(self.content, bg=BG)
-        self.tab_livemarket = Frame(self.content, bg=BG)
         self.tab_deploylive = Frame(self.content, bg=BG)
+        self.tab_livemarket = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
             self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
-            self.tab_forwardtest, self.tab_livemarket, self.tab_deploylive,
+            self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
+        # Every entry is (key, icon, label, frame, color). `icon` is kept
+        # in the tuple shape for backward compatibility but no longer
+        # rendered (see _build_sidebar_nav) -- a leading glyph AND a
+        # leading number on every row read as cluttered, so this sidebar
+        # picks one signal (the workflow number, where one exists) rather
+        # than both. A divider entry has key=None; its `label` slot holds
+        # the section header text shown above that group (小-caps style,
+        # letter-spaced) instead of a bare line -- every group is named
+        # rather than just visually separated, which is what actually
+        # makes a long list like this read as organized instead of messy.
         self._nav_items = [
-            ("dashboard", "\u25A3", "DASHBOARD", self.tab_dashboard, NEON_VIOLET),
-            ("manual", "\u2753", "USER MANUAL", self.tab_manual, METAL_BRIGHT),
-            (None, None, None, None, None),  # divider
-            ("data", "\u25A4", "01  DATA", self.tab_data, NEON_CYAN),
-            ("strategy", "\u2699", "02  STRATEGY", self.tab_strategy, NEON_CYAN),
-            ("prop", "\u2696", "03  PROP RULES", self.tab_prop, NEON_CYAN),
-            ("risk", "\u25C8", "04  RISK", self.tab_risk, NEON_CYAN),
-            ("run", "\u25B6", "05  RUN & REPORT", self.tab_run, NEON_CYAN),
-            ("refine", "\u21BB", "06  REFINEMENT", self.tab_refine, NEON_CYAN),
-            ("search", "\u25A6", "07  SEARCH LAB", self.tab_search, NEON_CYAN),
-            (None, None, None, None, None),  # divider — Validation Lab group
-            ("wfo", "\u21C6", "08  WALK-FORWARD OPT", self.tab_wfo, BLUE),
-            ("cpcv", "\u25C9", "09  CPCV / PBO", self.tab_cpcv, BLUE),
-            ("sensitivity", "\u2AF6", "10  SENSITIVITY", self.tab_sensitivity, BLUE),
-            ("portfolio", "\u25C7", "11  PORTFOLIO", self.tab_portfolio, BLUE),
-            ("multiobj", "\u2696", "12  MULTI-OBJECTIVE", self.tab_multiobj, BLUE),
-            ("wfga", "\u21BB", "13  WALK-FORWARD GA", self.tab_wfga, BLUE),
-            (None, None, None, None, None),  # divider — Finding an Edge group
-            ("ensemble", "\u25C6", "14  ENSEMBLE", self.tab_ensemble, NEON_MAGENTA),
-            (None, None, None, None, None),  # divider — All-In-One
-            ("fullpipeline", "\u2605", "15  FULL PIPELINE", self.tab_fullpipeline, NEON_AMBER),
-            (None, None, None, None, None),  # divider — going live
-            ("forwardtest", "\u25D4", "16  LIVE DEMO TEST", self.tab_forwardtest, NEON_LIME),
-            ("livemarket", "\u25CF", "17  LIVE MARKET", self.tab_livemarket, NEON_CYAN),
-            ("deploylive", "\u26A0", "18  DEPLOY LIVE", self.tab_deploylive, RED),
+            (None, None, "OVERVIEW", None, None),
+            ("dashboard", "", "Dashboard", self.tab_dashboard, NEON_VIOLET),
+            ("manual", "", "User Manual", self.tab_manual, METAL_BRIGHT),
+
+            (None, None, "WORKFLOW", None, None),
+            ("data", "", "01  Data", self.tab_data, NEON_CYAN),
+            ("strategy", "", "02  Strategy", self.tab_strategy, NEON_CYAN),
+            ("prop", "", "03  Prop Rules", self.tab_prop, NEON_CYAN),
+            ("risk", "", "04  Risk", self.tab_risk, NEON_CYAN),
+            ("run", "", "05  Run & Report", self.tab_run, NEON_CYAN),
+            ("refine", "", "06  Refinement", self.tab_refine, NEON_CYAN),
+            ("search", "", "07  Search Lab", self.tab_search, NEON_CYAN),
+
+            (None, None, "VALIDATION LAB", None, None),
+            ("wfo", "", "08  Walk-Forward Opt", self.tab_wfo, BLUE),
+            ("cpcv", "", "09  CPCV / PBO", self.tab_cpcv, BLUE),
+            ("sensitivity", "", "10  Sensitivity", self.tab_sensitivity, BLUE),
+            ("portfolio", "", "11  Portfolio", self.tab_portfolio, BLUE),
+            ("multiobj", "", "12  Multi-Objective", self.tab_multiobj, BLUE),
+            ("wfga", "", "13  Walk-Forward GA", self.tab_wfga, BLUE),
+
+            (None, None, "FINDING AN EDGE", None, None),
+            ("ensemble", "", "14  Ensemble", self.tab_ensemble, NEON_MAGENTA),
+
+            (None, None, "ALL-IN-ONE", None, None),
+            ("fullpipeline", "", "15  Full Pipeline", self.tab_fullpipeline, NEON_AMBER),
+
+            (None, None, "LIVE TRADING", None, None),
+            ("forwardtest", "", "Live Demo Test", self.tab_forwardtest, NEON_LIME),
+            ("deploylive", "", "Deploy Live", self.tab_deploylive, RED),
+            ("livemarket", "", "Live Market", self.tab_livemarket, NEON_CYAN),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -938,8 +954,8 @@ class MainWindow:
         self._build_ensemble_tab()
         self._build_full_pipeline_tab()
         self._build_forward_test_tab()
-        self._build_live_market_tab()
         self._build_deploy_live_tab()
+        self._build_live_market_tab()
 
         self._show_page("dashboard")
 
@@ -952,9 +968,18 @@ class MainWindow:
                 delta = 1
             self._sidebar_canvas.yview_scroll(delta, "units")
 
-        for key, icon, label, frame, color in self._nav_items:
+        first_section = True
+        for key, _icon, label, frame, color in self._nav_items:
             if key is None:
-                Frame(self._sidebar_inner, bg=BORDER, height=1).pack(fill="x", padx=14, pady=5)
+                # A named section header (small-caps, letter-spaced, muted)
+                # rather than a bare line -- every group is labeled, which
+                # is what makes a long list like this read as organized
+                # sections instead of one long undifferentiated list.
+                Label(
+                    self._sidebar_inner, text=" ".join(label.upper()), bg=PANEL, fg=TEXT_DIM,
+                    font=_safe_font(7, "bold"), anchor="w",
+                ).pack(fill="x", padx=16, pady=(14 if not first_section else 4, 4))
+                first_section = False
                 continue
             row = Frame(self._sidebar_inner, bg=PANEL, cursor="hand2")
             row.pack(fill="x", padx=8, pady=1)
@@ -970,8 +995,8 @@ class MainWindow:
             accent.pack(side="left", fill="y")
             accent.bind("<Configure>", lambda _e, k=key: self._draw_nav_accent(k))
             lbl = Label(
-                row, text=f"  {icon}   {label}", bg=PANEL, fg=TEXT_MUTED,
-                font=_safe_font(8, "bold"), anchor="w", padx=6, pady=6,
+                row, text=f"   {label}", bg=PANEL, fg=TEXT_MUTED,
+                font=_safe_font(9), anchor="w", padx=6, pady=6,
             )
             lbl.pack(side="left", fill="x", expand=True)
             for widget in (row, accent, lbl):
@@ -1477,6 +1502,106 @@ class MainWindow:
         ).pack(side="left", padx=(10, 0), anchor="w")
         return card
 
+    def _draw_neural_background(self, canvas, width, height):
+        """A soft, glowing node-link pattern -- purely decorative, in the
+        spirit of a knowledge-graph view (Obsidian's graph view, etc).
+        Deliberately muted (every color blended heavily toward BG) so it
+        reads as ambient texture behind/around the Dashboard's real
+        content rather than competing with it. Uses a fixed seed so the
+        pattern is stable across resizes and relaunches rather than
+        jittering into a new random layout every time.
+        """
+        canvas.delete("neural_bg")
+        if width < 20 or height < 20:
+            return
+        rng = random.Random(20260830)
+        palette = [NEON_CYAN, NEON_VIOLET, NEON_MAGENTA, NEON_LIME, BLUE]
+
+        nodes: list[tuple[float, float, str, bool]] = []
+        edges: list[tuple[float, float, float, float, str]] = []
+        n_clusters = max(5, int((width * height) / 40000))
+        for _ in range(n_clusters):
+            cx, cy = rng.uniform(0, width), rng.uniform(0, height)
+            color = rng.choice(palette)
+            nodes.append((cx, cy, color, True))
+            for _ in range(rng.randint(3, 9)):
+                angle = rng.uniform(0, 2 * math.pi)
+                dist = rng.uniform(26, 100)
+                lx, ly = cx + dist * math.cos(angle), cy + dist * math.sin(angle)
+                nodes.append((lx, ly, color, False))
+                edges.append((cx, cy, lx, ly, color))
+                if rng.random() < 0.3:
+                    angle2 = rng.uniform(0, 2 * math.pi)
+                    dist2 = rng.uniform(14, 40)
+                    lx2, ly2 = lx + dist2 * math.cos(angle2), ly + dist2 * math.sin(angle2)
+                    nodes.append((lx2, ly2, color, False))
+                    edges.append((lx, ly, lx2, ly2, color))
+        for _ in range(n_clusters * 5):
+            nodes.append((rng.uniform(0, width), rng.uniform(0, height), rng.choice(palette), False))
+
+        for x1, y1, x2, y2, color in edges:
+            canvas.create_line(x1, y1, x2, y2, fill=_blend_hex(BG, color, 0.11), width=1, tags="neural_bg")
+        for x, y, color, is_hub in nodes:
+            if is_hub:
+                for dr, t in ((5.5, 0.85), (3.6, 0.6)):
+                    canvas.create_oval(
+                        x - dr, y - dr, x + dr, y + dr, fill=_blend_hex(BG, color, 1 - t), outline="",
+                        tags="neural_bg",
+                    )
+                canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=_blend_hex(BG, color, 0.75), outline="", tags="neural_bg")
+            else:
+                r = rng.uniform(1.1, 2.2)
+                canvas.create_oval(
+                    x - r, y - r, x + r, y + r, fill=_blend_hex(BG, color, 0.42), outline="", tags="neural_bg",
+                )
+        canvas.tag_lower("neural_bg")
+
+    def _build_dashboard_scrollable(self, parent) -> Frame:
+        """Same scroll-and-wheel contract as _scrollable() (registers into
+        the shared self._scroll_canvas_by_tab dispatch table, so the
+        existing global mouse-wheel binding just works here too) but the
+        backing canvas also carries the soft glowing neural background
+        above, with the real content inset by MARGIN on every side so
+        that background is genuinely visible framing the page -- Tkinter
+        widgets are fully opaque, so showing the pattern truly BEHIND
+        every card individually would need a much larger rewrite of this
+        tab's whole layout into separately-positioned canvas windows.
+        Kept as its own method (rather than changing the shared
+        _scrollable()) so this stays purely additive for the one tab
+        that asked for it.
+        """
+        MARGIN = 48
+        outer = Frame(parent, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        canvas = Canvas(outer, bg=BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview, style="T58.Vertical.TScrollbar")
+        inner = Frame(canvas, bg=BG)
+
+        window_id = canvas.create_window((MARGIN, MARGIN), window=inner, anchor="nw")
+
+        def _sync_scrollregion(_e=None):
+            content_h = inner.winfo_reqheight()
+            canvas_w = max(canvas.winfo_width(), 200)
+            canvas.configure(scrollregion=(0, 0, canvas_w, content_h + MARGIN * 2))
+            self._draw_neural_background(canvas, canvas_w, max(canvas.winfo_height(), content_h + MARGIN * 2))
+
+        def _on_canvas_configure(e):
+            canvas.itemconfig(window_id, width=max(1, e.width - MARGIN * 2))
+            _sync_scrollregion()
+
+        inner.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        if not hasattr(self, "_scroll_canvas_by_tab"):
+            self._scroll_canvas_by_tab = {}
+        self._scroll_canvas_by_tab[parent] = canvas
+        return inner
+
     def _build_dashboard_tab(self):
         f = self.tab_dashboard
         self._page_header(
@@ -1485,12 +1610,11 @@ class MainWindow:
             "desktop, mobile web, and Search Lab all feed this automatically.",
         )
 
-        # Uses the same shared _scrollable() helper every other tab uses, so
-        # this canvas is registered and responds to the mouse wheel the same
-        # way -- it previously built its own one-off Canvas/Scrollbar pair
-        # that was never registered there, so only the dashboard's
-        # scrollbar could be dragged; the wheel silently did nothing.
-        scroll_frame = self._scrollable(f)
+        # A dedicated variant of _scrollable() that also paints a soft,
+        # glowing neural-graph backdrop around the dashboard's content
+        # (see _build_dashboard_scrollable's docstring for why it's a
+        # framing margin rather than truly behind every card).
+        scroll_frame = self._build_dashboard_scrollable(f)
 
         self._dash_stats_row = Frame(scroll_frame, bg=BG)
         self._dash_stats_row.pack(fill="x", padx=24, pady=(4, 14))
@@ -2130,18 +2254,18 @@ class MainWindow:
         )
         rule()
 
-        h2("STEP 10 — Live Demo Test on a real broker feed (16 LIVE DEMO TEST)")
+        h2("STEP 10 — Live Demo Test on a real broker feed (LIVE TRADING → Live Demo Test)")
         body(
             "Once a strategy looks good in the Full Pipeline, this deploys it to a free MetaTrader 5 (MT5) "
             "demo account so you can watch it trade forward against real, live broker prices — still no real "
-            "money, no live/funded order path exists in this app."
+            "money, no live/funded order path exists on this tab."
         )
         h3("One-time MT5 setup")
         numstep(1, "Download and install the MT5 terminal (64-bit) — any MT5-supporting broker's website offers "
                     "a free download, or your prop firm's own site if they provide one.")
         numstep(2, "Open the terminal and create a free demo account from within it (File → Open an Account → "
                     "choose a demo account) — this gives you a login number, server name, and password.")
-        numstep(3, "In this app's 16 LIVE DEMO TEST tab, enter that login, server, and password under "
+        numstep(3, "In this app's Live Demo Test tab, enter that login, server, and password under "
                     "'MT5 Demo Account'.")
         numstep(4, "Click SAVE & TEST CONNECTION.")
         substep(
@@ -2161,6 +2285,37 @@ class MainWindow:
         )
         rule()
 
+        h2("STEP 11 — Deploy Live (LIVE TRADING → Deploy Live) — real money, read this first")
+        warn(
+            "This is NOT the same as Live Demo Test. An account connected here trades with real capital in a "
+            "live or funded prop-firm account. Confirm your prop firm actually permits automated/EA trading "
+            "on that account before connecting it — many firms restrict or ban it outright, and violating "
+            "that can get a funded account terminated regardless of performance."
+        )
+        numstep(1, "Pick your prop firm from the dropdown (or 'Other' if it isn't listed) — this fills in which "
+                    "platform(s) it uses.")
+        substep(
+            "Only MT4/MT5 accounts are connectable today. Futures-only firms (Apex, Topstep, MyFundedFutures) "
+            "use Tradovate/Rithmic/NinjaTrader instead — a different integration this app doesn't have yet."
+        )
+        numstep(2, "Enter your account's nickname, login, server, and password, check the confirmation box, "
+                    "and click SAVE ACCOUNT.")
+        numstep(3, "Click TEST CONNECTION to confirm it reaches your real account and reports its balance.")
+        numstep(4, "Pick a validated strategy and click START LIVE TRADING.")
+        substep(
+            "The same red KILL SWITCH from Live Demo Test works identically here — use it any time something "
+            "looks wrong."
+        )
+        rule()
+
+        h2("STEP 12 — Live Market (LIVE TRADING → Live Market)")
+        body(
+            "A live-updating candlestick chart for any symbol — live via MT5 if connected, delayed via Alpaca "
+            "if you've saved keys, or a steady replay of a local CSV if neither is available. Pick a source, "
+            "symbol, and timeframe, then click OPEN LIVE CHART."
+        )
+        rule()
+
         # -------------------------------------------------------------
         # Short version recap
         # -------------------------------------------------------------
@@ -2170,7 +2325,8 @@ class MainWindow:
         numstep(2, "02 STRATEGY → pick/build your strategy.")
         numstep(3, "03 PROP RULES + 04 RISK → confirm these still match your firm/settings.")
         numstep(4, "15 FULL PIPELINE → RUN FULL PIPELINE → read the verdict.")
-        numstep(5, "If READY and you want to see it trade live → 16 LIVE DEMO TEST.")
+        numstep(5, "If READY and you want to see it trade live → LIVE TRADING → Live Demo Test (paper) or "
+                    "Deploy Live (real capital, once you're confident).")
         tip("That's the whole loop. Everything else in the sidebar is there for when you want to dig deeper.")
 
         text.config(state="disabled")
@@ -6810,10 +6966,10 @@ class MainWindow:
             "Live Market",
             "A real-time-style candlestick chart -- candlesticks, volume, EMA 20/50, VWAP, a "
             "crosshair OHLC readout, and trade markers from your Live Demo Test sessions -- "
-            "powered by TradingView's Lightweight Charts. This runs in your normal web browser: "
-            "this app starts a small local server on your own machine (nothing leaves it) and "
-            "opens a browser tab pointed at it, since Tkinter has no way to run real JavaScript "
-            "charts itself.",
+            "powered by TradingView's Lightweight Charts. This app starts a small local server on "
+            "your own machine (nothing leaves it) and opens the chart in its own window -- since "
+            "Tkinter can't run real JavaScript charts itself, it opens in your default browser "
+            "instead if a native chart window isn't available on this machine.",
         )
 
         section = self._section(
@@ -6903,6 +7059,40 @@ class MainWindow:
         self._lm_server = server
         return port
 
+    def _lm_open_in_native_window(self, url: str) -> bool:
+        """Best-effort: opens the chart in a chromeless native window (via
+        the optional `pywebview` package) so it feels like part of the app
+        rather than a separate browser tab. Tkinter itself has no way to
+        run real JavaScript/Canvas content -- what Lightweight Charts
+        needs -- so this is the closest thing to "embedded" achievable
+        without a much heavier dependency (bundling a full Chromium
+        build). Returns False on any failure (not installed, no supported
+        native webview backend on this machine, etc.) so the caller can
+        fall back to the system's default browser -- still fully
+        functional either way."""
+        try:
+            import webview
+        except ImportError:
+            return False
+        try:
+            existing = getattr(self, "_lm_webview_window", None)
+            if existing is not None:
+                existing.load_url(url)
+                return True
+
+            def run():
+                window = webview.create_window(
+                    "Live Market — T58", url, width=1300, height=880, min_size=(900, 600),
+                )
+                self._lm_webview_window = window
+                webview.start()
+                self._lm_webview_window = None  # the window was closed
+
+            threading.Thread(target=run, daemon=True).start()
+            return True
+        except Exception:
+            return False
+
     def _lm_open_chart(self):
         self.lm_status.config(text="Starting local server...", fg=AMBER)
         self.root.update_idletasks()
@@ -6922,8 +7112,11 @@ class MainWindow:
             "theme": CURRENT_THEME,
         })
         url = f"http://127.0.0.1:{port}/live-market?{params}"
-        webbrowser.open(url)
-        self.lm_status.config(text=f"Opened in your browser: {url}", fg=GREEN)
+        if self._lm_open_in_native_window(url):
+            self.lm_status.config(text="Opened in a live chart window.", fg=GREEN)
+        else:
+            webbrowser.open(url)
+            self.lm_status.config(text=f"Opened in your browser: {url}", fg=GREEN)
 
     # -----------------------------------------------------------------------
     # Tab 18 — Deploy Live
@@ -6947,7 +7140,7 @@ class MainWindow:
         ).pack(anchor="w", padx=16, pady=(12, 4))
         Label(
             warn_wrap,
-            text="This is not the same as 16 LIVE DEMO TEST. An account connected here places real "
+            text="This is not the same as Live Demo Test. An account connected here places real "
                  "orders against real capital in a live or funded prop-firm account. Before using this:\n"
                  "  1) Confirm your prop firm's rules actually PERMIT automated/EA trading on this "
                  "account -- many firms restrict or ban certain automation, and violating that can get "
@@ -6973,7 +7166,7 @@ class MainWindow:
                  "provides one of a small number of trading platforms for its funded accounts, and this "
                  "app connects the same way a human trader using that platform would:\n\n"
                  "  •  MT4 / MT5 (by far the most common) -- the exact same connection this app already "
-                 "uses for 16 LIVE DEMO TEST, just pointed at your live/funded login instead of a demo "
+                 "uses for Live Demo Test, just pointed at your live/funded login instead of a demo "
                  "one. This is the only path fully wired up below today.\n"
                  "  •  cTrader (a growing number of firms) -- cTrader has its own Open API (OAuth-based, "
                  "different from MT5 entirely). Not implemented yet -- see the note below.\n"
@@ -7061,10 +7254,37 @@ class MainWindow:
         self._button(add_btn_row, "AUTO-DETECT TERMINAL", self._dl_auto_detect_terminal).pack(side="left", padx=8)
         self._button(add_btn_row, "BROWSE...", self._dl_browse_terminal).pack(side="left")
 
+        # ---- Market + risk (same shape as Live Demo Test's own fields) -----
+        market_section = self._section(
+            f, "Market",
+            "Which symbol and timeframe the strategy trades on this account.",
+        )
+        self.dl_symbol = LabeledEntry(market_section, "Symbol", "XAUUSD")
+        self.dl_timeframe = LabeledCombo(
+            market_section, "Timeframe",
+            ["1 minute", "5 minutes", "15 minutes", "30 minutes", "1 hour", "4 hours", "1 day"],
+            "15 minutes",
+        )
+
+        risk_section = self._section(
+            f, "Risk (same fields as Step 04, applied to this live account)",
+            "Position sizing calls the exact same RiskConfig.position_size(...) the backtester "
+            "and Live Demo Test use -- if a strategy defines its own dynamic stop, that's "
+            "honored first; otherwise a fixed-pip or 1%-of-price fallback applies, same "
+            "precedence as everywhere else in this app.",
+        )
+        self.dl_risk_pct = LabeledEntry(risk_section, "Risk per trade (% of equity)", 1.0)
+        self.dl_daily_loss_limit = LabeledEntry(risk_section, "Daily loss limit (% of balance, halts new entries)", 5.0)
+        self.dl_max_trades_per_day = LabeledEntry(risk_section, "Max trades per day", 10)
+        self.dl_pip_size = LabeledEntry(risk_section, "Pip size (leave blank to auto-detect from MT5 symbol info)", "")
+        self.dl_baseline_win_rate = LabeledEntry(
+            risk_section, "Backtest win rate %, for drift comparison (optional)", "",
+        )
+
         # ---- Connect + deploy -------------------------------------------------
         deploy_section = self._section(
             f, "Connect and deploy",
-            "Same underlying engine as 16 LIVE DEMO TEST -- pick a saved account above, pick a "
+            "Same underlying engine as Live Demo Test -- pick a saved account above, pick a "
             "validated strategy from the Strategy Library, and start. The kill switch works "
             "identically.",
             emphasize=True,
@@ -7076,21 +7296,122 @@ class MainWindow:
         self.dl_start_btn = self._button(deploy_btn_row, "START LIVE TRADING", self._dl_start_clicked, primary=True)
         self.dl_start_btn.pack(side="left", padx=8)
         self.dl_start_btn.config(state="disabled")
-        self.dl_kill_btn = self._button(deploy_btn_row, "KILL SWITCH — FLATTEN & STOP", self._dl_kill_clicked)
-        self.dl_kill_btn.config(state="disabled", fg="#FF8FA0")
+        self.dl_stop_btn = self._button(deploy_btn_row, "STOP", self._dl_stop_clicked)
+        self.dl_stop_btn.pack(side="left", padx=8)
+        self.dl_stop_btn.config(state="disabled")
+        self.dl_kill_btn = Button(
+            deploy_btn_row, text="KILL SWITCH — FLATTEN & STOP", command=self._dl_kill_clicked,
+            bg=RED, fg="#1a0a0d", activebackground="#c94656", activeforeground="#1a0a0d",
+            relief="flat", bd=0, font=_safe_font(9, "bold"), padx=14, pady=8, cursor="hand2",
+        )
+        self.dl_kill_btn.pack(side="left", padx=8)
+        self.dl_kill_btn.config(state="disabled")
+
+        self.dl_progress = NeuralProgress(deploy_section)
+        self.dl_progress.pack(fill="x", padx=18, pady=(6, 10))
 
         self.dl_status = Label(
-            deploy_section, text="Not implemented yet: live order placement is scaffolded but disabled "
-                                 "pending your go-ahead -- see the note in CHANGES_SUMMARY.",
-            bg=PANEL, fg=AMBER, font=_safe_font(9), wraplength=900, justify="left",
+            deploy_section, text="Select a saved account above, then Test Connection.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(10, "bold"), wraplength=900, justify="left",
         )
         self.dl_status.pack(anchor="w", padx=18, pady=(2, 16))
 
+        journal_section = self._section(f, "Trade journal (this session)", "")
+        columns = ("time", "direction", "volume", "entry", "exit", "pnl", "status")
+        self.dl_journal_tree = ttk.Treeview(journal_section, columns=columns, show="headings", height=8)
+        for col, label, w in (
+            ("time", "Entry Time", 140), ("direction", "Dir", 50), ("volume", "Size", 70),
+            ("entry", "Entry", 90), ("exit", "Exit", 90), ("pnl", "P&L", 80), ("status", "Status", 70),
+        ):
+            self.dl_journal_tree.heading(col, text=label)
+            self.dl_journal_tree.column(col, width=w, anchor="center")
+        self.dl_journal_tree.pack(fill="x", padx=18, pady=(2, 12))
+
+        log_section = self._section(f, "Live log", "")
+        self.dl_log = Text(
+            log_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.dl_log.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
         self._dl_accounts: list = []
         self._dl_editing_id: str | None = None
+        self._dl_session = None
+        self._dl_journal = None
+        self._dl_selected_account = None
+        self._dl_strategy_items: list = []
         self._dl_refresh_accounts()
         self._dl_on_firm_changed()
         self._dl_refresh_strategy_list()
+
+    def _dl_timeframe_minutes(self) -> int:
+        mapping = {
+            "1 minute": 1, "5 minutes": 5, "15 minutes": 15, "30 minutes": 30,
+            "1 hour": 60, "4 hours": 240, "1 day": 1440,
+        }
+        return mapping.get(self.dl_timeframe.get_str(), 15)
+
+    def _dl_log_line(self, level: str, message: str):
+        color = {"error": RED, "warn": AMBER, "info": TEXT}.get(level, TEXT)
+        tag = f"lvl_{level}"
+        self.dl_log.tag_config(tag, foreground=color)
+        self.dl_log.insert(END, f"[{level.upper()}] {message}\n", tag)
+        self.dl_log.see(END)
+        try:
+            self.root.after(0, self.root.update_idletasks)
+        except Exception:
+            pass
+
+    def _dl_selected_strategy_item(self):
+        label = self.dl_strategy_combo.get_str()
+        for it in self._dl_strategy_items:
+            if f"[{it.strategy_type}] {it.name}" == label:
+                return it
+        return None
+
+    def _dl_refresh_journal_view(self):
+        for row in self.dl_journal_tree.get_children():
+            self.dl_journal_tree.delete(row)
+        if self._dl_journal is None or self._dl_session is None or self._dl_session._session_id is None:
+            return
+        trades = self._dl_journal.all_trades(self._dl_session._session_id)
+        for t in trades[:100]:
+            import datetime
+
+            entry_time = datetime.datetime.fromtimestamp(t.entry_time).strftime("%m-%d %H:%M")
+            direction = "LONG" if t.direction == 1 else "SHORT"
+            exit_price = f"{t.exit_price:.5f}" if t.exit_price else ""
+            pnl = f"{t.pnl:,.2f}" if t.pnl is not None else ""
+            self.dl_journal_tree.insert("", END, values=(
+                entry_time, direction, f"{t.volume:.2f}", f"{t.entry_price:.5f}", exit_price, pnl, t.status,
+            ))
+
+    def _dl_update_status(self, status):
+        parts = [f"Running: {status.running}", f"Last signal: {status.last_signal}"]
+        if status.balance is not None:
+            parts.append(f"Balance ${status.balance:,.2f}")
+        if status.equity is not None:
+            parts.append(f"Equity ${status.equity:,.2f}")
+        if status.n_trades_closed:
+            parts.append(f"Closed trades: {status.n_trades_closed}")
+        if status.win_rate is not None:
+            parts.append(f"Win rate {status.win_rate:.1f}%")
+        if status.halted_reason:
+            parts.append(f"HALTED: {status.halted_reason}")
+        color = RED if status.halted_reason else (GREEN if status.running else TEXT_DIM)
+        if status.drift_flag:
+            parts.append(f"⚠ {status.drift_flag}")
+            color = AMBER
+        self.dl_status.config(text="  |  ".join(parts), fg=color)
+        self._dl_refresh_journal_view()
+
+    def _dl_on_started(self):
+        self.dl_start_btn.config(state="disabled")
+        self.dl_stop_btn.config(state="normal")
+        self.dl_kill_btn.config(state="normal")
+        self.dl_progress.start()
+        self.dl_status.config(text="Running -- placing real orders on this account.", fg=GREEN)
 
     def _dl_on_firm_changed(self):
         name = self.dl_firm.get_str()
@@ -7131,6 +7452,7 @@ class MainWindow:
             return
         acct = self._dl_accounts[sel[0]]
         self._dl_editing_id = acct.id
+        self._dl_selected_account = acct
         self.dl_firm.var.set(acct.firm_name)
         self.dl_platform.var.set(acct.platform)
         self.dl_nickname.var.set(acct.nickname)
@@ -7139,6 +7461,14 @@ class MainWindow:
         self.dl_terminal_path.var.set(acct.terminal_path)
         self.dl_firm_note.config(text="Editing this saved account. Password is never re-displayed -- leave it "
                                        "blank to keep the existing one, or enter a new one to replace it.")
+        connectable = "(not yet supported)" not in acct.platform
+        self.dl_start_btn.config(state="normal" if connectable and self._dl_session is None else "disabled")
+        self.dl_status.config(
+            text=f"Selected '{acct.nickname}'. Click TEST CONNECTION, then START LIVE TRADING when ready."
+            if connectable else
+            f"'{acct.nickname}' uses {acct.platform}, which isn't connectable yet -- see the note above.",
+            fg=TEXT_DIM if connectable else AMBER,
+        )
 
     def _dl_delete_account(self):
         sel = self.dl_accounts_listbox.curselection()
@@ -7204,12 +7534,14 @@ class MainWindow:
 
     def _dl_refresh_strategy_list(self):
         try:
-            names = [f"{s.strategy_type}: {s.filename}" for s in list_saved_strategies()]
+            items = list_saved_strategies(None)
         except Exception:
-            names = []
-        self.dl_strategy_combo.combo.config(values=names or [""])
-        if names:
-            self.dl_strategy_combo.var.set(names[0])
+            items = []
+        self._dl_strategy_items = items
+        labels = [f"[{it.strategy_type}] {it.name}" for it in items]
+        self.dl_strategy_combo.combo.config(values=labels or [""])
+        if labels and not self.dl_strategy_combo.get_str():
+            self.dl_strategy_combo.var.set(labels[0])
 
     def _dl_test_connection(self):
         sel = self.dl_accounts_listbox.curselection()
@@ -7232,9 +7564,10 @@ class MainWindow:
             if result.ok:
                 msg = (f"Connected: account {result.account_login} @ {result.account_server} — "
                        f"balance {result.balance:,.2f} {result.currency}, equity {result.equity:,.2f}. "
-                       f"START LIVE TRADING is still disabled -- see the note below.")
+                       f"Ready -- pick a strategy below and click START LIVE TRADING when you're sure.")
                 connector.disconnect()
                 color = GREEN
+                self.root.after(0, lambda: self.dl_start_btn.config(state="normal" if self._dl_session is None else "disabled"))
             else:
                 msg, color = result.message, RED
             self.root.after(0, lambda: self.dl_status.config(text=msg, fg=color))
@@ -7242,16 +7575,136 @@ class MainWindow:
         threading.Thread(target=run, daemon=True).start()
 
     def _dl_start_clicked(self):
-        messagebox.showinfo(
-            "Not enabled yet",
-            "Live order placement is intentionally disabled in this build. The account-management "
-            "and connection-testing above are fully working; wiring START LIVE TRADING to actually "
-            "place live orders (reusing the same engine as Live Demo Test) is the next step once "
-            "you've confirmed you want that turned on.",
-        )
+        sel = self.dl_accounts_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("No account selected", "Select a saved live account first.")
+            return
+        acct = self._dl_accounts[sel[0]]
+        if "(not yet supported)" in acct.platform:
+            messagebox.showwarning("Not supported yet", f"{acct.platform} isn't wired up yet -- see the note above.")
+            return
+        if not mt5_connector_module.is_available():
+            messagebox.showwarning("MT5 not available", mt5_connector_module.unavailable_reason())
+            return
+
+        item = self._dl_selected_strategy_item()
+        if item is None:
+            messagebox.showwarning("No strategy selected", "Choose a strategy from the Strategy Library first.")
+            return
+
+        symbol = self.dl_symbol.get_str().strip()
+        if not symbol:
+            messagebox.showwarning("Missing symbol", "Enter the symbol to trade (must match your broker's Market Watch name).")
+            return
+
+        if not messagebox.askyesno(
+            "Confirm live trading",
+            f"This will place REAL orders with REAL money on account '{acct.nickname}' "
+            f"({acct.firm_name}, login {acct.login}) trading strategy '{item.name}' on {symbol}.\n\n"
+            "Have you validated this strategy (15 FULL PIPELINE) and run it on Live Demo Test first, "
+            "and confirmed your prop firm permits automated trading on this account?\n\n"
+            "This cannot be undone once trades are placed. Continue?",
+            icon="warning",
+        ):
+            return
+
+        try:
+            strategy = self._ft_build_strategy_instance(item)
+        except Exception as exc:
+            messagebox.showerror("Strategy error", f"Could not load strategy: {exc}")
+            return
+
+        from app.forward_test.mt5_connector import MT5Connector
+
+        connector = MT5Connector(acct.login, acct.password, acct.server, acct.terminal_path)
+        pip_size_str = self.dl_pip_size.get_str().strip()
+        pip_size = None
+        if pip_size_str:
+            try:
+                pip_size = float(pip_size_str)
+            except ValueError:
+                pip_size = None
+
+        def resolve_pip_and_start():
+            nonlocal pip_size
+            probe = MT5Connector(acct.login, acct.password, acct.server, acct.terminal_path)
+            conn = probe.connect()
+            if not conn.ok:
+                self.root.after(0, lambda: self._dl_log_line("error", conn.message))
+                self.root.after(0, lambda: self.dl_start_btn.config(state="normal"))
+                return
+            if pip_size is None:
+                try:
+                    pip_size = probe.symbol_point(symbol)
+                except Exception as exc:
+                    self.root.after(0, lambda: self._dl_log_line(
+                        "warn", f"Could not auto-detect pip size ({exc}); falling back to 0.0001."))
+                    pip_size = 0.0001
+            probe.disconnect()
+
+            risk = RiskConfig(
+                initial_balance=conn.balance or 10_000.0,
+                risk_mode="percent",
+                risk_value=self.dl_risk_pct.get_float(1.0),
+                max_trades_per_day=self.dl_max_trades_per_day.get_int(10),
+                pip_size=pip_size,
+                daily_loss_limit_pct=self.dl_daily_loss_limit.get_float(5.0) or None,
+            )
+            baseline_str = self.dl_baseline_win_rate.get_str().strip()
+            baseline_win_rate = float(baseline_str) if baseline_str else None
+
+            cfg = ForwardTestConfig(
+                symbol=symbol, timeframe_minutes=self._dl_timeframe_minutes(),
+                risk=risk, baseline_win_rate=baseline_win_rate,
+            )
+            self._dl_journal = ForwardTestJournal()
+            session = ForwardTestSession(
+                strategy=strategy, strategy_type=item.strategy_type, strategy_filename=item.name,
+                connector=connector, journal=self._dl_journal, config=cfg,
+                on_log=lambda level, msg: self.root.after(0, lambda: self._dl_log_line(level, msg)),
+                on_status=lambda status: self.root.after(0, lambda: self._dl_update_status(status)),
+            )
+            ok, msg = session.start()
+            if not ok:
+                self.root.after(0, lambda: self._dl_log_line("error", msg))
+                self.root.after(0, lambda: self.dl_start_btn.config(state="normal"))
+                return
+            self._dl_session = session
+            self.root.after(0, self._dl_on_started)
+
+        threading.Thread(target=resolve_pip_and_start, daemon=True).start()
+        self.dl_start_btn.config(state="disabled")
+        self.dl_status.config(text="Connecting...", fg=AMBER)
+        self._dl_log_line("info", f"Starting live trading on '{acct.nickname}' ({symbol}, {item.name})...")
+
+    def _dl_stop_clicked(self):
+        if self._dl_session is None:
+            return
+        self.dl_status.config(text="Stopping...", fg=AMBER)
+        threading.Thread(target=self._dl_session.stop, daemon=True).start()
+        self.dl_start_btn.config(state="normal")
+        self.dl_stop_btn.config(state="disabled")
+        self.dl_kill_btn.config(state="disabled")
+        self.dl_progress.stop()
+        self._dl_session = None
 
     def _dl_kill_clicked(self):
-        pass
+        if self._dl_session is None:
+            return
+        if not messagebox.askyesno(
+            "Kill switch",
+            "This closes every open REAL position on this account immediately and stops the "
+            "session. Continue?",
+        ):
+            return
+        self.dl_status.config(text="Flattening and stopping...", fg=RED)
+        session = self._dl_session
+        threading.Thread(target=session.flatten_all_and_stop, daemon=True).start()
+        self.dl_start_btn.config(state="normal")
+        self.dl_stop_btn.config(state="disabled")
+        self.dl_kill_btn.config(state="disabled")
+        self.dl_progress.stop()
+        self._dl_session = None
 
 
 def launch():

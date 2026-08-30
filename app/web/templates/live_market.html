@@ -148,7 +148,7 @@
   <label id="lm-replay-wrap" style="display:none;">Dataset
     <select id="lm-dataset">
       {% for d in replay_datasets %}
-      <option value="{{ d }}">{{ d }}</option>
+      <option value="{{ d }}" {{ 'selected' if d == initial_symbol }}>{{ d }}</option>
       {% endfor %}
     </select>
   </label>
@@ -373,7 +373,13 @@
 
   function fetchBars() {
     const symbol = currentSymbolParam();
-    if (!symbol) return;
+    if (!symbol) {
+      setStatus('unavailable');
+      if (sourceSel.value === 'replay') {
+        document.getElementById('lm-hud-symbol').textContent = 'No dataset -- import a CSV on Step 1 first';
+      }
+      return;
+    }
     const params = new URLSearchParams({
       source: sourceSel.value, symbol: symbol, timeframe: timeframeSel.value,
       seed: seeded ? '0' : '1',

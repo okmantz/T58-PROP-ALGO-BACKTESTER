@@ -105,7 +105,10 @@ class FullPipelineConfig:
     oos_check_metric: str = "profit_factor"
     random_seed: int | None = 42
     save_to_library: bool = True           # code strategies only -- manual configs aren't files
-    library_status: str = "validated"
+    library_status: str | None = None      # None = auto-pick from the READY/MARGINAL/NOT READY
+                                            # verdict (see _VERDICT_TO_LIBRARY_STATUS below);
+                                            # pass an explicit STRATEGY_STATUSES value to always
+                                            # use that one regardless of verdict.
     # Passed straight through to Step 2's walk-forward-aware GA (by far
     # the most expensive step in a typical run) -- see
     # app.optimize.walkforward_ga.run_walkforward_aware_refinement for
@@ -239,6 +242,19 @@ def _make_verdict(
     else:
         verdict = "NOT READY"
     return verdict, reasons
+
+
+# What each Full Pipeline verdict tags a newly-saved strategy with in the
+# Strategy Library when FullPipelineConfig.library_status is left as None
+# (the default) -- READY strategies still land on "validated" rather than
+# jumping straight to "ready_for_demo"/"ready_for_live", since those last
+# two stages are meant to reflect actual demo/live trading experience, not
+# just a clean backtest -- promote it yourself once you've watched it run.
+_VERDICT_TO_LIBRARY_STATUS = {
+    "READY": "validated",
+    "MARGINAL": "tested_passed",
+    "NOT READY": "tested_failed",
+}
 
 
 def run_full_pipeline(
@@ -613,7 +629,7 @@ def _finish(
             except StrategyAlreadyExists:
                 filename = f"{base_name}_pipeline_{int(time.time())}{ext}"
                 saved_library_path = save_strategy_text(final_code_text, filename, final_source_type, overwrite=False)
-            set_strategy_status(final_source_type, filename, cfg.library_status)
+            set_strategy_status(final_source_type, filename, cfg.library_status or _VERDICT_TO_LIBRARY_STATUS.get(verdict, "tested_passed"))
             record_backtest_result(final_source_type, filename, {
                 "trades": len(final_bt.trades),
                 "net_profit": round(final_bt.statistics.net_profit, 2),

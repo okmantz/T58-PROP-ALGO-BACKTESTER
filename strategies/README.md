@@ -1,5 +1,12 @@
 # Strategy Library
 
+**Writing or hand-editing a strategy file yourself?** See
+[`STRATEGY_FORMAT.md`](./STRATEGY_FORMAT.md) in this same folder for the
+exact parameters/functions each language (Python / PineScript / MQL5)
+needs so the backtester knows how to place trades, exit, and set
+stop-loss/take-profit. This file below is about the *library* mechanics
+(save/load/export) rather than the file format itself.
+
 This folder is the app's built-in strategy library. Strategies saved here
 (from the desktop app's Strategy tab or the mobile web app) are available
 on every future run without re-uploading them from your computer or phone.

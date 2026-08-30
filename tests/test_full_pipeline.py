@@ -10,6 +10,7 @@ from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipelin
 from app.prop.simulator import PropRules
 from app.strategy import library
 from app.strategy.manual import ManualStrategy
+from app.strategy.python import PythonStrategy
 
 
 @pytest.fixture(autouse=True)
@@ -230,3 +231,79 @@ def test_full_pipeline_ai_assist_gives_up_after_two_consecutive_failures(tmp_pat
     )
     assert call_count["n"] == 2  # stopped after exactly 2 consecutive failures
     assert any("giving up after 2 consecutive failures" in line for line in logs)
+
+
+# ---------------------------------------------------------------------------
+# Batch Full Pipeline -- run_full_pipeline_batch (multi-strategy, one full
+# 7-step pipeline run + one report per strategy)
+# ---------------------------------------------------------------------------
+
+from app.orchestration.full_pipeline import (  # noqa: E402
+    FullPipelineBatchItem, run_full_pipeline_batch,
+)
+
+
+def test_full_pipeline_batch_runs_every_item_and_writes_a_report_each(tmp_path):
+    df = _trending_df()
+    items = [
+        FullPipelineBatchItem(label="sma_a", strategy=ManualStrategy(_sma_config(fast=5, slow=15))),
+        FullPipelineBatchItem(label="sma_b", strategy=ManualStrategy(_sma_config(fast=8, slow=21))),
+    ]
+    logs = []
+    summary = run_full_pipeline_batch(
+        df, items, RiskConfig(), PropRules(), tmp_path, cfg=_cfg(), progress_cb=logs.append,
+    )
+    assert len(summary.outcomes) == 2
+    assert len(summary.succeeded) == 2
+    assert len(summary.failed) == 0
+    for outcome in summary.outcomes:
+        assert outcome.ok
+        assert outcome.verdict in ("READY", "MARGINAL", "NOT READY")
+        assert outcome.trades > 0
+        assert outcome.report_html.exists()
+    # Two distinct reports, not one overwriting the other.
+    assert summary.outcomes[0].report_html != summary.outcomes[1].report_html
+    assert any("[1/2]" in line for line in logs)
+    assert any("[2/2]" in line for line in logs)
+
+
+def test_full_pipeline_batch_one_bad_strategy_does_not_abort_the_rest(tmp_path):
+    df = _trending_df()
+    items = [
+        FullPipelineBatchItem(label="never_fires", strategy=ManualStrategy(_never_fires_config())),
+        FullPipelineBatchItem(label="sma_ok", strategy=ManualStrategy(_sma_config())),
+    ]
+    summary = run_full_pipeline_batch(df, items, RiskConfig(), PropRules(), tmp_path, cfg=_cfg())
+    assert len(summary.outcomes) == 2
+    failed = summary.failed
+    succeeded = summary.succeeded
+    assert len(failed) == 1 and failed[0].label == "never_fires"
+    assert len(succeeded) == 1 and succeeded[0].label == "sma_ok"
+    assert succeeded[0].report_html.exists()
+
+
+def test_full_pipeline_batch_records_result_onto_library_metadata(tmp_path):
+    df = _trending_df(n=2400, seed=9)
+    python_source = """
+import pandas as pd
+STOP_LOSS_PIPS = 15.0
+TAKE_PROFIT_PIPS = 30.0
+def generate_signals(df: pd.DataFrame) -> pd.Series:
+    fast = df["close"].rolling(5).mean()
+    slow = df["close"].rolling(15).mean()
+    sig = pd.Series(0, index=df.index)
+    sig[fast > slow] = 1
+    sig[fast < slow] = -1
+    return sig
+"""
+    filename = "batch_pipeline_test_strategy.py"
+    library.save_strategy_text(python_source, filename, "python")
+    strategy = PythonStrategy(library.get_strategy_library_dir("python") / filename)
+
+    items = [FullPipelineBatchItem(label=filename, strategy=strategy, library_ref=("python", filename))]
+    summary = run_full_pipeline_batch(df, items, RiskConfig(), PropRules(), tmp_path, cfg=_cfg())
+    assert summary.succeeded
+
+    saved = [s for s in library.list_saved_strategies("python") if s.name == filename][0]
+    assert saved.metadata.get("last_run") is not None
+    assert saved.metadata["last_run"].get("verdict") in ("READY", "MARGINAL", "NOT READY")

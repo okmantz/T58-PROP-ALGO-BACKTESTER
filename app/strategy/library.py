@@ -32,11 +32,12 @@ the repo's strategies/ folder and needs no extra step.
 
 Metadata sidecars (<file>.meta.json) hold everything besides the raw
 source: description, market, timeframe, tags (list[str]), status (one of
-STRATEGY_STATUSES -- the "draft -> validated -> live" lifecycle), and
-results other features stamp onto a saved strategy after they run against
-it: last_run (record_backtest_result), lookahead (record_lookahead_result),
-last_search (record_search_result). None of that is required -- an entry
-with no metadata at all is just a file with defaults (status "draft").
+STRATEGY_STATUSES -- the draft -> tested (failed/passed) -> validated ->
+ready-for-demo -> ready-for-live lifecycle), and results other features
+stamp onto a saved strategy after they run against it: last_run
+(record_backtest_result), lookahead (record_lookahead_result), last_search
+(record_search_result). None of that is required -- an entry with no
+metadata at all is just a file with defaults (status "draft").
 """
 from __future__ import annotations
 
@@ -62,14 +63,56 @@ _EXTENSIONS = {
 _META_SUFFIX = ".meta.json"
 
 # The strategy lifecycle this library tracks, cheapest-to-riskiest:
-#   draft     -- default; being built/edited, not yet trusted
-#   validated -- passed whatever checks you consider sufficient (lookahead
-#                check, falsification kit, holdout, etc.)
-#   live      -- actually trading / deployed
+#   draft            -- default; being built/edited, not yet trusted
+#   tested_failed    -- run through a backtest/pipeline and it failed
+#                       (didn't pass prop rules, negative expectancy, etc.)
+#   tested_passed    -- ran clean on a first pass, but hasn't been through
+#                       deeper out-of-sample validation yet
+#   validated        -- passed deeper validation (walk-forward, CPCV,
+#                       lookahead/falsification checks, holdout, etc.)
+#   ready_for_demo   -- validated and cleared to run on a demo account
+#   ready_for_live   -- proven on demo and cleared to trade real money
 # Nothing in this module enforces the *order* of transitions; it's a status
-# label the person sets deliberately, not a state machine that blocks you.
-STRATEGY_STATUSES = ("draft", "validated", "live")
+# label the person (or Full Pipeline's verdict, see
+# app.orchestration.full_pipeline) sets deliberately, not a state machine
+# that blocks you -- you can always drop a strategy back to "draft" or
+# jump straight to "ready_for_live" if that's genuinely where it belongs.
+STRATEGY_STATUSES = (
+    "draft",
+    "tested_failed",
+    "tested_passed",
+    "validated",
+    "ready_for_demo",
+    "ready_for_live",
+)
 DEFAULT_STATUS = "draft"
+
+# Human-readable labels for the UI (listbox prefixes, dropdowns, badges).
+# Falls back to status.upper() for anything not listed here, so an unknown
+# / future status never breaks display.
+STATUS_LABELS: dict[str, str] = {
+    "draft": "DRAFT",
+    "tested_failed": "TESTED / FAILED",
+    "tested_passed": "TESTED / PASSED",
+    "validated": "VALIDATED",
+    "ready_for_demo": "READY FOR DEMO",
+    "ready_for_live": "READY FOR LIVE",
+}
+
+# Old status values from before this lifecycle was expanded -- kept so a
+# strategy tagged under the old 3-stage scheme ("draft"/"validated"/"live")
+# still normalizes and displays sensibly instead of erroring, without
+# needing to rewrite every existing .meta.json sidecar.
+_LEGACY_STATUS_ALIASES: dict[str, str] = {
+    "live": "ready_for_live",
+}
+
+
+def status_label(status: str) -> str:
+    """Human-readable form of a status slug, for display -- e.g.
+    'tested_failed' -> 'TESTED / FAILED'. Never raises."""
+    s = _LEGACY_STATUS_ALIASES.get((status or "").strip().lower(), (status or "").strip().lower())
+    return STATUS_LABELS.get(s, s.upper() if s else STATUS_LABELS[DEFAULT_STATUS])
 
 
 class StrategyAlreadyExists(Exception):
@@ -94,6 +137,7 @@ def _normalize_type(strategy_type: str) -> str:
 
 def _normalize_status(status: str) -> str:
     s = (status or "").strip().lower()
+    s = _LEGACY_STATUS_ALIASES.get(s, s)
     if s not in STRATEGY_STATUSES:
         raise ValueError(f"Unknown status '{status}'. Expected one of {STRATEGY_STATUSES}.")
     return s
@@ -174,7 +218,15 @@ class StoredStrategy:
 
     @property
     def status(self) -> str:
-        return self.metadata.get("status") or DEFAULT_STATUS
+        raw = (self.metadata.get("status") or DEFAULT_STATUS).strip().lower()
+        return _LEGACY_STATUS_ALIASES.get(raw, raw)
+
+    @property
+    def status_display(self) -> str:
+        """Human-readable status, e.g. 'TESTED / FAILED' -- what the UI
+        should actually show; `.status` stays the raw slug used for
+        filtering/storage."""
+        return status_label(self.status)
 
     @property
     def tags(self) -> list[str]:
@@ -472,8 +524,10 @@ def set_strategy_tags(strategy_type: str, filename: str, tags: list[str]) -> Pat
 
 
 def set_strategy_status(strategy_type: str, filename: str, status: str) -> Path:
-    """Set a strategy's lifecycle status: 'draft', 'validated', or 'live'.
-    This is a plain label the person sets deliberately -- nothing here
+    """Set a strategy's lifecycle status -- one of STRATEGY_STATUSES
+    ('draft', 'tested_failed', 'tested_passed', 'validated',
+    'ready_for_demo', 'ready_for_live'). This is a plain label the person
+    (or Full Pipeline's verdict) sets deliberately -- nothing here
     enforces moving through the stages in order."""
     return save_strategy_metadata(strategy_type, filename, {"status": _normalize_status(status)})
 

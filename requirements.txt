@@ -12,6 +12,12 @@ requests>=2.31.0
 # (.txt/.md papers still work with no extra dependency at all) rather than
 # the app failing to start.
 pypdf>=4.0.0
+# Live Market's "open chart" button: opens a chromeless native window
+# instead of a browser tab when available, since Tkinter itself has no
+# way to run the real JavaScript/Canvas content Lightweight Charts needs.
+# Optional -- the app falls back to your default browser (fully
+# functional either way) if this isn't installed or fails to start.
+pywebview>=5.0; platform_system == "Windows"
 # Forward Test (MT5 Demo) tab only -- talks to a locally-running MT5
 # terminal, which only exists on Windows. Harmless to leave in on
 # other platforms: pip simply skips it there, and the Forward Test tab

@@ -47,7 +47,7 @@ import pandas as pd
 
 STRATEGY_NAME = "ICT Sniper (ported from PineScript)"
 
-SENSITIVITY = 5          # swing pivot confirmation window (each side)
+SENSITIVITY = 2          # swing pivot confirmation window (each side)
 # PORTABILITY FIX (2026-08-30): the original MIN_FVG_PIPS_EQUIV was a fixed
 # absolute-price constant (0.00008) calibrated for a 5-digit EURUSD quote.
 # On an instrument priced two/three orders of magnitude higher (AAPL ~$200,
@@ -58,11 +58,11 @@ SENSITIVITY = 5          # swing pivot confirmation window (each side)
 # expressed as a fraction of ATR(14), which is already computed on every
 # bar and scales automatically with whatever instrument/timeframe you load
 # -- no more manual recalibration per instrument.
-MIN_FVG_ATR_MULT = 0.10   # min qualifying gap size, as a fraction of ATR(14)
-ATR_PERIOD = 14
-DISPLACEMENT_ATR_MULT = 1.5
-STOP_BUFFER_ATR_MULT = 0.05   # stop buffer, as a fraction of ATR(14)
-RR_RATIO = 3.0
+MIN_FVG_ATR_MULT = -0.502325   # min qualifying gap size, as a fraction of ATR(14)
+ATR_PERIOD = 29
+DISPLACEMENT_ATR_MULT = 1.002154
+STOP_BUFFER_ATR_MULT = -0.747997   # stop buffer, as a fraction of ATR(14)
+RR_RATIO = 3.59888
 
 
 def _atr(df: pd.DataFrame, period: int) -> pd.Series:

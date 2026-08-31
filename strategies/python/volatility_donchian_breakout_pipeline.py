@@ -61,13 +61,13 @@ import pandas as pd
 
 STRATEGY_NAME = "Volatility-Filtered Donchian Breakout"
 
-DONCHIAN_PERIOD = 20        # bars in the breakout channel
-ATR_PERIOD = 14
-VOL_FILTER_LOOKBACK = 50    # bars in the ATR-regime rolling average
-STOP_ATR_MULT = 2.0
-RR_RATIO = 2.5
-TRAIL_ATR_MULT = 1.5
-BREAKEVEN_TRIGGER_R = 1.0
+DONCHIAN_PERIOD = 17        # bars in the breakout channel
+ATR_PERIOD = 42
+VOL_FILTER_LOOKBACK = 132    # bars in the ATR-regime rolling average
+STOP_ATR_MULT = 1.289338
+RR_RATIO = 3.273576
+TRAIL_ATR_MULT = 1.21484
+BREAKEVEN_TRIGGER_R = 1.101175
 
 
 def _atr(df: pd.DataFrame, period: int) -> pd.Series:

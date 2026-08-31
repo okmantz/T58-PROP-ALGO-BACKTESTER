@@ -912,6 +912,7 @@ class MainWindow:
         self.tab_deploylive = Frame(self.content, bg=BG)
         self.tab_livemarket = Frame(self.content, bg=BG)
         self.tab_genstrat = Frame(self.content, bg=BG)
+        self.tab_evolution = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
@@ -919,6 +920,7 @@ class MainWindow:
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
             self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket, self.tab_genstrat,
+            self.tab_evolution,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -957,6 +959,7 @@ class MainWindow:
             (None, None, "FINDING AN EDGE", None, None),
             ("ensemble", "", "14  Ensemble", self.tab_ensemble, NEON_MAGENTA),
             ("genstrat", "", "Generate Strategies (AI)", self.tab_genstrat, NEON_MAGENTA),
+            ("evolution", "", "Evolution Lab", self.tab_evolution, NEON_MAGENTA),
 
             (None, None, "ALL-IN-ONE", None, None),
             ("fullpipeline", "", "15  Full Pipeline", self.tab_fullpipeline, NEON_AMBER),
@@ -988,6 +991,7 @@ class MainWindow:
         self._build_wfga_tab()
         self._build_ensemble_tab()
         self._build_generate_strategies_tab()
+        self._build_evolution_lab_tab()
         self._build_full_pipeline_tab()
         self._build_forward_test_tab()
         self._build_deploy_live_tab()
@@ -7179,6 +7183,211 @@ class MainWindow:
     # -----------------------------------------------------------------------
     # Tab 15 — Full Pipeline (run everything, hand back the champion)
     # -----------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Evolution Lab -- natural-selection-based strategy discovery.
+    # See app.evolution.engine for the actual generate -> pre-filter ->
+    # robustness/OOS/Monte Carlo/prop-sim -> CPCV/PBO -> stress -> cluster
+    # -> keep top N -> mutate -> repeat loop this tab drives.
+    # ------------------------------------------------------------------
+    def _build_evolution_lab_tab(self):
+        f = self.tab_evolution
+        Label(
+            f, text="EVOLUTION LAB", bg=BG, fg=TEXT, font=_safe_font(16, "bold"),
+        ).pack(anchor="w", padx=24, pady=(20, 4))
+        Label(
+            f,
+            text=(
+                "Natural-selection-based strategy discovery: each generation generates a fresh "
+                "population of strategies across every family (07 Search Lab's own generator), "
+                "runs them through pre-filter -> robustness -> walk-forward -> Monte Carlo -> prop "
+                "simulation -> real CPCV / PBO -> a stress test at higher execution costs -> a "
+                "correlation-based cluster dedupe, keeps the top N by PROP FITNESS (not raw profit -- "
+                "see app/evolution/prop_fitness.py), mutates them, and repeats. Click START and it runs "
+                "in the background -- safe to leave running for hours while you work in other tabs. "
+                "Every candidate evaluated (not just the winners) is logged to the knowledge graph, so "
+                "later generations' journal entries can say what's historically worked before, not just "
+                "what this generation found."
+            ),
+            bg=BG, fg=TEXT_DIM, font=_safe_font(9), wraplength=900, justify="left",
+        ).pack(anchor="w", padx=24, pady=(0, 10))
+
+        cfg_section = self._section(
+            f, "Run configuration",
+            "Uses whatever market data is loaded in 01 Data and whatever's set on 03 Prop Rules / "
+            "04 Risk at the moment you click START -- changing those tabs after starting has no "
+            "effect on an already-running Evolution Lab run.",
+            emphasize=True,
+        )
+        self.evo_population = LabeledEntry(cfg_section, "Population size per generation", "60")
+        self.evo_elite_keep = LabeledEntry(cfg_section, "Elite keep (top N)", "10")
+        self.evo_max_generations = LabeledEntry(cfg_section, "Max generations (blank = run until stopped)", "")
+        self.evo_min_trades = LabeledEntry(cfg_section, "Min trades (pre-filter)", "20")
+        self.evo_mc_sims = LabeledEntry(cfg_section, "Monte Carlo sims per candidate", "1000")
+        self.evo_cpcv_top_n = LabeledEntry(cfg_section, "CPCV / PBO pool size (most expensive stage)", "8")
+        self.evo_stress_mult = LabeledEntry(cfg_section, "Stress test cost multiplier", "2.0")
+
+        families_frame = Frame(cfg_section, bg=PANEL)
+        families_frame.pack(fill="x", padx=18, pady=(4, 4))
+        Label(
+            families_frame, text="Families to include (none selected = every family)",
+            bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9),
+        ).pack(anchor="w")
+        self.evo_families_listbox = Listbox(
+            families_frame, height=6, selectmode=EXTENDED, exportselection=False,
+            bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+            font=(MONO, 9),
+        )
+        self.evo_families_listbox.pack(fill="x", pady=(2, 0))
+        try:
+            for fam in sorted(list_families().keys()):
+                self.evo_families_listbox.insert(END, fam)
+        except Exception:
+            pass
+
+        btn_row = Frame(cfg_section, bg=PANEL)
+        btn_row.pack(anchor="w", padx=18, pady=(10, 6))
+        self._button(btn_row, "START EVOLUTION LAB", self._start_evolution_lab, primary=True).pack(side="left")
+        self._button(btn_row, "STOP", self._stop_evolution_lab).pack(side="left", padx=8)
+
+        self.evo_status_label = Label(
+            cfg_section, text="Not running.", bg=PANEL, fg=TEXT_DIM, font=_safe_font(9),
+        )
+        self.evo_status_label.pack(anchor="w", padx=18, pady=(0, 12))
+
+        lb_section = self._section(
+            f, "Leaderboard (all-time best seen)",
+            "Refreshed after every generation. Sorted by PROP FITNESS, which already accounts for "
+            "pass probability, payout probability, robustness, OOS consistency, drawdown, and the "
+            "penalties described above -- not just net profit.",
+        )
+        self.evo_leaderboard_listbox = Listbox(
+            lb_section, height=8, exportselection=False, bg=PANEL_3, fg=TEXT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+            font=(MONO, 9),
+        )
+        self.evo_leaderboard_listbox.pack(fill="x", padx=18, pady=(2, 12))
+
+        log_section = self._section(
+            f, "Live log + hypothesis journal",
+            "Each generation ends with a numbered HYPOTHESIS entry (test/result/OOS/CPCV/stress/"
+            "winner/confidence) plus a knowledge-graph similarity readout for that generation's winner.",
+        )
+        log_frame = Frame(log_section, bg=PANEL)
+        log_frame.pack(fill="both", expand=True, padx=18, pady=(2, 14))
+        self.evo_log_text = Text(
+            log_frame, wrap="word", bg=PANEL_3, fg=TEXT, font=(MONO, 9), relief="flat", bd=0, height=18,
+        )
+        evo_log_scrollbar = ttk.Scrollbar(
+            log_frame, orient="vertical", command=self.evo_log_text.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.evo_log_text.config(yscrollcommand=evo_log_scrollbar.set)
+        self.evo_log_text.pack(side="left", fill="both", expand=True)
+        evo_log_scrollbar.pack(side="right", fill="y")
+
+        self._evolution_runner = None
+
+    def _evo_log(self, msg: str) -> None:
+        def _do():
+            try:
+                self.evo_log_text.insert(END, msg + "\n")
+                self.evo_log_text.see(END)
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _do)
+        except Exception:
+            pass
+
+    def _start_evolution_lab(self):
+        if self._evolution_runner is not None and self._evolution_runner.is_running:
+            messagebox.showinfo(
+                "Already running",
+                "Evolution Lab is already running. Click STOP first if you want to change settings "
+                "and start a fresh run.",
+            )
+            return
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data file in 01 Data before starting the Evolution Lab.")
+            return
+
+        from app.evolution.engine import EvolutionConfig, EvolutionRunner
+
+        try:
+            per_file_results = []
+            for p in self.csv_paths:
+                result = import_csv(p)
+                if not result.is_valid:
+                    messagebox.showerror("Import error", f"{os.path.basename(p)}:\n" + "\n".join(result.errors))
+                    return
+                per_file_results.append(result)
+            if len(per_file_results) == 1:
+                df = per_file_results[0].dataframe
+            else:
+                df, _labels = merge_multi_timeframe([r.dataframe for r in per_file_results])
+        except Exception as exc:
+            messagebox.showerror("Could not load data", str(exc))
+            return
+
+        risk = self._build_risk_config()
+        rules = self._build_prop_rules()
+        selected_families = [self.evo_families_listbox.get(i) for i in self.evo_families_listbox.curselection()] or None
+        max_gen_raw = self.evo_max_generations.get_str().strip()
+        max_generations = int(max_gen_raw) if max_gen_raw.isdigit() else None
+
+        cfg = EvolutionConfig(
+            population_size=self.evo_population.get_int(60),
+            elite_keep=self.evo_elite_keep.get_int(10),
+            families=selected_families,
+            min_trades=self.evo_min_trades.get_int(20),
+            mc_sims=self.evo_mc_sims.get_int(1000),
+            cpcv_top_n=self.evo_cpcv_top_n.get_int(8),
+            stress_cost_multiplier=self.evo_stress_mult.get_float(2.0),
+            max_generations=max_generations,
+        )
+        self.evo_log_text.delete("1.0", END)
+        self._evolution_runner = EvolutionRunner(df, risk, rules, cfg, progress_cb=self._evo_log)
+        self._evolution_runner.start()
+        self._evo_log(
+            f"Evolution Lab started -- population {cfg.population_size}, elite keep {cfg.elite_keep}, "
+            f"{'unlimited generations' if cfg.max_generations is None else f'max {cfg.max_generations} generations'}."
+        )
+        self._poll_evolution_status()
+
+    def _stop_evolution_lab(self):
+        if self._evolution_runner is None or not self._evolution_runner.is_running:
+            messagebox.showinfo("Not running", "Evolution Lab isn't currently running.")
+            return
+        self._evolution_runner.stop()
+        self._evo_log("Stop requested -- finishing the current generation, then stopping.")
+
+    def _poll_evolution_status(self):
+        runner = self._evolution_runner
+        if runner is None:
+            return
+        status = runner.status()
+        self.evo_status_label.config(
+            text=(
+                f"{'RUNNING' if status['running'] else 'STOPPED'} -- generation {status['generation']}, "
+                f"leaderboard size {status['leaderboard_size']}"
+            ),
+            fg=GREEN if status["running"] else TEXT_DIM,
+        )
+        try:
+            self.evo_leaderboard_listbox.delete(0, END)
+            for r in runner.leaderboard:
+                score = r.fitness.final_score if r.fitness else float("nan")
+                self.evo_leaderboard_listbox.insert(
+                    END, f"  {score:8.2f}   {r.meta.get('family', '?'):18s}  {r.candidate_id}"
+                )
+        except Exception:
+            pass
+        if status["running"]:
+            try:
+                self.root.after(2000, self._poll_evolution_status)
+            except Exception:
+                pass
 
     def _build_full_pipeline_tab(self):
         f = self._scrollable(self.tab_fullpipeline)

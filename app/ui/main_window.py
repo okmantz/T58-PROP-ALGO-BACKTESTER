@@ -2757,7 +2757,7 @@ class MainWindow:
 
     def _browse_csv(self):
         paths = filedialog.askopenfilenames(
-            filetypes=[("CSV files", "*.csv")]
+            filetypes=[("Market data", "*.csv *.tsv *.txt *.parquet *.zip *.7z"), ("All files", "*.*")]
         )
         if not paths:
             return
@@ -2958,6 +2958,9 @@ class MainWindow:
         self._button(
             lib_btn_row_3, "VIEW CODE / CONFIG", self._view_selected_strategy_code
         ).pack(side="left", padx=8)
+        self._button(
+            lib_btn_row_3, "OPTIMIZE SELECTED", self._optimize_selected_library_strategies
+        ).pack(side="left", padx=8)
 
         Label(
             library_section,
@@ -2968,7 +2971,11 @@ class MainWindow:
             "way you want them, and come back here and click RUN BATCH TEST when you're "
             "ready. VIEW CODE / CONFIG shows the saved source for a selected "
             "Python/PineScript/MQL5 strategy, or the built config for whatever's currently "
-            "set up in Manual mode.",
+            "set up in Manual mode. OPTIMIZE SELECTED runs the same walk-forward-aware GA "
+            "Full Pipeline uses (Step 2) against just the highlighted strategy(ies) -- "
+            "quicker than a full Full Pipeline run, and saves each winning configuration "
+            "into the library as a new '<name>_optimized' file (status: draft) without "
+            "touching the original.",
             bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
         ).pack(anchor="w", padx=18, pady=(0, 10))
 
@@ -3866,6 +3873,86 @@ class MainWindow:
                     self._refresh_dashboard()
                 except Exception:
                     pass
+                try:
+                    self._refresh_strategy_library()
+                except Exception:
+                    pass
+            try:
+                self.root.after(0, _refresh_after_run)
+            except Exception:
+                pass
+        except Exception:
+            log("\nUnexpected error:\n" + traceback.format_exc())
+
+    def _optimize_selected_library_strategies(self):
+        """OPTIMIZE SELECTED -- runs app.orchestration.quick_optimize against
+        every currently-highlighted Strategy Library row. Unlike the Batch
+        test queue, this acts directly on whatever's selected in the list
+        right now (no separate queue/stage step), since it's meant as a
+        quick "is this worth a real Full Pipeline run" check."""
+        items = self._selected_library_items()
+        if not items:
+            messagebox.showinfo(
+                "No selection",
+                "Select one or more saved strategies from the list above first "
+                "(Ctrl/Cmd-click or Shift-click for more than one).",
+            )
+            return
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data file in Step 1 before optimizing.")
+            return
+        win, append = self._open_progress_window(f"Optimizing {len(items)} strategy(ies)...")
+        threading.Thread(
+            target=self._run_library_quick_optimize, args=(items, append), daemon=True,
+        ).start()
+
+    def _run_library_quick_optimize(self, items, log):
+        from app.orchestration.quick_optimize import QuickOptimizeConfig, run_quick_optimize
+
+        try:
+            log(f"Loading {len(self.csv_paths)} market data file(s)...")
+            per_file_results = []
+            for p in self.csv_paths:
+                result = import_csv(p)
+                if not result.is_valid:
+                    log(f"Import errors ({os.path.basename(p)}):\n" + "\n".join(result.errors))
+                    return
+                per_file_results.append((p, result))
+            if len(per_file_results) == 1:
+                df = per_file_results[0][1].dataframe
+            else:
+                df, _labels = merge_multi_timeframe([r.dataframe for _, r in per_file_results])
+            log(f"Loaded {len(df)} bars.\n")
+
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            cfg = QuickOptimizeConfig()
+            results = []
+            for i, item in enumerate(items, start=1):
+                log(f"===== [{i}/{len(items)}] Optimizing: {item.name} =====")
+                try:
+                    strategy = self._load_bulk_strategy(item.path)
+                except Exception as exc:
+                    log(f"  Skipped -- could not load: {exc}\n")
+                    continue
+                try:
+                    res = run_quick_optimize(df, strategy, risk, rules, cfg, progress_cb=lambda m: log(f"  {m}"))
+                    results.append((item.name, res))
+                except Exception as exc:
+                    log(f"  Optimize failed: {exc}\n")
+                    continue
+                log("")
+
+            if results:
+                log("Summary (eval-pass probability, before -> after):")
+                for name, res in sorted(results, key=lambda t: t[1].optimized_eval_pass_probability, reverse=True):
+                    marker = "IMPROVED" if res.improved else "no improvement"
+                    log(
+                        f"  {name}: {res.baseline_eval_pass_probability:.1f}% -> "
+                        f"{res.optimized_eval_pass_probability:.1f}%  ({marker})"
+                    )
+
+            def _refresh_after_run():
                 try:
                     self._refresh_strategy_library()
                 except Exception:
@@ -5387,7 +5474,7 @@ class MainWindow:
     def _search_choose_pair_csv(self):
         path = filedialog.askopenfilename(
             title="Select the second instrument's market data CSV (for the stat_pairs family)",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            filetypes=[("Market data", "*.csv *.tsv *.txt *.parquet *.zip *.7z"), ("All files", "*.*")],
         )
         if not path:
             return
@@ -6334,7 +6421,7 @@ class MainWindow:
     def _portfolio_add_leg(self):
         path = filedialog.askopenfilename(
             title="Select market data CSV for this instrument",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            filetypes=[("Market data", "*.csv *.tsv *.txt *.parquet *.zip *.7z"), ("All files", "*.*")],
         )
         if not path:
             return

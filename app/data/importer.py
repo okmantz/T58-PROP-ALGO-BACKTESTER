@@ -24,7 +24,9 @@ Standard internal schema:
 from __future__ import annotations
 
 import io
+import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -207,14 +209,134 @@ def _looks_like_header(row: list[str]) -> bool:
     return True
 
 
+SUPPORTED_ARCHIVE_EXTENSIONS = {".zip", ".7z"}
+SUPPORTED_DATA_EXTENSIONS = {".csv", ".tsv", ".txt", ".parquet"}
+
+
+def _name_of(path_or_buffer) -> str:
+    """Best-effort filename for a path, Path, or file-like/buffer object
+    (Tkinter/Flask both hand this function open file handles or werkzeug
+    FileStorage objects, not always plain path strings)."""
+    if isinstance(path_or_buffer, (str, Path)):
+        return str(path_or_buffer)
+    return str(getattr(path_or_buffer, "name", "") or getattr(path_or_buffer, "filename", "") or "")
+
+
+def _extension_of(path_or_buffer) -> str:
+    return Path(_name_of(path_or_buffer)).suffix.lower()
+
+
+def _bytes_of(path_or_buffer) -> bytes:
+    if isinstance(path_or_buffer, (str, Path)):
+        return Path(path_or_buffer).read_bytes()
+    if hasattr(path_or_buffer, "seek"):
+        path_or_buffer.seek(0)
+    data = path_or_buffer.read()
+    if hasattr(path_or_buffer, "seek"):
+        path_or_buffer.seek(0)
+    return data
+
+
+def _pick_data_member(names: list[str]) -> str:
+    """Given the member names inside a zip/7z archive, pick the one that's
+    actually the market-data file -- skips directories, macOS junk
+    (__MACOSX/.DS_Store), and anything without a recognized data
+    extension. If more than one candidate remains, the pattern in
+    practice (a vendor export zip) is one real data file plus small
+    readme/metadata files, so the LARGEST-by-name-heuristic candidate
+    isn't knowable from names alone -- callers pass this list already
+    filtered to real candidates and this just picks the first, but if
+    several match we prefer the one that looks most like a data export
+    (contains a digit, e.g. an OHLCV period suffix) over a generic name
+    like 'data.csv'.
+    """
+    candidates = [
+        n for n in names
+        if not n.endswith("/") and "__MACOSX" not in n and not Path(n).name.startswith(".")
+        and Path(n).suffix.lower() in SUPPORTED_DATA_EXTENSIONS
+    ]
+    if not candidates:
+        raise ValueError(
+            f"No .csv/.tsv/.txt/.parquet file found inside the archive (contents: {names[:10]})."
+        )
+    if len(candidates) == 1:
+        return candidates[0]
+    with_digit = [n for n in candidates if any(ch.isdigit() for ch in Path(n).stem)]
+    return sorted(with_digit or candidates, key=len)[0]
+
+
+def _read_parquet_ohlcv(path_or_buffer) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(io.BytesIO(_bytes_of(path_or_buffer)))
+    except ImportError as exc:
+        raise ValueError(
+            "Reading .parquet files requires the 'pyarrow' package (pip install pyarrow)."
+        ) from exc
+
+
+def _read_member_bytes(member_name: str, member_bytes: bytes) -> pd.DataFrame:
+    ext = Path(member_name).suffix.lower()
+    if ext == ".parquet":
+        return _read_parquet_ohlcv(io.BytesIO(member_bytes))
+    # csv/tsv/txt member -- reuse the normal CSV path (delimiter/header
+    # detection) on the extracted bytes.
+    return _read_csv_like(io.BytesIO(member_bytes))
+
+
+def _read_zip(path_or_buffer) -> pd.DataFrame:
+    with zipfile.ZipFile(io.BytesIO(_bytes_of(path_or_buffer))) as zf:
+        member = _pick_data_member(zf.namelist())
+        return _read_member_bytes(member, zf.read(member))
+
+
+def _read_7z(path_or_buffer) -> pd.DataFrame:
+    try:
+        import py7zr
+    except ImportError as exc:
+        raise ValueError(
+            "Reading .7z files requires the 'py7zr' package (pip install py7zr)."
+        ) from exc
+    import tempfile
+    with py7zr.SevenZipFile(io.BytesIO(_bytes_of(path_or_buffer)), mode="r") as archive:
+        names = archive.getnames()
+        member = _pick_data_member(names)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive.extract(path=tmp_dir, targets=[member])
+            extracted_path = Path(tmp_dir) / member
+            return _read_member_bytes(member, extracted_path.read_bytes())
+
+
 def _read_raw_file(path_or_buffer) -> pd.DataFrame:
+    """
+    Read a market-data file, dispatching on extension first:
+
+    - .parquet             -> pd.read_parquet directly (already tabular,
+                               no delimiter/header guessing needed)
+    - .zip / .7z            -> opens the archive and reads whichever member
+                               inside it looks like the actual OHLCV data
+                               file (.csv/.tsv/.txt/.parquet), skipping
+                               folders and OS junk like __MACOSX/.DS_Store
+    - anything else (.csv, .tsv, .txt, or no extension at all -- e.g. a
+      Tkinter/Flask file handle that doesn't expose one) falls through to
+      the existing delimiter/header-detecting CSV reader below.
+    """
+    ext = _extension_of(path_or_buffer)
+    if ext == ".parquet":
+        return _read_parquet_ohlcv(path_or_buffer)
+    if ext == ".zip":
+        return _read_zip(path_or_buffer)
+    if ext == ".7z":
+        return _read_7z(path_or_buffer)
+    return _read_csv_like(path_or_buffer)
+
+
+def _read_csv_like(path_or_buffer) -> pd.DataFrame:
     """
     Read a market-data file while automatically detecting:
 
     - delimiter
     - header/no-header
-    """
-
+    \"\"\" - see _read_raw_file's docstring for the extension dispatch above this."""
     separator = _detect_separator(path_or_buffer)
 
     # First read the first row without assuming a header.

@@ -45,7 +45,7 @@ from pathlib import Path
 import pandas as pd
 
 from app.strategy.base import Strategy, StrategyError, StrategyResult, signals_from_conditions
-from app.strategy.expr import safe_eval_bool
+from app.strategy.expr import safe_eval_bool, safe_eval_numeric
 from app.strategy.indicators import ema, sma
 
 _COMMENT_RE = re.compile(r"//.*$")
@@ -194,10 +194,24 @@ class MQL5Strategy(Strategy):
                     work[var_name] = safe_eval_bool(work, _c_bool_to_python(rhs), var_name)
                     continue
 
+                # Plain arithmetic over previously-defined numeric variables,
+                # e.g. `trendStrengthPct = (emaFast - emaSlow) / emaSlow;`.
+                # Common for normalized/percentage-separation filters. Only
+                # attempted when the RHS actually contains an arithmetic
+                # operator and no function-call syntax (iMA/iRSI would have
+                # already matched above) -- anything else still falls
+                # through to the error below.
+                if any(op in rhs for op in ("+", "-", "*", "/")):
+                    try:
+                        work[var_name] = safe_eval_numeric(work, rhs, var_name)
+                        continue
+                    except StrategyError:
+                        pass
+
                 raise StrategyError(
                     f"MQL5: unsupported expression assigned to '{var_name}': '{rhs}'. "
                     "Supported: iMA(...) with MODE_SMA/MODE_EMA/MODE_LWMA, iRSI(...), "
-                    "and boolean comparisons over previously defined variables."
+                    "boolean comparisons, and +-*/ arithmetic over previously defined variables."
                 )
 
             # if (...) { block open   (K&R style, brace on same line)

@@ -163,7 +163,18 @@ class PineScriptStrategy(Strategy):
 
                 input_match = _INPUT_RE.search(rhs)
                 if input_match and rhs.strip().startswith("input."):
-                    constants[var_name] = float(input_match.group(1))
+                    value = float(input_match.group(1))
+                    constants[var_name] = value
+                    # Also expose the value as a broadcast column, not just
+                    # in the `constants` dict. `constants` is only ever
+                    # consulted by _resolve_length() for ta.* length
+                    # arguments -- a very common second use of input.*() is
+                    # a plain threshold (e.g. `longRSI = input.float(55.0,
+                    # ...)` used later as `rsiVal > longRSI`), which is
+                    # evaluated by safe_eval_bool() against `work`'s
+                    # columns and would otherwise fail with "name 'longRSI'
+                    # is not defined" even though the script is valid.
+                    work[var_name] = value
                     continue
 
                 cross_match = _CROSS_CALL_RE.search(rhs)

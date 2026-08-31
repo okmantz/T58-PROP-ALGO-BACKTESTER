@@ -20,9 +20,16 @@ ALLOWED_EXPR_CHARS = set(
 )
 
 _FORBIDDEN_WORDS = {
-    "import", "exec", "eval", "open", "compile", "globals", "locals",
+    "import", "exec", "eval", "compile", "globals", "locals",
     "builtins", "lambda", "class", "def", "os", "sys", "subprocess",
 }
+# NOTE: "open" is deliberately NOT in this list. It is a legitimate OHLC
+# price series name (Pine/MQL5 strategies routinely compare close > open),
+# and the actual security concern -- someone writing the Python builtin
+# call `open(...)` -- is already caught below by the function-call-syntax
+# check, which rejects any `name(` pattern regardless of the name. Keeping
+# "open" as a bare forbidden word blocked every legitimate use of the open
+# price and was never adding real protection on top of that check.
 
 
 def validate_expression(expr: str, field_name: str) -> None:
@@ -53,6 +60,27 @@ def validate_expression(expr: str, field_name: str) -> None:
     # still allowed for grouping.
     if re.search(r"[A-Za-z_]\w*\s*\(", expr):
         raise StrategyError(f"'{field_name}' contains a function call; use the visual indicator builder instead.")
+
+
+def safe_eval_numeric(frame: pd.DataFrame, expr: str, field_name: str) -> pd.Series:
+    """Evaluate a restricted numeric (arithmetic) expression against
+    DataFrame columns -- e.g. '(emaFast - emaSlow) / emaSlow'. Shares the
+    same character/forbidden-word/no-function-call validation as
+    safe_eval_bool(); the only difference is this one is for a numeric
+    result (a derived indicator series) rather than a boolean one, so it
+    skips the and/or/not substitution and doesn't coerce the result to
+    bool at the end.
+    """
+    validate_expression(expr, field_name)
+    try:
+        result = frame.eval(expr, engine="python", parser="pandas")
+    except Exception as exc:  # noqa: BLE001
+        raise StrategyError(
+            f"Failed to evaluate expression '{expr}' ({field_name}): {exc}"
+        ) from exc
+    if not isinstance(result, pd.Series):
+        result = pd.Series(result, index=frame.index)
+    return result.astype(float)
 
 
 def safe_eval_bool(frame: pd.DataFrame, expr: str, field_name: str) -> pd.Series:

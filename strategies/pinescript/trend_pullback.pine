@@ -1,0 +1,38 @@
+//@version=5
+strategy("T58 Trend Pullback")
+
+fastLen = input.int(20, "Fast EMA")
+slowLen = input.int(50, "Slow EMA")
+rsiLen = input.int(14, "RSI Length")
+rsiLongMin = input.float(50.0, "Long RSI Minimum")
+rsiLongMax = input.float(68.0, "Long RSI Maximum")
+rsiShortMin = input.float(32.0, "Short RSI Minimum")
+rsiShortMax = input.float(50.0, "Short RSI Maximum")
+
+fastEMA = ta.ema(close, fastLen)
+slowEMA = ta.ema(close, slowLen)
+rsiVal = ta.rsi(close, rsiLen)
+
+longTrend = fastEMA > slowEMA
+shortTrend = fastEMA < slowEMA
+
+longPullback = low < fastEMA and close > fastEMA
+shortPullback = high > fastEMA and close < fastEMA
+
+longMomentum = rsiVal > rsiLongMin and rsiVal < rsiLongMax
+shortMomentum = rsiVal > rsiShortMin and rsiVal < rsiShortMax
+
+longCondition = longTrend and longPullback and longMomentum and close > open
+shortCondition = shortTrend and shortPullback and shortMomentum and close < open
+
+exitLongCondition = ta.crossunder(close, fastEMA)
+exitShortCondition = ta.crossover(close, fastEMA)
+
+strategy.entry("Long", strategy.long, when=longCondition)
+strategy.entry("Short", strategy.short, when=shortCondition)
+
+strategy.close("Long", when=exitLongCondition)
+strategy.close("Short", when=exitShortCondition)
+
+// T58_SL_PIPS=20
+// T58_TP_PIPS=40

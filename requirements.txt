@@ -6,6 +6,13 @@ alpaca-py>=0.33.0
 keyring>=24.0.0
 qrcode[pil]==8.2
 requests>=2.31.0
+# Market data import: .parquet files (pyarrow) and .7z archives (py7zr).
+# .zip archives use Python's built-in zipfile, no extra dependency needed.
+# Both optional in spirit -- .csv/.tsv/.txt import works with neither
+# installed; only opening a .parquet or .7z file raises a clear
+# "pip install ..." error if the corresponding package is missing.
+pyarrow>=14.0.0
+py7zr>=0.20.0
 # Research library (research/ folder) -- extracts text from PDF papers you
 # drop in there so the Ollama AI assist can be grounded in them. Optional
 # in spirit: if this isn't installed, PDF papers are silently skipped

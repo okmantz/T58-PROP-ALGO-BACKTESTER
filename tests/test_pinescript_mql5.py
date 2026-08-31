@@ -140,3 +140,90 @@ def test_mql5_copybuffer_pattern_raises_clear_error():
 def test_mql5_no_buy_sell_raises():
     with pytest.raises(StrategyError):
         MQL5Strategy("void OnTick() {}").generate(_oscillating_df(n=20))
+
+
+# -- Regression tests for the 2026-08-31 bug fixes ------------------------
+# (see app/strategy/pinescript.py, app/strategy/expr.py, app/strategy/mql5.py)
+
+
+def test_pine_input_float_threshold_usable_in_comparison():
+    """Bug: input.int/float() values were only ever exposed via the internal
+    `constants` dict (used by ta.* length resolution), never as a column
+    `safe_eval_bool` could see -- so any script that used an input as a
+    THRESHOLD rather than an indicator length (e.g. `rsiVal > longRSI`)
+    failed with "name 'longRSI' is not defined" even though it's valid Pine."""
+    df = _oscillating_df(n=200)
+    code = """
+    //@version=5
+    strategy("Threshold input")
+    rsiLen = input.int(14, "RSI Length")
+    longRSI = input.float(55.0, "Long RSI")
+    rsiVal = ta.rsi(close, rsiLen)
+    longCondition = rsiVal > longRSI
+    shortCondition = rsiVal < 45.0
+    if longCondition
+        strategy.entry("Long", strategy.long)
+    if shortCondition
+        strategy.entry("Short", strategy.short)
+    """
+    result = PineScriptStrategy(code).generate(df)
+    assert (result.signals != 0).any()
+
+
+def test_pine_open_price_series_not_treated_as_forbidden_token():
+    """Bug: expr.py's security blocklist contained the bare word "open" to
+    stop someone writing the Python builtin open(...), but "open" is also
+    the legitimate OHLC open-price series name -- so `close > open` was
+    rejected with "contains forbidden token 'open'" even though it's just
+    a column reference, not a function call (which is caught separately)."""
+    df = _oscillating_df(n=200)
+    # _oscillating_df sets open == close, which would never trigger
+    # `close > open` regardless of this bug -- offset open so the
+    # condition can actually fire and the assertion is meaningful.
+    df["open"] = df["close"].shift(1).fillna(df["close"])
+    code = """
+    //@version=5
+    strategy("Uses open")
+    longCondition = close > open
+    shortCondition = close < open
+    if longCondition
+        strategy.entry("Long", strategy.long)
+    if shortCondition
+        strategy.entry("Short", strategy.short)
+    """
+    result = PineScriptStrategy(code).generate(df)
+    assert (result.signals != 0).any()
+
+
+def test_expr_still_blocks_actual_open_call():
+    """The fix must not reopen the actual hole -- open(...) as a genuine
+    function call is still rejected by the separate function-call-syntax
+    check in validate_expression."""
+    from app.strategy.expr import StrategyError as ExprStrategyError  # re-exported
+    from app.strategy.expr import validate_expression
+    with pytest.raises(ExprStrategyError):
+        validate_expression("open('/etc/passwd').read() > 0", "test")
+
+
+def test_mql5_supports_basic_arithmetic_over_indicators():
+    """Bug: the MQL5 parser only understood iMA()/iRSI() assignments and
+    boolean comparisons -- a normalized/derived value like a percentage
+    EMA-separation filter (`(emaFast - emaSlow) / emaSlow`) raised
+    'unsupported expression assigned to trendStrengthPct' even though it's
+    ordinary arithmetic over two already-defined variables."""
+    df = _oscillating_df(n=300)
+    code = """
+    #include <Trade/Trade.mqh>
+    CTrade trade;
+    void OnTick() {
+      double emaFast = iMA(_Symbol, PERIOD_CURRENT, 10, 0, MODE_EMA, PRICE_CLOSE);
+      double emaSlow = iMA(_Symbol, PERIOD_CURRENT, 30, 0, MODE_EMA, PRICE_CLOSE);
+      double trendStrengthPct = (emaFast - emaSlow) / emaSlow;
+      bool bullTrend = trendStrengthPct > 0.0001;
+      bool bearTrend = trendStrengthPct < -0.0001;
+      if (bullTrend) { trade.Buy(0.1); }
+      if (bearTrend) { trade.Sell(0.1); }
+    }
+    """
+    result = MQL5Strategy(code).generate(df)
+    assert (result.signals != 0).any()

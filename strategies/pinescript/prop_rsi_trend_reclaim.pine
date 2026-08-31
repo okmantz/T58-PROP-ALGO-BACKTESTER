@@ -1,0 +1,40 @@
+//@version=5
+strategy("Prop RSI Trend Reclaim", overlay=true)
+
+// T58_SL_PIPS=25
+// T58_TP_PIPS=50
+
+// Indicator parameters using parser-supported inputs
+fastLength = input.int(20, "Fast EMA Length")
+slowLength = input.int(100, "Slow EMA Length")
+rsiLength = input.int(14, "RSI Length")
+
+// Moving averages & RSI calculations
+emaFast = ta.ema(close, fastLength)
+emaSlow = ta.ema(close, slowLength)
+rsiVal = ta.rsi(close, rsiLength)
+
+// Regime validation
+bullRegime = emaFast > emaSlow and close > emaSlow
+bearRegime = emaFast < emaSlow and close < emaSlow
+
+// Event-based triggers: RSI recovers from pullback territory within trend
+longCondition = bullRegime and ta.crossover(rsiVal, 40)
+shortCondition = bearRegime and ta.crossunder(rsiVal, 60)
+
+// Trend invalidation exits
+exitLongCondition = ta.crossunder(close, emaFast) or ta.crossover(rsiVal, 75)
+exitShortCondition = ta.crossover(close, emaFast) or ta.crossunder(rsiVal, 25)
+
+// Execution guards
+if longCondition
+    strategy.entry("Long", strategy.long)
+
+if shortCondition
+    strategy.entry("Short", strategy.short)
+
+if exitLongCondition
+    strategy.close("Long")
+
+if exitShortCondition
+    strategy.close("Short")

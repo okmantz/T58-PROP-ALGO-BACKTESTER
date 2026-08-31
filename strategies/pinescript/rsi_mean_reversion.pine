@@ -1,0 +1,25 @@
+//@version=5
+strategy("T58 RSI Mean Reversion")
+
+rsiLen = input.int(14, "RSI Length")
+rsiOversold = input.float(30.0, "Oversold")
+rsiOverbought = input.float(70.0, "Overbought")
+meanLen = input.int(20, "Mean Length")
+
+mean = ta.sma(close, meanLen)
+rsiVal = ta.rsi(close, rsiLen)
+
+longCondition = rsiVal < rsiOversold and close < mean and close > open
+shortCondition = rsiVal > rsiOverbought and close > mean and close < open
+
+exitLongCondition = ta.crossover(close, mean)
+exitShortCondition = ta.crossunder(close, mean)
+
+strategy.entry("Long", strategy.long, when=longCondition)
+strategy.entry("Short", strategy.short, when=shortCondition)
+
+strategy.close("Long", when=exitLongCondition)
+strategy.close("Short", when=exitShortCondition)
+
+// T58_SL_PIPS=15
+// T58_TP_PIPS=30

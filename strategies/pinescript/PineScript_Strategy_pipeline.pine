@@ -1,8 +1,8 @@
 //@version=5
 strategy("RSI Mean Reversion Fade", overlay=true)
 
-// T58_SL_PIPS=30
-// T58_TP_PIPS=45
+// T58_SL_PIPS=35.256641
+// T58_TP_PIPS=20.015285
 //
 // NEW STRATEGY (built from scratch, 2026-08-30) -- pure counter-trend
 // mean reversion. Deliberately the OPPOSITE mechanism from the prior Pine
@@ -35,7 +35,7 @@ strategy("RSI Mean Reversion Fade", overlay=true)
 // treat 25/75/50 and the pip values as a starting point for the GA to
 // refine, not a finished, tested setting.
 
-rsiVal = ta.rsi(close, 14)
+rsiVal = ta.rsi(close, 42)
 
 longCondition = rsiVal < 25
 shortCondition = rsiVal > 75

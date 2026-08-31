@@ -2,13 +2,13 @@
 // Designed to participate only when trend and momentum agree.
 // Uses only constructs supported by the T58 MQL5 parser.
 //
-// T58_SL_PIPS=22
-// T58_TP_PIPS=50
+// T58_SL_PIPS=6.6
+// T58_TP_PIPS=54.067375
 
-double fastMA = iMA(_Symbol, PERIOD_CURRENT, 10, 0, MODE_EMA, PRICE_CLOSE);
-double midMA = iMA(_Symbol, PERIOD_CURRENT, 30, 0, MODE_EMA, PRICE_CLOSE);
-double trendMA = iMA(_Symbol, PERIOD_CURRENT, 100, 0, MODE_EMA, PRICE_CLOSE);
-double rsiVal = iRSI(_Symbol, PERIOD_CURRENT, 14, PRICE_CLOSE);
+double fastMA = iMA(_Symbol, PERIOD_CURRENT, 3, 0, MODE_EMA, PRICE_CLOSE);
+double midMA = iMA(_Symbol, PERIOD_CURRENT, 50, 0, MODE_EMA, PRICE_CLOSE);
+double trendMA = iMA(_Symbol, PERIOD_CURRENT, 90, 0, MODE_EMA, PRICE_CLOSE);
+double rsiVal = iRSI(_Symbol, PERIOD_CURRENT, 30, PRICE_CLOSE);
 
 if (fastMA > midMA && midMA > trendMA && close > fastMA && rsiVal >= 55 && rsiVal <= 72) {
     trade.Buy(0.10, _Symbol);

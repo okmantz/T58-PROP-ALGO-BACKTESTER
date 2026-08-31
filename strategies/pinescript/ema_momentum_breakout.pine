@@ -1,0 +1,35 @@
+//@version=5
+strategy("T58 EMA Momentum Breakout")
+
+fastLen = input.int(10, "Fast EMA")
+mediumLen = input.int(20, "Medium EMA")
+slowLen = input.int(50, "Slow EMA")
+rsiLen = input.int(14, "RSI Length")
+longRSI = input.float(55.0, "Long RSI")
+shortRSI = input.float(45.0, "Short RSI")
+
+fastEMA = ta.ema(close, fastLen)
+mediumEMA = ta.ema(close, mediumLen)
+slowEMA = ta.ema(close, slowLen)
+rsiVal = ta.rsi(close, rsiLen)
+
+bullTrend = fastEMA > mediumEMA and mediumEMA > slowEMA
+bearTrend = fastEMA < mediumEMA and mediumEMA < slowEMA
+
+longCross = ta.crossover(fastEMA, mediumEMA)
+shortCross = ta.crossunder(fastEMA, mediumEMA)
+
+longCondition = bullTrend and longCross and rsiVal > longRSI and close > slowEMA
+shortCondition = bearTrend and shortCross and rsiVal < shortRSI and close < slowEMA
+
+exitLongCondition = ta.crossunder(fastEMA, mediumEMA)
+exitShortCondition = ta.crossover(fastEMA, mediumEMA)
+
+strategy.entry("Long", strategy.long, when=longCondition)
+strategy.entry("Short", strategy.short, when=shortCondition)
+
+strategy.close("Long", when=exitLongCondition)
+strategy.close("Short", when=exitShortCondition)
+
+// T58_SL_PIPS=25
+// T58_TP_PIPS=75

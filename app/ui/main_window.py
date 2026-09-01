@@ -35,6 +35,9 @@ from app.backtest.risk import RiskConfig, suggest_pip_size
 import app.ai.ollama_settings as ollama_settings_module
 from app.ai.ollama_settings import OllamaSettings
 import app.ai.strategy_generator as strategy_generator_module
+import app.ai.research_library as research_library_module
+import app.ai.experiment_memory as experiment_memory_module
+from app.ai.research_agent import ResearchAgentContext, ResearchAgent
 from app.data import alpaca_credentials
 from app.data.alpaca_source import (
     ASSET_CLASSES, ADJUSTMENT_CHOICES, FEED_CHOICES, TIMEFRAME_LABELS,
@@ -854,7 +857,7 @@ class MainWindow:
         body = Frame(shell, bg=BG)
         body.pack(fill="both", expand=True, padx=18, pady=(0, 18))
 
-        # The sidebar itself scrolls: with 17 tabs + section dividers, the
+        # The sidebar itself scrolls: with 18 tabs + section dividers, the
         # full nav list is taller than the sidebar's available height on
         # this app's default/minimum window size, and a fixed (non-
         # scrolling) sidebar simply clips whatever doesn't fit off the
@@ -915,6 +918,7 @@ class MainWindow:
         self.tab_livemarket = Frame(self.content, bg=BG)
         self.tab_genstrat = Frame(self.content, bg=BG)
         self.tab_evolution = Frame(self.content, bg=BG)
+        self.tab_researchagent = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
@@ -970,6 +974,9 @@ class MainWindow:
             ("forwardtest", "", "Live Demo Test", self.tab_forwardtest, NEON_LIME),
             ("deploylive", "", "Deploy Live", self.tab_deploylive, RED),
             ("livemarket", "", "Live Market", self.tab_livemarket, NEON_CYAN),
+
+            (None, None, "AI RESEARCH", None, None),
+            ("researchagent", "", "18  Research Agent", self.tab_researchagent, NEON_MAGENTA),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -999,6 +1006,7 @@ class MainWindow:
             ("Forward Test", self._build_forward_test_tab),
             ("Deploy Live", self._build_deploy_live_tab),
             ("Live Market", self._build_live_market_tab),
+            ("Research Agent", self._build_research_agent_tab),
         ):
             self._pump_splash(f"Loading {label}...")
             builder()
@@ -8011,6 +8019,254 @@ class MainWindow:
         finally:
             self.fullpipeline_progress.stop()
 
+    # -----------------------------------------------------------------------
+    # Tab 18 — AI Research Agent (T58 AI Research Engine)
+    #
+    # The "research analyst" upgrade to AI Assist: instead of a single
+    # request/response call (numeric parameter suggestions, or a one-shot
+    # generated strategy file), this hands a local Ollama model a fixed
+    # toolbox of READ-ONLY analysis actions -- backtest, prop-simulation,
+    # Monte Carlo, walk-forward, regime analysis, parameter sensitivity,
+    # cost stress, plus the research/ paper library and T58's own memory
+    # of every past experiment -- and lets it reason across several steps
+    # before answering. See app.ai.research_agent's module docstring for
+    # the full safety rationale: every tool call runs this app's OWN
+    # already-validated engine, so the model can propose a next step or a
+    # diagnosis, but it can never invent a number or write/change code.
+    # Uses the strategy, data, prop rules, and risk settings already
+    # configured in Steps 01-04, exactly like 15 Full Pipeline does.
+    # -----------------------------------------------------------------------
+
+    def _build_research_agent_tab(self):
+        f = self._scrollable(self.tab_researchagent)
+        self._page_header(
+            f,
+            "18 / AI Research",
+            "AI Research Agent",
+            "Ask a local Ollama model to investigate the strategy configured in Steps 01-04. "
+            "It can call run_backtest, run_prop_simulation, run_monte_carlo, run_walk_forward, "
+            "run_regime_analysis, run_parameter_sensitivity, run_cost_stress, compare_strategies, "
+            "search_research (your research/ paper library), and search_experiments (T58's own "
+            "memory of every past strategy test) -- each one runs this app's real, already-"
+            "validated engine, never a guess. The model can recommend a next step (e.g. a "
+            "parameter worth testing), but cannot apply it itself -- take any recommendation "
+            "into 09 Refinement / Quick Optimize / 15 Full Pipeline to actually test it.",
+        )
+
+        question_section = self._section(
+            f, "Research question",
+            "What do you want the agent to investigate? Be specific -- \"Is this strategy "
+            "robust enough for a 50K prop account?\" gets a more useful investigation than "
+            "\"is this good\".",
+            emphasize=True,
+        )
+        self.ra_question = Text(
+            question_section, height=4, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.ra_question.insert(
+            "1.0",
+            "Is this strategy robust, or does its edge depend on a fragile parameter or a "
+            "specific market regime? What's the most promising next thing to test?",
+        )
+        self.ra_question.pack(fill="x", padx=18, pady=(4, 12))
+        self.ra_max_steps = LabeledEntry(question_section, "Max tool-calling steps", 6)
+
+        self._build_ai_assist_section(f, prefix="ra_ai")
+
+        memory_section = self._section(
+            f, "Research Library + T58 Research Memory",
+            "The research/ paper library (RAG) and the durable record of every strategy this "
+            "app has tested. Embedding the library is optional (needs an Ollama embedding "
+            "model, e.g. `ollama pull nomic-embed-text`) -- without it, search_research still "
+            "works via plain keyword matching.",
+        )
+        btn_row = Frame(memory_section, bg=PANEL)
+        btn_row.pack(anchor="w", padx=18, pady=(2, 6))
+        self._button(btn_row, "EMBED RESEARCH LIBRARY", self._ra_embed_library_clicked, primary=True).pack(side="left")
+        self._button(btn_row, "REFRESH MEMORY SUMMARY", self._ra_refresh_memory_clicked).pack(side="left", padx=8)
+        self.ra_memory_status = Label(
+            memory_section, text="Click REFRESH MEMORY SUMMARY to see how many experiments T58 has recorded.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=900, justify="left",
+        )
+        self.ra_memory_status.pack(anchor="w", padx=18, pady=(0, 12))
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self.ra_run_btn = self._button(button_row, "RUN RESEARCH AGENT", self._ra_run_clicked, primary=True)
+        self.ra_run_btn.pack(side="left")
+
+        self.ra_progress = NeuralProgress(f)
+        self.ra_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        answer_section = self._section(f, "Final Answer", "Filled in once the agent finishes.")
+        self.ra_answer_label = Label(
+            answer_section, text="No run yet.", bg=PANEL, fg=TEXT_DIM,
+            font=_safe_font(11, "bold"), justify="left", wraplength=900, anchor="w",
+        )
+        self.ra_answer_label.pack(anchor="w", fill="x", padx=18, pady=(2, 12))
+
+        output_section = self._section(f, "Agent transcript", "Thought / Action / Observation, one step at a time.")
+        self.ra_output = Text(
+            output_section, height=22, wrap="word", bg=LOG_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.ra_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+    def _log_research_agent(self, msg: str):
+        self.ra_output.insert(END, msg + "\n")
+        self.ra_output.see(END)
+        self.root.update_idletasks()
+
+    def _ra_embed_library_clicked(self):
+        settings = self._build_ollama_settings(prefix="ra_ai")
+        if not settings.is_usable:
+            messagebox.showwarning(
+                "Ollama not enabled",
+                "Turn on 'Enable AI Assist for this run' above (and confirm TEST CONNECTION works) first.",
+            )
+            return
+        self.ra_memory_status.config(text="Embedding research library...", fg=AMBER)
+        self.root.update_idletasks()
+
+        def run():
+            try:
+                stats = research_library_module.embed_index(settings)
+                if stats.error:
+                    text = f"Embedded {stats.chunks_embedded} new chunk(s); stopped early: {stats.error}"
+                    color = AMBER
+                else:
+                    text = (
+                        f"Research library ready: {stats.chunks_embedded} newly embedded, "
+                        f"{stats.chunks_already_current} already current, {stats.total_chunks} total chunks."
+                    )
+                    color = GREEN
+            except Exception as exc:
+                text, color = f"Embedding failed: {exc}", RED
+
+            def _finish():
+                self.ra_memory_status.config(text=text, fg=color)
+
+            try:
+                self.root.after(0, _finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _ra_refresh_memory_clicked(self):
+        try:
+            counts = experiment_memory_module.get_summary_counts()
+        except Exception as exc:
+            self.ra_memory_status.config(text=f"Could not read Research Memory: {exc}", fg=RED)
+            return
+        if counts["total"] == 0:
+            text = "No experiments recorded yet -- run 15 Full Pipeline, Quick Optimize, or a Batch Test first."
+        else:
+            breakdown = ", ".join(f"{v}: {n}" for v, n in counts["by_verdict"].items())
+            text = f"T58 Research Memory: {counts['total']} experiments recorded. By verdict -- {breakdown}."
+        self.ra_memory_status.config(text=text, fg=TEXT_DIM)
+
+    def _ra_run_clicked(self):
+        question = self.ra_question.get("1.0", END).strip()
+        if not question:
+            messagebox.showinfo("Ask a question first", "Type a research question in the box above.")
+            return
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        settings = self._build_ollama_settings(prefix="ra_ai")
+        if not settings.is_usable:
+            messagebox.showwarning(
+                "Ollama not enabled",
+                "Turn on 'Enable AI Assist for this run' above (and confirm TEST CONNECTION works) first.",
+            )
+            return
+        self.ra_output.delete("1.0", END)
+        self.ra_answer_label.config(text="Running...", fg=TEXT_DIM)
+        self.ra_run_btn.config(state="disabled")
+        self.ra_progress.start(10)
+        threading.Thread(target=self._ra_run_agent, args=(question, settings), daemon=True).start()
+
+    def _ra_run_agent(self, question: str, settings: "OllamaSettings"):
+        try:
+            df = self._load_df_for_page(self._log_research_agent)
+            if df is None:
+                return
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            max_steps = self.ra_max_steps.get_int(6)
+            instrument = (
+                os.path.basename(self.csv_paths[0])
+                if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+
+            # Zero-arg builder consistent with every other tab's "always
+            # build fresh" convention (see app.search.robustness /
+            # app.validation.regime_testing) -- rereads current Step 02
+            # strategy config on every call, exactly like Full Pipeline's
+            # own strategy_builder does.
+            strategy_snapshot = self._build_strategy()
+            ctx = ResearchAgentContext(
+                df=df, strategy_builder=self._build_strategy,
+                strategy_name=_strategy_display_name(strategy_snapshot),
+                source_type=strategy_snapshot.source_type,
+                risk=risk, prop_rules=rules, instrument=instrument,
+            )
+
+            self._log_research_agent(f"Investigating '{ctx.strategy_name}' on {instrument}...\n")
+            agent = ResearchAgent(settings, max_steps=max_steps)
+            result = agent.run(question, ctx, progress_cb=self._log_research_agent)
+
+            for step in result.steps:
+                self._log_research_agent(f"\n--- Step {step.step_index} ---")
+                if step.thought:
+                    self._log_research_agent(f"Thought: {step.thought}")
+                if step.action:
+                    self._log_research_agent(f"Action: {step.action}({json.dumps(step.action_input or {})})")
+                if step.observation is not None:
+                    self._log_research_agent(f"Observation: {json.dumps(step.observation, indent=2)[:2000]}")
+                if step.note:
+                    self._log_research_agent(f"Note: {step.note}")
+
+            if result.final_answer:
+                self.ra_answer_label.config(text=result.final_answer, fg=GREEN)
+                self._log_research_agent(f"\nFinal Answer: {result.final_answer}")
+            elif result.error:
+                self.ra_answer_label.config(text=f"Stopped: {result.error}", fg=RED)
+                self._log_research_agent(f"\nStopped: {result.error}")
+            else:
+                self.ra_answer_label.config(text=f"Stopped without a final answer: {result.stopped_reason}", fg=AMBER)
+                self._log_research_agent(f"\nStopped without a final answer: {result.stopped_reason}")
+
+            # Best-effort: record this investigation in T58 Research Memory too,
+            # using whatever the agent's own run_backtest/run_monte_carlo tool
+            # calls already computed (never a fresh computation just for this).
+            try:
+                bt = ctx.cache_get("__baseline_bt__")
+                if bt is not None and bt.trades:
+                    experiment_memory_module.record_experiment(
+                        origin="research_agent", strategy_name=ctx.strategy_name,
+                        source_type=ctx.source_type, instrument=instrument,
+                        verdict="INVESTIGATED", trades=len(bt.trades),
+                        net_profit=bt.statistics.net_profit, win_rate=bt.statistics.win_rate,
+                        profit_factor=bt.statistics.profit_factor,
+                        max_drawdown_pct=bt.statistics.max_drawdown_pct,
+                        lesson=(result.final_answer or "")[:500], settings=settings,
+                    )
+            except Exception:
+                pass
+        except StrategyError as exc:
+            self._log_research_agent(f"\nStrategy error: {exc}")
+            self.ra_answer_label.config(text="Failed -- see log.", fg=RED)
+        except Exception:
+            self._log_research_agent("\nUnexpected error:\n" + traceback.format_exc())
+            self.ra_answer_label.config(text="Failed -- see log.", fg=RED)
+        finally:
+            self.ra_progress.stop()
+            self.ra_run_btn.config(state="normal")
 
     # -----------------------------------------------------------------------
     # Tab 16 — Live Demo Test (MT5 Demo)

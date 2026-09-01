@@ -209,7 +209,7 @@
   <div class="card">
     <h2>5. AI Assist (optional, off by default)</h2>
     <p class="ai-note">
-      When enabled, the GA search asks a local Ollama model for candidate parameter values once per generation and seeds them into the population alongside the normal random/bred candidates. Every suggestion still goes through the exact same backtest/prop-sim/Monte Carlo evaluation as any other candidate -- it proposes numbers for parameters that already exist, never code. Needs Ollama reachable at the host below from wherever this server is running (works over LAN; if this app is deployed to Cloud Run, that means a publicly reachable Ollama endpoint, not your own machine's localhost).
+      When enabled, the GA search asks a local Ollama model for candidate parameter values once per generation and seeds them into the population alongside the normal random/bred candidates. Every suggestion still goes through the exact same backtest/prop-sim/Monte Carlo evaluation as any other candidate -- it proposes numbers for parameters that already exist, never code. Needs Ollama reachable at the host below from wherever this server is running (works over your home/office LAN -- point it at the IP of whatever machine is running Ollama).
     </p>
     <label class="checkbox-row"><input type="checkbox" name="ai_enabled" id="ai_enabled" {{ 'checked' if ai_enabled else '' }}>Enable AI Assist for this run</label>
     <div class="row">

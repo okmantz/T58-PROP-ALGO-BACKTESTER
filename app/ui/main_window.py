@@ -926,7 +926,7 @@ class MainWindow:
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
             self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket, self.tab_genstrat,
-            self.tab_evolution,
+            self.tab_evolution, self.tab_researchagent,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -4119,21 +4119,33 @@ class MainWindow:
                 log("\nNothing to test -- every queued strategy failed to load.")
                 return
 
-            # Run several strategies' pipelines concurrently instead of one
-            # after another -- Step 2's GA search (by far the dominant cost
-            # per strategy) already parallelizes ACROSS a genome population;
-            # this additionally parallelizes ACROSS strategies, which is
-            # what actually shrinks a large multi-strategy batch's total
-            # wall-clock time. Auto-picked from the core count rather than
-            # a fixed number so it scales with whatever machine this runs
-            # on without needing its own settings widget; each strategy's
-            # own GA worker count is capped in turn by run_full_pipeline_batch
-            # so the two forms of parallelism don't oversubscribe the CPU.
-            max_parallel = max(1, min(len(batch_items), (os.cpu_count() or 4) // 2))
+            # Deliberately serial (max_parallel_strategies=1), not auto-
+            # scaled off the core count. This used to run several
+            # strategies' pipelines concurrently via ProcessPoolExecutor,
+            # which cut wall-clock time but cost two things Owen actually
+            # relies on for this specific button: (1) run_full_pipeline_batch
+            # can't pass a live progress_cb across a process boundary, so the
+            # parallel path only ever logs a start/finish line per strategy
+            # instead of every step (baseline, GA generations, OOS/holdout
+            # checks, ...) -- which is exactly the "it only showed the final
+            # verdict, not all the steps" regression this restores. (2) a
+            # worker process dying mid-run (OOM, a native crash inside
+            # numpy/pandas under concurrent load, etc.) is a much larger,
+            # harder-to-diagnose failure surface than a single-process loop
+            # where one bad strategy's exception is caught right where it
+            # happens -- the most likely explanation for a batch crashing
+            # partway through a run of several strategies. Step 2's GA
+            # search inside EACH strategy's own pipeline still parallelizes
+            # internally (see cfg.parallel_search_max_workers) -- this only
+            # removes the outer, less safe layer of parallelism ACROSS
+            # strategies. Pass max_parallel_strategies>1 to
+            # run_full_pipeline_batch directly (e.g. from a script) if raw
+            # throughput matters more than per-step visibility for a given
+            # run.
             summary = run_full_pipeline_batch(
                 df, batch_items, risk, rules, OUTPUT_DIR / "full_pipeline",
                 cfg=cfg, instrument=instrument, ollama_settings=ollama_settings, progress_cb=log,
-                max_parallel_strategies=max_parallel,
+                max_parallel_strategies=1,
             )
             if summary.succeeded:
                 ranked = sorted(summary.succeeded, key=lambda o: o.eval_pass_probability, reverse=True)

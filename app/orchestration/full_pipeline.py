@@ -942,23 +942,52 @@ def run_full_pipeline_batch(
             f"\nRunning {len(items)} strategies with up to {max_parallel_strategies} in parallel "
             f"(each capped to {item_cfg.parallel_search_max_workers} GA worker process(es))..."
         )
-        with ProcessPoolExecutor(max_workers=max_parallel_strategies) as pool:
-            futures = {
-                pool.submit(
-                    _batch_item_worker, i, item.label, item.strategy, df, risk, prop_rules,
-                    output_dir, item_cfg, instrument, ollama_settings,
-                    f"full_pipeline_{i:03d}_{safe_names[i]}",
-                ): (i, item.label)
-                for i, item in enumerate(items, start=1)
-            }
-            for future in as_completed(futures):
-                i, label = futures[future]
-                log(f"\n===== [{i}/{len(items)}] Full Pipeline: {label} (finished) =====")
+        try:
+            with ProcessPoolExecutor(max_workers=max_parallel_strategies) as pool:
+                futures = {
+                    pool.submit(
+                        _batch_item_worker, i, item.label, item.strategy, df, risk, prop_rules,
+                        output_dir, item_cfg, instrument, ollama_settings,
+                        f"full_pipeline_{i:03d}_{safe_names[i]}",
+                    ): (i, item.label)
+                    for i, item in enumerate(items, start=1)
+                }
+                for future in as_completed(futures):
+                    i, label = futures[future]
+                    log(f"\n===== [{i}/{len(items)}] Full Pipeline: {label} (finished) =====")
+                    try:
+                        _, _, ok, result, reason = future.result()
+                    except Exception as exc:  # noqa: BLE001 -- worker crash must not stop the batch
+                        ok, result, reason = False, None, str(exc)
+                    _record(i, label, ok, result, reason)
+        except Exception as exc:  # noqa: BLE001 -- e.g. BrokenProcessPool: the whole
+            # pool died (a worker OOM'd, segfaulted, or was killed), which
+            # normally surfaces here rather than from an individual
+            # future.result() call. Whatever didn't finish yet falls back
+            # to running serially in THIS process instead of the entire
+            # rest of the batch silently vanishing with no report and no
+            # recorded reason.
+            log(f"\nParallel batch pool failed ({exc}) -- finishing the remaining strategy(ies) one at a time...")
+            remaining = [
+                (i, item) for i, item in enumerate(items, start=1)
+                if i not in outcomes_by_index
+            ]
+            for i, item in remaining:
+                log(f"\n===== [{i}/{len(items)}] Full Pipeline: {item.label} =====")
+
+                def item_log(msg: str) -> None:
+                    log(f"  {msg}")
+
                 try:
-                    _, _, ok, result, reason = future.result()
-                except Exception as exc:  # noqa: BLE001 -- worker crash must not stop the batch
-                    ok, result, reason = False, None, str(exc)
-                _record(i, label, ok, result, reason)
+                    result = run_full_pipeline(
+                        df, item.strategy, risk, prop_rules, output_dir, item_cfg,
+                        progress_cb=item_log, instrument=instrument, ollama_settings=ollama_settings,
+                        report_basename=f"full_pipeline_{i:03d}_{safe_names[i]}",
+                    )
+                except Exception as item_exc:  # noqa: BLE001
+                    _record(i, item.label, False, None, str(item_exc))
+                    continue
+                _record(i, item.label, True, result, None)
 
     outcomes = [outcomes_by_index[i] for i in sorted(outcomes_by_index)]
     elapsed = time.time() - t0

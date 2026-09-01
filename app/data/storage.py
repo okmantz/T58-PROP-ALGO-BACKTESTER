@@ -7,6 +7,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# Every extension the importer (app.data.importer.SUPPORTED_DATA_EXTENSIONS)
+# can actually read as tabular market data. list_stored_datasets() and the
+# bundled-data seeder below used to hardcode "*.csv" only, which meant a
+# .parquet (or .tsv/.txt) file sitting right there in data/raw was invisible
+# to the desktop app's stored-dataset list AND the web app's dropdown even
+# though selecting/importing it would have worked fine -- kept in sync with
+# the importer's own set rather than duplicated as a separate literal so the
+# two can't drift apart again.
+RAW_DATA_EXTENSIONS = (".csv", ".tsv", ".txt", ".parquet")
+
 
 def get_app_base_dir() -> Path:
     """Return a writable persistent application-data root."""
@@ -37,14 +47,15 @@ def _seed_bundled_raw_data(raw_dir: Path) -> None:
     bundled_raw = Path(bundle_root) / "data" / "raw"
     if not bundled_raw.exists():
         return
-    for source in bundled_raw.rglob("*.csv"):
-        destination = raw_dir / source.relative_to(bundled_raw)
-        if not destination.exists():
-            try:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
-            except OSError:
-                continue
+    for ext in RAW_DATA_EXTENSIONS:
+        for source in bundled_raw.rglob(f"*{ext}"):
+            destination = raw_dir / source.relative_to(bundled_raw)
+            if not destination.exists():
+                try:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+                except OSError:
+                    continue
 
 
 def get_raw_data_dir() -> Path:
@@ -66,9 +77,10 @@ class StoredDataset:
 
 def list_stored_datasets() -> list[StoredDataset]:
     """
-    Return every CSV under data/raw/, newest first -- including CSVs
-    organized into subfolders (e.g. data/raw/EURUSD/EURUSD5.csv), not just
-    ones directly in data/raw/ itself. `name` is the POSIX-style path
+    Return every importable market-data file under data/raw/ (.csv, .tsv,
+    .txt, .parquet -- see RAW_DATA_EXTENSIONS), newest first -- including
+    files organized into subfolders (e.g. data/raw/EURUSD/EURUSD5.csv), not
+    just ones directly in data/raw/ itself. `name` is the POSIX-style path
     relative to data/raw/, which both the desktop app's stored-dataset list
     and the web app's dropdown display as-is and (for the web app) submit
     back as the selection value -- `get_raw_data_dir() / name` resolves a
@@ -76,7 +88,10 @@ def list_stored_datasets() -> list[StoredDataset]:
     separators on every platform including Windows.
     """
     raw_dir = get_raw_data_dir()
-    files = sorted(raw_dir.rglob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files: list[Path] = []
+    for ext in RAW_DATA_EXTENSIONS:
+        files.extend(raw_dir.rglob(f"*{ext}"))
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [
         StoredDataset(name=f.relative_to(raw_dir).as_posix(), path=f, size_bytes=f.stat().st_size)
         for f in files
@@ -89,9 +104,22 @@ EMPTY_DATASET_BYTES = 32
 
 
 def _quick_row_count(path: Path) -> int:
-    """Cheap line count (minus header), without loading the file through
-    pandas -- this runs once per file every time the dashboard loads, so it
-    needs to stay fast even for multi-megabyte CSVs."""
+    """Cheap row count, without loading the file through pandas -- this
+    runs once per file every time the dashboard loads, so it needs to stay
+    fast even for multi-megabyte files.
+
+    .parquet is a binary columnar format, not newline-delimited text --
+    counting b"\\n" bytes in it (the old behavior here) produced a
+    meaningless number instead of a row count. pyarrow can read a
+    .parquet file's row count straight out of its footer metadata without
+    decoding any actual column data, which is just as cheap as the
+    line-count trick for text formats."""
+    if path.suffix.lower() == ".parquet":
+        try:
+            import pyarrow.parquet as pq
+            return pq.ParquetFile(path).metadata.num_rows
+        except Exception:
+            return 0
     try:
         with open(path, "rb") as f:
             count = sum(1 for _ in f)

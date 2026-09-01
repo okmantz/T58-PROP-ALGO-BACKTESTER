@@ -2450,8 +2450,8 @@ def evolution_status():
 # forward/regime/sensitivity/cost-stress engine (see app.ai.research_agent
 # -- no code-editing tool exists, so it can only recommend, never apply).
 # Needs a local Ollama reachable from wherever this server runs -- see the
-# AI Assist note on the Full Pipeline page for what that means if this app
-# is deployed to Cloud Run rather than run locally/on a LAN.
+# AI Assist note on the Full Pipeline page for what that means (point it
+# at whatever machine on your LAN is running Ollama).
 # ---------------------------------------------------------------------------
 
 _AGENT_JOBS: dict[str, dict] = {}

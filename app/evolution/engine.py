@@ -46,20 +46,27 @@ Known scope limits (stated plainly rather than glossed over):
   Python/PineScript/MQL5 files. Manual configs are what Search Lab
   already generates and mutates today, so this is the same scope as the
   system Owen asked to have "combined," not a new restriction.
-- This runs single-process. It will happily run for hours as asked, but
-  each generation is currently slower than it would be with the
-  ProcessPoolExecutor parallelism app.search.batch_runner already uses
-  for its own stage1/2/3 -- porting that same pattern in here is the
-  natural next optimization once this loop's shape is validated in
-  practice, not attempted in this pass.
+- PRE-FILTER and the ROBUSTNESS/OOS/MONTE CARLO/PROP SIMULATION stage
+  (by far the two most expensive, once-per-candidate stages) now run
+  across a ProcessPoolExecutor pool, the same pattern
+  app.search.batch_runner already uses for its own stage1/2/3 and
+  app.orchestration.full_pipeline uses for its multi-strategy batch --
+  see EvolutionConfig.parallel_workers. CPCV/PBO, the stress test, and
+  clustering stay serial (they only run against the small `cpcv_top_n`
+  survivor pool per generation, not the full population, so parallelizing
+  them buys much less for the added complexity).
 """
 from __future__ import annotations
 
+import multiprocessing
+import os
 import random
+import tempfile
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pandas as pd
@@ -79,6 +86,125 @@ from app.strategy.library import StrategyAlreadyExists, save_strategy_text, set_
 from app.validation.cpcv import CPCVError, compute_pbo, run_cpcv
 
 ProgressCallback = "Callable[[str], None]"
+
+
+# ---------------------------------------------------------------------------
+# Worker process state & tasks (module-level so ProcessPoolExecutor can
+# pickle/import them; state is per-process, populated once by
+# _evo_init_worker -- same pattern app.search.batch_runner already uses).
+# ---------------------------------------------------------------------------
+
+_EVO_WORKER: dict = {}
+
+
+def _evo_init_worker(df_pickle_path: str, risk_kwargs: dict, prop_kwargs: dict) -> None:
+    global _EVO_WORKER
+    _EVO_WORKER["df"] = pd.read_pickle(df_pickle_path)
+    _EVO_WORKER["risk"] = RiskConfig(**risk_kwargs)
+    _EVO_WORKER["prop_rules"] = PropRules(**prop_kwargs)
+
+
+def _evo_prefilter_task(
+    cid: str, spec: dict, meta: dict,
+    min_trades: int, min_profit_factor: float, max_drawdown_pct: float, max_drawdown_buffer_mult: float,
+):
+    """One candidate's PRE-FILTER: build + backtest + the cheap pass/fail
+    test, run in a worker process. Mirrors
+    EvolutionRunner._prefilter_one's body exactly -- that instance method
+    is what actually runs this when parallel_workers==1 or the pool is
+    unavailable, so there's exactly one place the filter logic lives;
+    this just re-parametrizes it without `self` so it can cross a
+    process boundary. Returns a plain tuple (never raises) so one bad
+    generated spec can't take down the whole prefilter batch."""
+    df, risk = _EVO_WORKER["df"], _EVO_WORKER["risk"]
+    try:
+        strategy = build_strategy_from_spec(spec)
+        bt = run_backtest(df, strategy, risk)
+    except Exception as exc:  # noqa: BLE001 -- a bad generated config must not kill the pool
+        return (cid, spec, meta, None, ["build_or_backtest_error"], str(exc)[:300], None)
+    if not bt.trades:
+        return (cid, spec, meta, None, ["no_trades"], None, None)
+
+    stats = bt.statistics.to_dict()
+    pf = stats.get("profit_factor", 0.0)
+    pf_val = 10.0 if pf == float("inf") else float(pf or 0.0)
+    n_trades = stats.get("total_trades", 0)
+    max_dd = stats.get("max_drawdown_pct", 0.0) or 0.0
+
+    reasons = []
+    if n_trades < min_trades:
+        reasons.append("min_trades")
+    if pf_val < min_profit_factor:
+        reasons.append("profit_factor")
+    if max_dd > max_drawdown_pct * max_drawdown_buffer_mult:
+        reasons.append("max_drawdown")
+    if stats.get("net_profit", 0.0) <= 0:
+        reasons.append("unprofitable")
+
+    if reasons:
+        return (cid, spec, meta, None, reasons, None, stats)
+    return (cid, spec, meta, bt, [], None, stats)
+
+
+def _evo_full_eval_task(
+    cid: str, spec: dict, meta: dict, bt,
+    mc_sims: int, robustness_perturbation_frac: float, robustness_neighbors: int,
+    robustness_min_stability: float, walk_forward_folds: int, walk_forward_metric: str,
+    min_trades_target_for_fitness: int, random_seed: int,
+):
+    """One PRE-FILTER survivor's ROBUSTNESS / OOS / MONTE CARLO / PROP
+    SIMULATION scoring, run in a worker process. Mirrors
+    EvolutionRunner._full_eval_one's body exactly (same one-source-of-
+    truth reasoning as _evo_prefilter_task above)."""
+    df, risk, prop_rules = _EVO_WORKER["df"], _EVO_WORKER["risk"], _EVO_WORKER["prop_rules"]
+    stats = bt.statistics.to_dict()
+    trade_pnls = [t.pnl for t in bt.trades]
+    trade_dates = [t.entry_time for t in bt.trades]
+
+    mc_cfg = MonteCarloConfig(n_simulations=mc_sims, random_seed=random_seed)
+    mc = run_monte_carlo(bt.trades, prop_rules, mc_cfg)
+    mc_summary = {
+        "evaluation_pass_probability": mc.evaluation_pass_probability,
+        "first_payout_probability": mc.first_payout_probability,
+    }
+    single_run = simulate_account(trade_pnls, trade_dates, prop_rules)
+    summarize_single_run(single_run)  # surfaces prop-sim issues early; summary itself not needed downstream here
+
+    robustness_dict = None
+    try:
+        robustness = parameter_neighborhood_robustness(
+            spec, df, risk, prop_rules, mc_cfg,
+            fitness_metric="composite_prop_score",
+            perturbation_frac=robustness_perturbation_frac,
+            n_neighbors=robustness_neighbors,
+            seed=random_seed,
+            stability_threshold=robustness_min_stability,
+        )
+        if robustness is not None:
+            robustness_dict = {"stability_ratio": robustness.stability_ratio, "is_stable": robustness.is_stable}
+    except Exception:
+        pass
+
+    wf_dict = None
+    try:
+        wf = run_walk_forward(
+            df, lambda spec=spec: build_strategy_from_spec(spec), risk,
+            n_folds=walk_forward_folds, metric=walk_forward_metric,
+        )
+        if wf is not None:
+            wf_dict = {"walk_forward_efficiency": wf.walk_forward_efficiency, "is_stable": wf.is_stable}
+    except Exception:
+        pass
+
+    fitness = compute_prop_fitness(
+        stats, mc_summary, robustness_dict, wf_dict, trade_pnls,
+        min_trades_target=min_trades_target_for_fitness,
+    )
+    return EvolutionCandidateRecord(
+        candidate_id=cid, spec=spec, meta=meta, stats=stats, mc_summary=mc_summary,
+        robustness=robustness_dict, walk_forward=wf_dict, fitness=fitness, trade_pnls=trade_pnls,
+        trades=bt.trades,
+    )
 
 
 @dataclass
@@ -125,6 +251,16 @@ class EvolutionConfig:
     min_trades_target_for_fitness: int = 30
     max_generations: int | None = None          # None = run until stop() is called
     random_seed: int = 42
+
+    # Parallelism for PRE-FILTER and the ROBUSTNESS/OOS/MONTE CARLO/PROP
+    # SIMULATION stage -- the two stages that run once per candidate and
+    # dominate a generation's wall-clock time. None (default) auto-picks
+    # os.cpu_count() (minimum 1); set to 1 to force the old fully serial
+    # behavior (e.g. for debugging, or a machine where spawning worker
+    # processes is undesirable). The pool is created once per run (not
+    # once per generation) and reused across generations to avoid paying
+    # worker-startup cost repeatedly.
+    parallel_workers: int | None = None
 
     save_to_library: bool = True
     library_status: str = "draft"
@@ -246,8 +382,64 @@ class EvolutionRunner:
         self._elites: list[tuple[dict, dict]] = []                    # seeds mutated children next gen
         self._consecutive_empty_generations = 0
         self.resumed = False                                          # set True if a checkpoint was loaded
+        self._pool: ProcessPoolExecutor | None = None
+        self._pool_tmp_dir: tempfile.TemporaryDirectory | None = None
 
         self._load_checkpoint_if_compatible()
+
+    # -- worker pool (PRE-FILTER + full-eval parallelism) ------------------
+    def _ensure_pool(self) -> ProcessPoolExecutor | None:
+        """Lazily creates the ProcessPoolExecutor used by _prefilter and
+        _full_eval, reused across every generation of this run (workers
+        are expensive to start, cheap to keep alive). Returns None (never
+        raises) if parallel_workers resolves to 1 or the pool fails to
+        start for any reason -- both _prefilter and _full_eval fall back
+        to their serial per-candidate loop in that case, so a machine
+        where spawning worker processes doesn't work still runs, just
+        without the speedup."""
+        if self._pool is not None:
+            return self._pool
+        workers = self.cfg.parallel_workers
+        if workers is None:
+            workers = os.cpu_count() or 1
+        if workers <= 1:
+            return None
+        try:
+            self._pool_tmp_dir = tempfile.TemporaryDirectory(prefix="t58_evolution_")
+            df_path = Path(self._pool_tmp_dir.name) / "data.pkl"
+            self.df.to_pickle(df_path)
+            self._pool = ProcessPoolExecutor(
+                max_workers=workers, initializer=_evo_init_worker,
+                initargs=(str(df_path), asdict(self.risk), asdict(self.prop_rules)),
+                # spawn, not the platform default fork: this runner always
+                # lives inside a background thread (see start()), and
+                # forking a multi-threaded process is unsafe/deprecated --
+                # same reasoning as app.search.batch_runner's own pool.
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+            return self._pool
+        except Exception:
+            self._log(
+                "Could not start a worker process pool for this run -- "
+                "continuing single-process (slower, but still fully "
+                "functional)."
+            )
+            self._shutdown_pool()
+            return None
+
+    def _shutdown_pool(self) -> None:
+        if self._pool is not None:
+            try:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._pool = None
+        if self._pool_tmp_dir is not None:
+            try:
+                self._pool_tmp_dir.cleanup()
+            except Exception:
+                pass
+            self._pool_tmp_dir = None
 
     # -- checkpoint / resume ----------------------------------------------
     def _load_checkpoint_if_compatible(self) -> None:
@@ -411,6 +603,7 @@ class EvolutionRunner:
         except Exception:
             self._log("Evolution Lab crashed:\n" + traceback.format_exc())
         finally:
+            self._shutdown_pool()
             self.is_running = False
             self._log("Evolution Lab stopped. Progress is saved -- clicking START again resumes from here.")
 
@@ -483,43 +676,38 @@ class EvolutionRunner:
 
     # -- PRE-FILTER + BACKTEST --------------------------------------------
     def _prefilter(self, population: list[tuple[str, dict, dict]], gen: int):
+        """Runs every candidate in `population` through build+backtest+the
+        cheap pass/fail test. Dispatches across the worker pool (see
+        _ensure_pool) when one is available, falling back to a plain
+        serial loop -- in-process, calling the exact same
+        _evo_prefilter_task function each candidate would run in a
+        worker -- if the pool couldn't be started or parallel_workers==1.
+        Either path produces identical survivors/rejection_counts/
+        tested_rows; only the wall-clock time differs."""
         survivors = []
         rejection_counts = {
             "build_or_backtest_error": 0, "no_trades": 0, "min_trades": 0,
             "profit_factor": 0, "max_drawdown": 0, "unprofitable": 0,
         }
         tested_rows = []
-        for cid, spec, meta in population:
-            if self._stop_flag.is_set():
-                break
-            try:
-                strategy = build_strategy_from_spec(spec)
-                bt = run_backtest(self.df, strategy, self.risk)
-            except Exception as exc:
+
+        def _consume(cid, spec, meta, bt, reasons, error, stats):
+            # Mirrors _evo_prefilter_task's four possible return shapes
+            # exactly (see its docstring/body): a build/backtest error, a
+            # zero-trade candidate, a candidate that ran but failed one or
+            # more cheap filters, or a genuine survivor.
+            if error is not None:
                 rejection_counts["build_or_backtest_error"] += 1
-                tested_rows.append(self._tested_row(cid, meta, gen, passed=False, reasons=["build_or_backtest_error"],
-                                                     error=str(exc)[:300]))
-                continue
-            if not bt.trades:
+                tested_rows.append(self._tested_row(cid, meta, gen, passed=False, reasons=reasons, error=error))
+                return
+            if stats is None:
                 rejection_counts["no_trades"] += 1
-                tested_rows.append(self._tested_row(cid, meta, gen, passed=False, reasons=["no_trades"]))
-                continue
-            stats = bt.statistics.to_dict()
+                tested_rows.append(self._tested_row(cid, meta, gen, passed=False, reasons=reasons))
+                return
+            n_trades = stats.get("total_trades", 0)
             pf = stats.get("profit_factor", 0.0)
             pf_val = 10.0 if pf == float("inf") else float(pf or 0.0)
-            n_trades = stats.get("total_trades", 0)
             max_dd = stats.get("max_drawdown_pct", 0.0) or 0.0
-
-            reasons = []
-            if n_trades < self.cfg.min_trades:
-                reasons.append("min_trades")
-            if pf_val < self.cfg.min_profit_factor:
-                reasons.append("profit_factor")
-            if max_dd > self.prop_rules.max_drawdown_pct * self.cfg.max_drawdown_buffer_mult:
-                reasons.append("max_drawdown")
-            if stats.get("net_profit", 0.0) <= 0:
-                reasons.append("unprofitable")
-
             tested_rows.append(self._tested_row(
                 cid, meta, gen, passed=not reasons, reasons=reasons,
                 n_trades=n_trades, profit_factor=pf_val, net_profit=stats.get("net_profit"),
@@ -530,6 +718,42 @@ class EvolutionRunner:
                     rejection_counts[r] += 1
             else:
                 survivors.append((cid, spec, meta, bt))
+
+        pool = self._ensure_pool()
+        if pool is None:
+            # Serial fallback still calls _evo_prefilter_task (single
+            # source of truth for the filter logic) -- it just runs it
+            # in-process instead of in a worker, so _EVO_WORKER (normally
+            # populated once per worker process by _evo_init_worker) needs
+            # seeding here too.
+            _EVO_WORKER["df"], _EVO_WORKER["risk"] = self.df, self.risk
+            for cid, spec, meta in population:
+                if self._stop_flag.is_set():
+                    break
+                cid_out, spec_out, meta_out, bt, reasons, error, stats = _evo_prefilter_task(
+                    cid, spec, meta, self.cfg.min_trades, self.cfg.min_profit_factor,
+                    self.prop_rules.max_drawdown_pct, self.cfg.max_drawdown_buffer_mult,
+                )
+                _consume(cid_out, spec_out, meta_out, bt, reasons, error, stats)
+        else:
+            futures = {
+                pool.submit(
+                    _evo_prefilter_task, cid, spec, meta, self.cfg.min_trades, self.cfg.min_profit_factor,
+                    self.prop_rules.max_drawdown_pct, self.cfg.max_drawdown_buffer_mult,
+                ): (cid, spec, meta)
+                for cid, spec, meta in population
+            }
+            for future in as_completed(futures):
+                if self._stop_flag.is_set():
+                    break
+                cid, spec, meta = futures[future]
+                try:
+                    _, _, _, bt, reasons, error, stats = future.result()
+                except Exception as exc:  # noqa: BLE001 -- a dead worker must not kill the generation
+                    _consume(cid, spec, meta, None, ["build_or_backtest_error"], str(exc)[:300], None)
+                    continue
+                _consume(cid, spec, meta, bt, reasons, error, stats)
+
         evo_checkpoint.append_tested_rows(tested_rows, Path(self.cfg.tested_log_path))
         return survivors, rejection_counts
 
@@ -583,58 +807,39 @@ class EvolutionRunner:
 
     # -- ROBUSTNESS + OOS + MONTE CARLO + PROP SIMULATION ------------------
     def _full_eval(self, stage1_survivors) -> list[EvolutionCandidateRecord]:
-        records = []
-        for cid, spec, meta, bt in stage1_survivors:
-            if self._stop_flag.is_set():
-                break
-            stats = bt.statistics.to_dict()
-            trade_pnls = [t.pnl for t in bt.trades]
-            trade_dates = [t.entry_time for t in bt.trades]
-
-            mc_cfg = MonteCarloConfig(n_simulations=self.cfg.mc_sims, random_seed=self.cfg.random_seed)
-            mc = run_monte_carlo(bt.trades, self.prop_rules, mc_cfg)
-            mc_summary = {
-                "evaluation_pass_probability": mc.evaluation_pass_probability,
-                "first_payout_probability": mc.first_payout_probability,
+        """Runs every PRE-FILTER survivor through ROBUSTNESS / OOS / MONTE
+        CARLO / PROP SIMULATION scoring. Same dispatch-to-pool-or-fall-
+        back-serial shape as _prefilter (see its docstring) -- both paths
+        call _evo_full_eval_task, so there's one place this logic lives."""
+        args = (
+            self.cfg.mc_sims, self.cfg.robustness_perturbation_frac, self.cfg.robustness_neighbors,
+            self.cfg.robustness_min_stability, self.cfg.walk_forward_folds, self.cfg.walk_forward_metric,
+            self.cfg.min_trades_target_for_fitness, self.cfg.random_seed,
+        )
+        records: list[EvolutionCandidateRecord] = []
+        eval_pool = self._ensure_pool()
+        if eval_pool is None:
+            _EVO_WORKER["df"], _EVO_WORKER["risk"], _EVO_WORKER["prop_rules"] = self.df, self.risk, self.prop_rules
+            for cid, spec, meta, bt in stage1_survivors:
+                if self._stop_flag.is_set():
+                    break
+                try:
+                    records.append(_evo_full_eval_task(cid, spec, meta, bt, *args))
+                except Exception:
+                    self._log(f"  full-eval error on {cid}:\n" + traceback.format_exc())
+        else:
+            futures = {
+                eval_pool.submit(_evo_full_eval_task, cid, spec, meta, bt, *args): cid
+                for cid, spec, meta, bt in stage1_survivors
             }
-            single_run = simulate_account(trade_pnls, trade_dates, self.prop_rules)
-            summarize_single_run(single_run)  # surfaces prop-sim issues early; summary itself not needed downstream here
-
-            robustness_dict = None
-            try:
-                robustness = parameter_neighborhood_robustness(
-                    spec, self.df, self.risk, self.prop_rules, mc_cfg,
-                    fitness_metric="composite_prop_score",
-                    perturbation_frac=self.cfg.robustness_perturbation_frac,
-                    n_neighbors=self.cfg.robustness_neighbors,
-                    seed=self.cfg.random_seed,
-                    stability_threshold=self.cfg.robustness_min_stability,
-                )
-                if robustness is not None:
-                    robustness_dict = {"stability_ratio": robustness.stability_ratio, "is_stable": robustness.is_stable}
-            except Exception:
-                pass
-
-            wf_dict = None
-            try:
-                wf = run_walk_forward(
-                    self.df, lambda spec=spec: build_strategy_from_spec(spec), self.risk,
-                    n_folds=self.cfg.walk_forward_folds, metric=self.cfg.walk_forward_metric,
-                )
-                if wf is not None:
-                    wf_dict = {"walk_forward_efficiency": wf.walk_forward_efficiency, "is_stable": wf.is_stable}
-            except Exception:
-                pass
-
-            fitness = compute_prop_fitness(
-                stats, mc_summary, robustness_dict, wf_dict, trade_pnls,
-                min_trades_target=self.cfg.min_trades_target_for_fitness,
-            )
-            records.append(EvolutionCandidateRecord(
-                candidate_id=cid, spec=spec, meta=meta, stats=stats, mc_summary=mc_summary,
-                robustness=robustness_dict, walk_forward=wf_dict, fitness=fitness, trade_pnls=trade_pnls,
-                trades=bt.trades,
-            ))
+            for future in as_completed(futures):
+                if self._stop_flag.is_set():
+                    break
+                cid = futures[future]
+                try:
+                    records.append(future.result())
+                except Exception:  # noqa: BLE001 -- a dead worker must not kill the generation
+                    self._log(f"  full-eval error on {cid}:\n" + traceback.format_exc())
         return records
 
     # -- CPCV / PBO ---------------------------------------------------------

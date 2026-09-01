@@ -189,3 +189,109 @@
   </div>
 
   <button class="submit-btn" type="submit">Run Walk-Forward Optimization</button>
+</form>
+
+</div>
+</div>
+
+<script>
+  const tabs = document.querySelectorAll('#strategy-tabs button');
+  const modeInput = document.getElementById('strategy_mode');
+  const manualFields = document.getElementById('manual-fields');
+  const codeFields = document.getElementById('code-fields');
+  const SAVED_STRATEGIES = {{ saved_strategies_json | safe }};
+
+  function filteredLibraryItems(mode) {
+    const query = (document.getElementById('strategy_search_input').value || '').toLowerCase().trim();
+    const market = document.getElementById('strategy_filter_market').value;
+    const tag = document.getElementById('strategy_filter_tag').value;
+    const status = document.getElementById('strategy_filter_status').value;
+    const all = SAVED_STRATEGIES[mode] || [];
+    return all.filter(s => {
+      if (query && !(s.name + ' ' + s.description + ' ' + s.market + ' ' + (s.tags || []).join(' ')).toLowerCase().includes(query)) return false;
+      if (market && s.market !== market) return false;
+      if (tag && !(s.tags || []).map(t => t.toLowerCase()).includes(tag.toLowerCase())) return false;
+      if (status && s.status !== status) return false;
+      return true;
+    });
+  }
+
+  function populateFilterOptions(mode) {
+    const all = SAVED_STRATEGIES[mode] || [];
+    const markets = [...new Set(all.map(s => s.market).filter(Boolean))].sort();
+    const tags = [...new Set(all.flatMap(s => s.tags || []))].sort((a, b) => a.localeCompare(b));
+    const marketSelect = document.getElementById('strategy_filter_market');
+    const keepMarket = marketSelect.value;
+    marketSelect.innerHTML = '<option value="">All markets</option>' + markets.map(m => `<option value="${m}">${m}</option>`).join('');
+    if (markets.includes(keepMarket)) marketSelect.value = keepMarket;
+    const tagSelect = document.getElementById('strategy_filter_tag');
+    const keepTag = tagSelect.value;
+    tagSelect.innerHTML = '<option value="">All tags</option>' + tags.map(t => `<option value="${t}">${t}</option>`).join('');
+    if (tags.includes(keepTag)) tagSelect.value = keepTag;
+  }
+
+  function populateLibrarySelect(mode) {
+    populateFilterOptions(mode);
+    const select = document.getElementById('existing_strategy_select');
+    const note = document.getElementById('library-count-note');
+    const all = SAVED_STRATEGIES[mode] || [];
+    const items = filteredLibraryItems(mode);
+    select.innerHTML = '<option value="">— none, paste or upload below —</option>';
+    items.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.name;
+      const label = s.description ? `${s.name} — ${s.description}` : s.name;
+      opt.textContent = `[${s.status}] ${label}`;
+      select.appendChild(opt);
+    });
+    if (!all.length) {
+      note.textContent = `No saved ${mode} strategies yet — upload or paste one below.`;
+    } else if (!items.length) {
+      note.textContent = `No saved ${mode} strategies match the current search/filters.`;
+    } else {
+      note.textContent = items.length === all.length
+        ? `${all.length} saved ${mode} strategy(ies) in the library.`
+        : `${items.length} of ${all.length} saved ${mode} strategy(ies) shown.`;
+    }
+  }
+
+  function onLibraryFiltersChanged() { populateLibrarySelect(modeInput.value); }
+
+  function loadFromLibrary() {
+    const mode = modeInput.value;
+    const name = document.getElementById('existing_strategy_select').value;
+    if (!name) return;
+    fetch(`/strategies/${encodeURIComponent(mode)}/${encodeURIComponent(name)}`)
+      .then(r => r.ok ? r.text() : Promise.reject())
+      .then(text => { document.getElementById('strategy_code').value = text; })
+      .catch(() => alert('Could not load that saved strategy.'));
+  }
+
+  document.getElementById('strategy_file_input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { document.getElementById('strategy_code').value = reader.result; };
+    reader.readAsText(file);
+  });
+
+  tabs.forEach(btn => btn.addEventListener('click', () => {
+    tabs.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    modeInput.value = btn.dataset.mode;
+    if (btn.dataset.mode === 'manual') {
+      manualFields.style.display = 'block';
+      codeFields.style.display = 'none';
+    } else {
+      manualFields.style.display = 'none';
+      codeFields.style.display = 'block';
+      populateLibrarySelect(btn.dataset.mode);
+    }
+  }));
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

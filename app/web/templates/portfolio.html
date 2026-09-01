@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Multi-Asset Portfolio</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: var(--text); font-size: 15px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15);
+  }
+  textarea { min-height: 140px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tabs button {
+    flex: 1; min-width: 70px; padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: #ccc; font-size: 13px;
+  }
+  .tabs button.active { background: var(--teal); color: #04120e; font-weight: 600; border-color: var(--teal); }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+    box-shadow: 0 0 22px rgba(53,224,176,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .notice { background: #142a1a; border: 1px solid #235a32; color: #b4ffcb; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .leg-block { border: 1px solid var(--border-light); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+  .leg-block h3 { font-size: 12px; text-transform: uppercase; color: #999; margin: 0 0 8px; }
+  .headline { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 10px; }
+  .stat { background: var(--panel-3); border: 1px solid var(--border-light); border-radius: 10px; padding: 10px; }
+  .stat .label { font-size: 10px; color: #888; text-transform: uppercase; }
+  .stat .value { font-size: 16px; font-weight: 700; margin-top: 2px; }
+  .links a { display: block; color: #9ecbff; font-size: 13px; margin-top: 6px; text-decoration: none; }
+</style>
+</head>
+<body>
+{% set active_page = active_page|default('portfolio') %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Multi-asset portfolio</h1>
+  <p>The SAME strategy and risk settings applied to several DIFFERENT instruments at once, correlation-aware re-weighted and chained into one combined equity curve. Several imperfectly-correlated return streams smooth the combined curve in a way re-tuning a single strategy's parameters can't.</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+{% if result %}
+<div class="card">
+  <h2>Result</h2>
+  <p class="help">Legs: {{ result.legs | join(', ') }}</p>
+  <div class="headline">
+    <div class="stat"><div class="label">Combined trades</div><div class="value">{{ result.trades }}</div></div>
+    <div class="stat"><div class="label">Combined net profit</div><div class="value">${{ '%.0f' % result.net_profit }}</div></div>
+    <div class="stat"><div class="label">Combined max drawdown</div><div class="value">{{ '%.1f' % result.max_dd }}%</div></div>
+    <div class="stat"><div class="label">Combined Sharpe</div><div class="value">{{ '%.2f' % result.sharpe }}</div></div>
+  </div>
+  <p class="help" style="margin-top:10px;">Diversification ratio: {{ '%.2f' % result.diversification_ratio if result.diversification_ratio else 'n/a' }} (weighted-avg individual volatility / portfolio volatility; above 1 means diversification helped).</p>
+  {% for w in result.warnings %}<div class="notice">{{ w }}</div>{% endfor %}
+  <div class="links">
+    <a href="{{ result.report_html }}" target="_blank">Open full portfolio report &rarr;</a>
+  </div>
+</div>
+{% endif %}
+
+<form method="post" action="/portfolio/run" enctype="multipart/form-data">
+
+  <div class="card">
+    <h2>1. Strategy (applied to every leg)</h2>
+    <div class="tabs" id="strategy-tabs">
+      <button type="button" data-mode="manual" class="active">Manual</button>
+      <button type="button" data-mode="python">Python</button>
+      <button type="button" data-mode="pinescript">PineScript</button>
+      <button type="button" data-mode="mql5">MQL5</button>
+    </div>
+    <input type="hidden" name="strategy_mode" id="strategy_mode" value="manual">
+
+    <div id="manual-fields">
+      <div class="row">
+        <div><label>SMA fast</label><input type="number" name="sma_fast" value="20"></div>
+        <div><label>SMA slow</label><input type="number" name="sma_slow" value="50"></div>
+      </div>
+      <div class="row">
+        <div><label>Stop loss (pips)</label><input type="number" name="sl_pips" value="20"></div>
+        <div><label>Take profit (pips)</label><input type="number" name="tp_pips" value="40"></div>
+      </div>
+    </div>
+
+    <div id="code-fields" style="display:none;">
+      <label>Load a saved strategy from the library</label>
+      <select id="existing_strategy_select" onchange="loadFromLibrary()">
+        <option value="">— none, paste or upload below —</option>
+      </select>
+      <label style="margin-top:14px;">Or upload a strategy file</label>
+      <input type="file" id="strategy_file_input" name="strategy_file" accept=".py,.pine,.mq5">
+      <label>Or paste strategy source</label>
+      <textarea name="strategy_code" id="strategy_code" placeholder="Paste your Python / PineScript / MQL5 strategy here"></textarea>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. Shared risk settings</h2>
+    <div class="row">
+      <div><label>Initial account balance</label><input type="number" name="initial_balance" value="100000"></div>
+      <div><label>Risk value</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
+    </div>
+    <div class="row">
+      <div><label>Risk mode</label>
+        <select name="risk_mode"><option value="percent">% of balance</option><option value="fixed">Fixed lot</option></select>
+      </div>
+      <div><label>Pip size</label><input type="number" step="0.0001" name="pip_size" value="0.0001"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Instrument legs (at least 2 required, up to 4)</h2>
+    <p class="help">Each leg is a separate instrument's market data. Nominal weight sets each leg's relative share of the risk budget BEFORE correlation adjustment.</p>
+    {% for i in range(1, 5) %}
+    <div class="leg-block">
+      <h3>Leg {{ i }}{% if i > 2 %} (optional){% endif %}</h3>
+      {% if stored_datasets %}
+      <label>Use a previously stored dataset</label>
+      <select name="leg{{ i }}_existing_dataset">
+        <option value="">— none —</option>
+        {% for ds in stored_datasets %}
+        <option value="{{ ds.name }}">{{ ds.name }}</option>
+        {% endfor %}
+      </select>
+      {% endif %}
+      <label>Or upload a CSV for this instrument</label>
+      <input type="file" name="leg{{ i }}_csv" accept=".csv">
+      <label>Nominal weight</label>
+      <input type="number" step="0.1" name="leg{{ i }}_weight" value="1.0">
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>Advanced re-weighting settings</summary>
+      <label>Correlation penalty strength (0 = ignore, 1 = full inverse-correlation re-weighting)</label>
+      <input type="number" step="0.05" name="correlation_penalty_strength" value="0.6">
+      <div class="row">
+        <div><label>Max weight fraction (any one leg's cap)</label><input type="number" step="0.05" name="max_instrument_weight_frac" value="0.5"></div>
+        <div><label>Min weight fraction (floor vs. own nominal)</label><input type="number" step="0.05" name="min_weight_frac" value="0.15"></div>
+      </div>
+    </details>
+  </div>
+
+  <button class="submit-btn" type="submit">Run Portfolio Backtest</button>
+</form>
+
+</div>
+</div>
+
+<script>
+  const tabs = document.querySelectorAll('#strategy-tabs button');
+  const modeInput = document.getElementById('strategy_mode');
+  const manualFields = document.getElementById('manual-fields');
+  const codeFields = document.getElementById('code-fields');
+  const SAVED_STRATEGIES = {{ saved_strategies_json | safe }};
+
+  function populateLibrarySelect(mode) {
+    const select = document.getElementById('existing_strategy_select');
+    const all = SAVED_STRATEGIES[mode] || [];
+    select.innerHTML = '<option value="">— none, paste or upload below —</option>';
+    all.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.name;
+      opt.textContent = s.description ? `${s.name} — ${s.description}` : s.name;
+      select.appendChild(opt);
+    });
+  }
+
+  function loadFromLibrary() {
+    const mode = modeInput.value;
+    const name = document.getElementById('existing_strategy_select').value;
+    if (!name) return;
+    fetch(`/strategies/${encodeURIComponent(mode)}/${encodeURIComponent(name)}`)
+      .then(r => r.ok ? r.text() : Promise.reject())
+      .then(text => { document.getElementById('strategy_code').value = text; })
+      .catch(() => alert('Could not load that saved strategy.'));
+  }
+
+  document.getElementById('strategy_file_input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { document.getElementById('strategy_code').value = reader.result; };
+    reader.readAsText(file);
+  });
+
+  tabs.forEach(btn => btn.addEventListener('click', () => {
+    tabs.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    modeInput.value = btn.dataset.mode;
+    if (btn.dataset.mode === 'manual') {
+      manualFields.style.display = 'block';
+      codeFields.style.display = 'none';
+    } else {
+      manualFields.style.display = 'none';
+      codeFields.style.display = 'block';
+      populateLibrarySelect(btn.dataset.mode);
+    }
+  }));
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

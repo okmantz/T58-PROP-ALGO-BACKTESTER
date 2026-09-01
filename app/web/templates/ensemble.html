@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Multi-Strategy Ensemble</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: var(--text); font-size: 15px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15);
+  }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+    box-shadow: 0 0 22px rgba(53,224,176,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .notice { background: #142a1a; border: 1px solid #235a32; color: #b4ffcb; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .leg-block { border: 1px solid var(--border-light); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+  .leg-block h3 { font-size: 12px; text-transform: uppercase; color: #999; margin: 0 0 8px; }
+  .headline { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 10px; }
+  .stat { background: var(--panel-3); border: 1px solid var(--border-light); border-radius: 10px; padding: 10px; }
+  .stat .label { font-size: 10px; color: #888; text-transform: uppercase; }
+  .stat .value { font-size: 16px; font-weight: 700; margin-top: 2px; }
+  .links a { display: block; color: #9ecbff; font-size: 13px; margin-top: 6px; text-decoration: none; }
+</style>
+</head>
+<body>
+{% set active_page = active_page|default('ensemble') %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Multi-strategy ensemble</h1>
+  <p>The mirror case of Multi-Asset Portfolio: several DIFFERENT strategies combined on the SAME instrument, instead of one strategy across several instruments. <b>Blend</b> keeps every strategy trading independently at a correlation-adjusted share of the account's risk budget. <b>Vote</b> combines every strategy's signal into one entry, taken only once enough of them agree on direction (risk management inherited from the first leg).</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+{% if result %}
+<div class="card">
+  <h2>Result ({{ result.mode }} mode)</h2>
+  <p class="help">Legs: {{ result.legs | join(', ') }}</p>
+  <div class="headline">
+    <div class="stat"><div class="label">Trades</div><div class="value">{{ result.trades }}</div></div>
+    <div class="stat"><div class="label">Net profit</div><div class="value">${{ '%.0f' % result.net_profit }}</div></div>
+    <div class="stat"><div class="label">Max drawdown</div><div class="value">{{ '%.1f' % result.max_dd }}%</div></div>
+    {% if result.mode == 'blend' %}
+    <div class="stat"><div class="label">Sharpe</div><div class="value">{{ '%.2f' % result.sharpe }}</div></div>
+    {% else %}
+    <div class="stat"><div class="label">Eval pass probability</div><div class="value">{{ '%.1f' % result.eval_pass_probability }}%</div></div>
+    {% endif %}
+  </div>
+  {% if result.mode == 'blend' %}
+  <p class="help" style="margin-top:10px;">Diversification ratio: {{ '%.2f' % result.diversification_ratio if result.diversification_ratio else 'n/a' }}.</p>
+  {% for w in result.warnings %}<div class="notice">{{ w }}</div>{% endfor %}
+  {% endif %}
+  <div class="links">
+    <a href="{{ result.report_html }}" target="_blank">Open full report &rarr;</a>
+  </div>
+</div>
+{% endif %}
+
+<form method="post" action="/ensemble/run" enctype="multipart/form-data">
+
+  <div class="card">
+    <h2>1. Market Data (shared by every leg)</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none, I'm uploading a new file below —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }} ({{ (ds.size_bytes / 1024) | round(1) }} KB)</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+    <label>Or upload a new CSV</label>
+    <input type="file" name="csv_file" accept=".csv">
+  </div>
+
+  <div class="card">
+    <h2>2. Strategy legs (at least 2 required, up to 4)</h2>
+    <p class="help">Python (.py), PineScript (.pine), or MQL5 (.mq5) files -- mixing types in the same ensemble is fine, each is detected by extension. Manual Strategy Builder configs aren't supported as ensemble legs (no file to identify a type from) -- use saved library files instead.</p>
+    {% for i in range(1, 5) %}
+    <div class="leg-block">
+      <h3>Leg {{ i }}{% if i > 2 %} (optional){% endif %}</h3>
+      <input type="file" name="leg{{ i }}_file" accept=".py,.pine,.mq5">
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>3. Ensemble settings</h2>
+    <label>Combination mode</label>
+    <select name="ensemble_mode" id="ensemble_mode">
+      <option value="blend">Blend (each strategy trades independently, correlation-adjusted risk)</option>
+      <option value="vote">Vote (one combined signal, entered only once enough strategies agree)</option>
+    </select>
+    <div class="row">
+      <div><label>Shared initial account balance</label><input type="number" name="initial_balance" value="100000"></div>
+      <div id="min-agreement-field" style="display:none;"><label>Min agreement (Vote mode only)</label><input type="number" name="min_agreement" value="2"></div>
+    </div>
+    <div id="corr-strength-field">
+      <label>Correlation penalty strength (Blend mode, 0=ignore, 1=full re-weighting)</label>
+      <input type="number" step="0.05" name="correlation_penalty_strength" value="0.6">
+    </div>
+    <div id="mc-sims-field" style="display:none;">
+      <label>Monte Carlo simulations (Vote mode only)</label>
+      <input type="number" name="n_sims" value="2000">
+    </div>
+  </div>
+
+  <button class="submit-btn" type="submit">Run Ensemble Backtest</button>
+</form>
+
+</div>
+</div>
+
+<script>
+  const modeSelect = document.getElementById('ensemble_mode');
+  const minAgreementField = document.getElementById('min-agreement-field');
+  const corrStrengthField = document.getElementById('corr-strength-field');
+  const mcSimsField = document.getElementById('mc-sims-field');
+  function updateModeFields() {
+    const isVote = modeSelect.value === 'vote';
+    minAgreementField.style.display = isVote ? 'block' : 'none';
+    corrStrengthField.style.display = isVote ? 'none' : 'block';
+    mcSimsField.style.display = isVote ? 'block' : 'none';
+  }
+  modeSelect.addEventListener('change', updateModeFields);
+  updateModeFields();
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

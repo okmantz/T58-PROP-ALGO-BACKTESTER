@@ -8,7 +8,8 @@ stubbing all of them thinly at once.
 ## Done
 
 - [x] **Round 1 infra**: Cloud Run + Firebase Hosting deploy pipeline
-      (`Dockerfile`, `firebase.json`, `.firebaserc`, GitHub Actions workflow).
+      (`docker/Dockerfile`, `firebase/firebase.json`, `firebase/.firebaserc`,
+      GitHub Actions workflow).
       See `FIREBASE_DEPLOY.md`.
 - [x] **Round 1 feature**: Step 06 Iterative Refinement (`/refine`,
       `/refine/start`, `/refine/job/<id>`) -- same background-job/poll

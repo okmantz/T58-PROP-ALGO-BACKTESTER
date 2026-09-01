@@ -44,7 +44,7 @@ def unavailable_reason() -> str:
         return (
             "The MetaTrader5 package isn't installed, or this isn't running on Windows. "
             "Forward Test requires: Windows, a running MT5 terminal, and `pip install "
-            "MetaTrader5` (already in requirements.txt on Windows)."
+            "MetaTrader5` (already in config/requirements.txt on Windows)."
         )
     return f"MetaTrader5 package failed to load: {_MT5_IMPORT_ERROR}"
 

@@ -1,0 +1,85 @@
+//@version=5
+strategy("T58 EMA Ribbon RSI Reversal")
+
+// New strategy (2026-08-31), deliberately a different entry SHAPE from
+// the three existing PineScript files in this folder:
+//   - trend_pullback.pine: 2-EMA pullback with a static RSI band
+//     (price simply has to be inside a range).
+//   - ema_momentum_breakout.pine / rsi_mean_reversion.pine: their own
+//     separate mechanisms.
+//   - This one uses a slower mid/slow EMA pair as the regime filter --
+//     deliberately not the fast EMA, since a fast EMA reacts to the
+//     same short-term pullback that pushes RSI toward oversold/
+//     overbought, which would flip a fast-EMA-based regime off at
+//     exactly the moment the entry trigger fires -- combined with an
+//     RSI THRESHOLD-CROSS EVENT (crossing up through oversold / down
+//     through overbought) as the entry trigger, rather than a static
+//     "RSI is currently inside a band" condition. A crossover is a
+//     specific moment (the reversal just happened), which fires far
+//     less often but with a cleaner signal than "RSI happens to
+//     currently be in this range." The fast EMA still earns its place,
+//     just in the exit instead of the entry gate: losing the fast EMA
+//     against the position means the pullback that was bought/sold
+//     failed to reclaim.
+//
+// Same T58 PineScript parser subset restriction as every other
+// strategy here: only ta.sma/ema/wma/rsi, ta.crossover/crossunder,
+// input.int/float constants, and strategy.entry/close. No custom
+// functions, no ta.atr/highest/lowest, no security() (see
+// app/strategy/pinescript.py for the exact supported list).
+//
+// SL/TP sizing: gold-scale (pip_size ~0.01), NOT the FX default of
+// 0.0001 -- click "detect pip size from data" on the Data tab before
+// running this. The other pinescript/mql5 files in this repo originally
+// used FX-style 15-40 "pip" stops, which are $0.20-0.40 at gold scale --
+// nowhere near gold's per-bar ATR -- and stopped out almost instantly
+// (1-2 trades, catastrophic loss) the one time they were actually run
+// against real gold data. The 650/1300 values below are a starting
+// point at gold scale, not a validated setting.
+//
+// NOT YET VALIDATED: run through Full Pipeline before trusting any
+// constant below -- these are GA starting points.
+
+fastLen = input.int(9, "Fast EMA")
+midLen = input.int(21, "Mid EMA")
+slowLen = input.int(55, "Slow EMA")
+rsiLen = input.int(14, "RSI Length")
+rsiOversold = input.float(35.0, "RSI Oversold Level")
+rsiOverbought = input.float(65.0, "RSI Overbought Level")
+
+fastEMA = ta.ema(close, fastLen)
+midEMA = ta.ema(close, midLen)
+slowEMA = ta.ema(close, slowLen)
+rsiVal = ta.rsi(close, rsiLen)
+
+// Trend regime uses only the mid/slow pair -- deliberately NOT the fast
+// EMA, since the fast EMA reacts to the same short-term pullback that
+// pushes RSI toward oversold/overbought, which would flip the regime
+// off at exactly the moment the entry trigger fires. Mid/slow stays
+// stable through that pullback, so the regime filter and the entry
+// trigger measure genuinely different things instead of fighting each
+// other.
+uptrend = midEMA > slowEMA
+downtrend = midEMA < slowEMA
+
+rsiReclaimLong = ta.crossover(rsiVal, rsiOversold)
+rsiReclaimShort = ta.crossunder(rsiVal, rsiOverbought)
+
+longCondition = uptrend and rsiReclaimLong and close > open
+shortCondition = downtrend and rsiReclaimShort and close < open
+
+// The fast EMA earns its place in the exit instead: once price loses
+// the fast EMA against the position, the pullback that was bought/sold
+// has failed to reclaim, which is a cleaner invalidation than waiting
+// for the slower mid/slow trend filter itself to flip.
+exitLongCondition = ta.crossunder(fastEMA, midEMA)
+exitShortCondition = ta.crossover(fastEMA, midEMA)
+
+strategy.entry("Long", strategy.long, when=longCondition)
+strategy.entry("Short", strategy.short, when=shortCondition)
+
+strategy.close("Long", when=exitLongCondition)
+strategy.close("Short", when=exitShortCondition)
+
+// T58_SL_PIPS=650
+// T58_TP_PIPS=1300

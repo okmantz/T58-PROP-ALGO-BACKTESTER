@@ -87,6 +87,8 @@ def test_evolution_runner_one_generation_smoke(tmp_path):
         mc_sims=50, robustness_neighbors=1, walk_forward_folds=2,
         cpcv_top_n=2, cpcv_max_paths=3, cpcv_n_groups=3,
         save_to_library=False, knowledge_graph_path=str(tmp_path / "kg.jsonl"),
+        checkpoint_path=str(tmp_path / "checkpoint.json"),
+        tested_log_path=str(tmp_path / "tested_candidates.jsonl"),
     )
     runner = EvolutionRunner(df, RiskConfig(), PropRules(), cfg, progress_cb=None)
     runner._run_loop()  # calling the loop body directly (no thread) keeps this test deterministic and fast
@@ -95,8 +97,75 @@ def test_evolution_runner_one_generation_smoke(tmp_path):
     # incrementing past the cap.
     assert runner.generation == 0
     assert not runner.is_running
+    assert not runner.resumed
     # Not every synthetic run is guaranteed survivors -- the real assertion
     # is that the whole funnel ran without raising, and produced a journal
     # entry either way.
     assert len(runner.journal) == 1
     assert (tmp_path / "kg.jsonl").exists() or len(runner.leaderboard) == 0
+    # A checkpoint should always be written after a completed generation
+    # (whether or not anything survived far enough to reach the
+    # leaderboard), and the tested-candidates log should have at least
+    # one row per population member from PRE-FILTER.
+    assert (tmp_path / "checkpoint.json").exists()
+    tested_rows = runner.tested_candidates()
+    assert len(tested_rows) >= 10
+
+
+def test_evolution_runner_resumes_from_checkpoint(tmp_path):
+    """STOP then START again should continue from the saved generation/
+    elites/leaderboard/journal instead of starting a fresh run -- this is
+    the fix for the reported "generation 11, leaderboard size 0" bug,
+    where every restart silently discarded all prior progress."""
+    df = _trending_df()
+    checkpoint_path = str(tmp_path / "checkpoint.json")
+    tested_log_path = str(tmp_path / "tested_candidates.jsonl")
+    kg_path = str(tmp_path / "kg.jsonl")
+    base_kwargs = dict(
+        population_size=10, elite_keep=2, min_trades=3, min_profit_factor=0.0,
+        max_drawdown_buffer_mult=20.0, mc_sims=30, robustness_neighbors=1,
+        walk_forward_folds=2, cpcv_top_n=2, cpcv_max_paths=3, cpcv_n_groups=3,
+        save_to_library=False, knowledge_graph_path=kg_path,
+        checkpoint_path=checkpoint_path, tested_log_path=tested_log_path,
+        random_seed=7,
+    )
+
+    cfg1 = EvolutionConfig(max_generations=1, **base_kwargs)
+    runner1 = EvolutionRunner(df, RiskConfig(), PropRules(), cfg1, progress_cb=None)
+    assert not runner1.resumed
+    runner1._run_loop()
+    journal_len_after_run1 = len(runner1.journal)
+
+    cfg2 = EvolutionConfig(max_generations=2, **base_kwargs)
+    runner2 = EvolutionRunner(df, RiskConfig(), PropRules(), cfg2, progress_cb=None)
+    assert runner2.resumed
+    assert runner2.generation == 1  # picks up right after generation 0
+    assert len(runner2.journal) == journal_len_after_run1
+    runner2._run_loop()
+    assert runner2.generation == 1  # ran exactly one more generation (index 1) before hitting max_generations=2
+    assert len(runner2.journal) == journal_len_after_run1 + 1
+
+
+def test_evolution_runner_refuses_to_resume_against_different_data(tmp_path):
+    """Resuming a checkpoint built from one dataset against a DIFFERENTLY
+    SHAPED dataset must start fresh rather than silently mixing
+    incompatible runs."""
+    checkpoint_path = str(tmp_path / "checkpoint.json")
+    cfg1 = EvolutionConfig(
+        population_size=5, elite_keep=2, max_generations=1, min_trades=3,
+        min_profit_factor=0.0, mc_sims=20, cpcv_top_n=2, cpcv_max_paths=2,
+        save_to_library=False, knowledge_graph_path=str(tmp_path / "kg.jsonl"),
+        checkpoint_path=checkpoint_path, tested_log_path=str(tmp_path / "tested.jsonl"),
+    )
+    runner1 = EvolutionRunner(_trending_df(n=4000, seed=1), RiskConfig(), PropRules(), cfg1, progress_cb=None)
+    runner1._run_loop()
+
+    different_df = _trending_df(n=500, seed=99)
+    cfg2 = EvolutionConfig(
+        population_size=5, elite_keep=2, max_generations=1,
+        knowledge_graph_path=str(tmp_path / "kg.jsonl"),
+        checkpoint_path=checkpoint_path, tested_log_path=str(tmp_path / "tested.jsonl"),
+    )
+    runner2 = EvolutionRunner(different_df, RiskConfig(), PropRules(), cfg2, progress_cb=None)
+    assert not runner2.resumed
+    assert runner2.generation == 0

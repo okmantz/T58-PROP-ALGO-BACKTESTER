@@ -702,6 +702,28 @@ def _finish(
 
     log(f"\nFull Pipeline complete in {elapsed:.1f}s. Verdict: {verdict}.")
 
+    try:
+        from app.ai.experiment_memory import record_experiment
+
+        record_experiment(
+            origin="full_pipeline",
+            strategy_name=final_strategy_name,
+            source_type=final_source_type,
+            instrument=instrument,
+            verdict=verdict,
+            trades=len(final_bt.trades),
+            net_profit=final_bt.statistics.net_profit,
+            win_rate=final_bt.statistics.win_rate,
+            profit_factor=final_bt.statistics.profit_factor,
+            max_drawdown_pct=final_bt.statistics.max_drawdown_pct,
+            eval_pass_probability=final_mc.evaluation_pass_probability,
+            first_payout_probability=final_mc.first_payout_probability,
+            risk_of_ruin_pct=final_mc.risk_of_ruin_pct,
+            lesson="; ".join(verdict_reasons) if verdict_reasons else "",
+        )
+    except Exception:
+        pass  # T58 Research Memory is a bonus record -- never let it affect a completed Full Pipeline run
+
     return FullPipelineResult(
         strategy_source_type=strategy.source_type,
         strategy_display_name=display_name,

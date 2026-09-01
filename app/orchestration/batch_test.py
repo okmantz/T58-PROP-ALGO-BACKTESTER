@@ -153,6 +153,27 @@ def run_batch_test(
             except Exception:  # noqa: BLE001 -- recording to the library is a convenience, not core output
                 pass
 
+        try:
+            from app.ai.experiment_memory import record_experiment
+
+            record_experiment(
+                origin="batch_test",
+                strategy_name=item.label,
+                source_type=item.strategy.source_type,
+                instrument=instrument,
+                verdict="TESTED",
+                trades=len(bt_result.trades),
+                net_profit=bt_result.statistics.net_profit,
+                win_rate=bt_result.statistics.win_rate,
+                profit_factor=bt_result.statistics.profit_factor,
+                max_drawdown_pct=bt_result.statistics.max_drawdown_pct,
+                eval_pass_probability=mc_result.evaluation_pass_probability,
+                first_payout_probability=mc_result.first_payout_probability,
+                risk_of_ruin_pct=mc_result.risk_of_ruin_pct,
+            )
+        except Exception:  # noqa: BLE001 -- T58 Research Memory is a bonus record, not core output
+            pass
+
         log(
             f"  Trades: {len(bt_result.trades)}  Net profit: ${bt_result.statistics.net_profit:,.2f}  "
             f"Eval pass probability: {mc_result.evaluation_pass_probability:.1f}%  Report: {paths['html'].name}"

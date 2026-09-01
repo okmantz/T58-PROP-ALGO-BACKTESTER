@@ -254,6 +254,27 @@ def run_quick_optimize(
     elapsed = time.time() - t0
     log(f"Quick Optimize complete in {elapsed:.1f}s.")
 
+    try:
+        from app.ai.experiment_memory import record_experiment
+
+        record_experiment(
+            origin="quick_optimize",
+            strategy_name=f"{display_name} (Quick Optimize)",
+            source_type=final_source_type,
+            verdict="IMPROVED" if improved else "NO IMPROVEMENT",
+            trades=len(final_bt.trades),
+            net_profit=final_bt.statistics.net_profit,
+            win_rate=final_bt.statistics.win_rate,
+            profit_factor=final_bt.statistics.profit_factor,
+            max_drawdown_pct=final_bt.statistics.max_drawdown_pct,
+            eval_pass_probability=final_mc.evaluation_pass_probability,
+            first_payout_probability=final_mc.first_payout_probability,
+            risk_of_ruin_pct=final_mc.risk_of_ruin_pct,
+            lesson="; ".join(warnings[:3]) if warnings else "",
+        )
+    except Exception:
+        pass  # T58 Research Memory is a bonus record -- never let it affect a completed Quick Optimize run
+
     return QuickOptimizeResult(
         strategy_display_name=display_name,
         source_type=strategy.source_type,

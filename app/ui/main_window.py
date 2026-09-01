@@ -2032,9 +2032,20 @@ class MainWindow:
         rng = (hi - lo) or 1
         max_len = max(len(s["values"]) for s in series)
 
+        # Each strategy gets its own distinct hue from this app's
+        # decorative neon palette, so multiple lines on the same chart
+        # stay visually distinguishable. Coloring every line strictly by
+        # pass/fail (GREEN/RED) meant every failing strategy rendered as
+        # the exact same solid red -- indistinguishable from one another
+        # whenever most (or, for a fresh batch, all) of the ranked
+        # strategies happened to be failing, which is the common case.
+        # Pass/fail is still shown -- just via the legend's status text/
+        # color instead of collapsing every line to one of two colors.
+        palette = [NEON_CYAN, NEON_AMBER, NEON_VIOLET, NEON_LIME, NEON_MAGENTA, BLUE]
+
         c.create_line(pad, h - pad, w - pad, h - pad, fill=BORDER)
-        for s in series:
-            color = GREEN if s["passed"] else RED
+        for idx, s in enumerate(series):
+            color = palette[idx % len(palette)]
             n = len(s["values"])
             if n < 2:
                 continue
@@ -2046,10 +2057,13 @@ class MainWindow:
             self._glow_line(c, points, color, width=1.6)
 
         legend_y = 6
-        for s in series:
-            color = GREEN if s["passed"] else RED
+        for idx, s in enumerate(series):
+            color = palette[idx % len(palette)]
+            status_color = GREEN if s["passed"] else RED
+            status_text = "PASS" if s["passed"] else "FAIL"
             c.create_oval(6, legend_y, 12, legend_y + 6, fill=color, outline="")
             c.create_text(18, legend_y + 3, text=s["name"], fill=TEXT_MUTED, font=_safe_font(7), anchor="w")
+            c.create_text(w - 8, legend_y + 3, text=status_text, fill=status_color, font=_safe_font(7, "bold"), anchor="e")
             legend_y += 13
 
     def _paint_heatmap(self, grid):
@@ -4075,9 +4089,21 @@ class MainWindow:
                 log("\nNothing to test -- every queued strategy failed to load.")
                 return
 
+            # Run several strategies' pipelines concurrently instead of one
+            # after another -- Step 2's GA search (by far the dominant cost
+            # per strategy) already parallelizes ACROSS a genome population;
+            # this additionally parallelizes ACROSS strategies, which is
+            # what actually shrinks a large multi-strategy batch's total
+            # wall-clock time. Auto-picked from the core count rather than
+            # a fixed number so it scales with whatever machine this runs
+            # on without needing its own settings widget; each strategy's
+            # own GA worker count is capped in turn by run_full_pipeline_batch
+            # so the two forms of parallelism don't oversubscribe the CPU.
+            max_parallel = max(1, min(len(batch_items), (os.cpu_count() or 4) // 2))
             summary = run_full_pipeline_batch(
                 df, batch_items, risk, rules, OUTPUT_DIR / "full_pipeline",
                 cfg=cfg, instrument=instrument, ollama_settings=ollama_settings, progress_cb=log,
+                max_parallel_strategies=max_parallel,
             )
             if summary.succeeded:
                 ranked = sorted(summary.succeeded, key=lambda o: o.eval_pass_probability, reverse=True)

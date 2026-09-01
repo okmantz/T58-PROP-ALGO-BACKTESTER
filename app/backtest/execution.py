@@ -100,11 +100,29 @@ def run_execution(
     pip_scale_mismatch_count = 0
     pip_scale_mismatch_worst_ratio = None  # smallest (stop_distance / entry_price) seen, for the warning
     gap_loss_count = 0
+    clamped_loss_count = 0
+    account_blown = False
+    account_blown_at = None
     daily_limit_amount = (
         risk.initial_balance * (risk.daily_loss_limit_pct / 100.0)
         if risk.daily_loss_limit_pct is not None
         else None
     )
+    blown_floor = risk.account_blown_floor()  # None if no floor configured
+
+    def _clamp_loss(pnl_value: float, equity_at_entry: float) -> float:
+        """A single trade's loss can never realistically exceed what the
+        account actually has to lose (negative-balance protection) or a
+        configured hard per-trade ceiling -- see RiskConfig.max_trade_loss.
+        Wins are never touched."""
+        nonlocal clamped_loss_count
+        if pnl_value >= 0 or not math.isfinite(pnl_value):
+            return pnl_value
+        cap = risk.max_trade_loss(equity_at_entry)
+        if cap and -pnl_value > cap:
+            clamped_loss_count += 1
+            return -cap
+        return pnl_value
 
     sig = signals.values
     ts = df["timestamp"].values
@@ -161,6 +179,7 @@ def run_execution(
                 pnl -= risk.commission_per_trade
                 if not math.isfinite(pnl):
                     pnl = 0.0
+                pnl = _clamp_loss(pnl, open_trade["equity_at_entry"])
                 equity += pnl
                 trades.append(Trade(
                     entry_time=open_trade["entry_time"],
@@ -262,6 +281,7 @@ def run_execution(
                     # otherwise-sane backtest don't get mistaken for a
                     # broken engine.
                     gap_loss_count += 1
+                pnl = _clamp_loss(pnl, open_trade["equity_at_entry"])
                 equity += pnl
                 trades.append(Trade(
                     entry_time=open_trade["entry_time"],
@@ -298,12 +318,27 @@ def run_execution(
             mtm_equity = equity
         equity_curve.append((ts[i], mtm_equity))
 
+        # --- account-blown circuit breaker ---
+        # A real prop/broker account is terminated the instant it breaches
+        # the firm's max-drawdown floor -- it does not keep "trading"
+        # itself into ever-deeper negative equity. Once realized equity
+        # crosses that floor (or the account has literally run out of
+        # money), stop opening any new trades for the remainder of the
+        # run; this is what makes a single misconfigured/gapped trade
+        # (see max_trade_loss above) unable to cascade into the kind of
+        # -$50,000-on-a-$50,000-account or -$2.5M results this was built
+        # to prevent. Any already-open trade still manages normally
+        # (stop/target/signal exits) -- only NEW entries are blocked.
+        if not account_blown and (equity <= 0 or (blown_floor is not None and equity <= blown_floor)):
+            account_blown = True
+            account_blown_at = pd.Timestamp(ts[i])
+
         # --- consider new entry ---
         day_realized_pnl = pnl_today.get(bar_date, 0.0)
         daily_limit_breached = (
             daily_limit_amount is not None and day_realized_pnl <= -daily_limit_amount
         )
-        if open_trade is None and sig[i] != 0 and not daily_limit_breached:
+        if open_trade is None and sig[i] != 0 and not daily_limit_breached and not account_blown:
             n_today = trades_today.get(bar_date, 0)
             if n_today < risk.max_trades_per_day:
                 direction = int(sig[i])
@@ -407,6 +442,7 @@ def run_execution(
         pnl -= risk.commission_per_trade
         if not math.isfinite(pnl):
             pnl = 0.0
+        pnl = _clamp_loss(pnl, open_trade["equity_at_entry"])
         equity += pnl
         trades.append(Trade(
             entry_time=open_trade["entry_time"],
@@ -427,6 +463,36 @@ def run_execution(
         adaptive_state.record_trade_close(pnl, is_new_day=pd.Timestamp(ts[i]).normalize() not in pnl_today)
 
     equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
+
+    if account_blown:
+        import warnings
+        warnings.warn(
+            f"Account BLOWN at {account_blown_at}: equity crossed the configured "
+            f"account-survivability floor (max_account_drawdown_pct) or hit zero. "
+            "No new trades were opened for the remainder of this run -- exactly "
+            "like a real prop/broker account being terminated rather than being "
+            "allowed to keep 'trading' itself into deeper negative equity. If you "
+            "want to know what happens after a re-funded account, run a fresh "
+            "backtest starting from that point rather than reading further trades "
+            "on this run as real.",
+            RuntimeWarning,
+        )
+
+    if clamped_loss_count:
+        import warnings
+        warnings.warn(
+            f"{clamped_loss_count} trade(s) had their simulated loss capped at "
+            "RiskConfig.max_trade_loss (a hard per-trade ceiling, default 3x the "
+            "trade's own intended risk) instead of being allowed to realize the "
+            "full computed loss. This models real negative-balance protection / "
+            "firm loss floors -- without it, a pip_size mismatch or an extreme "
+            "gap-through fill could report a single trade losing more than the "
+            "entire account, which cannot happen live. If you see this often, "
+            "the underlying cause (usually pip_scale_mismatch, see any warning "
+            "above) is still worth fixing -- capping the number doesn't fix the "
+            "sizing bug that produced it.",
+            RuntimeWarning,
+        )
 
     if force_closed_count:
         import warnings

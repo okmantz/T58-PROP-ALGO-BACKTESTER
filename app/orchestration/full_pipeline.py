@@ -57,16 +57,18 @@ reason, never allowed to take down a run that otherwise succeeded.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 
 from app.backtest.engine import BacktestResult, run_backtest, run_holdout_comparison
-from app.backtest.risk import RiskConfig
+from app.backtest.risk import RiskConfig, with_prop_safety_defaults
 from app.monte_carlo.engine import MonteCarloConfig, MonteCarloResult, run_monte_carlo
 from app.optimize.code_parameter_space import patched_source_for_strategy
 from app.optimize.parameter_space import RefinementError
@@ -90,7 +92,7 @@ class FullPipelineConfig:
     ga_population: int = 12
     ga_generations: int = 6
     ga_search_mc_sims: int = 200
-    fitness_metric: str = "composite_prop_score"
+    fitness_metric: str = "prop_guide_score"
     final_mc_sims: int = 10_000
     # Step 1's baseline Monte Carlo run is diagnostic only -- it's logged
     # and reported alongside the final numbers, but never feeds the
@@ -302,6 +304,14 @@ def run_full_pipeline(
     warnings: list[str] = []
     display_name = _display_name(strategy)
 
+    # Automatically ties the raw execution engine's account-blown circuit
+    # breaker (app.backtest.execution) to whatever max-drawdown floor this
+    # PROP FIRM actually enforces, so a single misconfigured/gapped trade
+    # can never report a loss bigger than the account the prop simulation
+    # is about to test it against. No-op if `risk` already set its own
+    # max_account_drawdown_pct explicitly.
+    risk = with_prop_safety_defaults(risk, prop_rules)
+
     # -- Step 1: baseline -----------------------------------------------
     log(f"Step 1/7: Baseline run for '{display_name}'...")
     preflight_signal_check(df, strategy, risk, "Full Pipeline")
@@ -419,49 +429,76 @@ def run_full_pipeline(
                 log(f"  AI assist: seeded with {len(feedback_lines)} observed parameter pattern(s) from this search.")
             return result.genomes
 
-    try:
-        refine_cfg = RefinementConfig(
-            population_size=cfg.ga_population,
-            generations=cfg.ga_generations,
-            fitness_metric=cfg.fitness_metric,
-            search_monte_carlo_sims=cfg.ga_search_mc_sims,
-            random_seed=cfg.random_seed,
+    # Fast-skip: a pip_size/instrument-scale mismatch (see the
+    # pip_scale_mismatch warning in app.backtest.execution) invalidates
+    # every position size and every stop distance the baseline computed --
+    # spending a full multi-generation GA search (typically the single
+    # most expensive step of a Full Pipeline run, 100-270s in a real
+    # 23-strategy batch) tuning parameters against numbers that can't be
+    # trusted is pure wasted wall-clock time. The fix is changing
+    # risk.pip_size to match the instrument (see suggest_pip_size), not
+    # anything the GA can search its way around. Skip straight to
+    # reporting NOT READY with the actionable reason instead.
+    instrument_mismatch = any(
+        "doesn't match the instrument actually being tested" in w for w in baseline_bt.warnings
+    )
+    if instrument_mismatch:
+        refinement_skip_reason = (
+            "Skipped optimization search: the baseline run flagged a pip_size/"
+            "instrument-scale mismatch (see the WARNING above). Every position "
+            "size and stop distance this backtest computed is unreliable, so "
+            "searching for 'better' parameters against those numbers would "
+            "waste the search budget without producing a trustworthy result. "
+            "Set risk.pip_size to match this instrument (e.g. 0.01 for gold/"
+            "JPY pairs, 1.0 for high-priced indices/stocks -- see "
+            "app.backtest.risk.suggest_pip_size) and re-run."
         )
-        ga_result = run_walkforward_aware_refinement(
-            df, strategy, risk, prop_rules,
-            MonteCarloConfig(n_simulations=cfg.ga_search_mc_sims, random_seed=cfg.random_seed),
-            refinement_config=refine_cfg,
-            n_folds=cfg.n_folds, window_mode=cfg.window_mode,
-            progress_cb=lambda m: log(f"  {m}"),
-            ai_suggest_cb=ai_suggest_cb,
-            parallel=cfg.parallel_search,
-            max_workers=cfg.parallel_search_max_workers,
-        )
-        refinement_ran = True
-        if ga_result.best.oos_trade_count > 0:
-            final_config = ga_result.best.config
-            final_code_text = ga_result.best.code_text
-            final_code_ext = ga_result.best.code_extension
-            log(
-                f"  Winning configuration: chained-OOS fitness {ga_result.best.fitness:.3f} "
-                f"({ga_result.best.oos_trade_count} OOS trades across {ga_result.n_folds} fold(s))."
+        log(f"  Optimization skipped: {refinement_skip_reason}")
+        ga_result = None
+    else:
+        try:
+            refine_cfg = RefinementConfig(
+                population_size=cfg.ga_population,
+                generations=cfg.ga_generations,
+                fitness_metric=cfg.fitness_metric,
+                search_monte_carlo_sims=cfg.ga_search_mc_sims,
+                random_seed=cfg.random_seed,
             )
-            if ga_result.overfitting_gap is not None and ga_result.overfitting_gap > 0:
-                warnings.append(
-                    f"Overfitting gap (in-sample fitness minus chained-OOS fitness): "
-                    f"{ga_result.overfitting_gap:.3f}. A large positive gap means the winning "
-                    f"configuration looks noticeably better in-sample than out-of-sample."
+            ga_result = run_walkforward_aware_refinement(
+                df, strategy, risk, prop_rules,
+                MonteCarloConfig(n_simulations=cfg.ga_search_mc_sims, random_seed=cfg.random_seed),
+                refinement_config=refine_cfg,
+                n_folds=cfg.n_folds, window_mode=cfg.window_mode,
+                progress_cb=lambda m: log(f"  {m}"),
+                ai_suggest_cb=ai_suggest_cb,
+                parallel=cfg.parallel_search,
+                max_workers=cfg.parallel_search_max_workers,
+            )
+            refinement_ran = True
+            if ga_result.best.oos_trade_count > 0:
+                final_config = ga_result.best.config
+                final_code_text = ga_result.best.code_text
+                final_code_ext = ga_result.best.code_extension
+                log(
+                    f"  Winning configuration: chained-OOS fitness {ga_result.best.fitness:.3f} "
+                    f"({ga_result.best.oos_trade_count} OOS trades across {ga_result.n_folds} fold(s))."
                 )
-            warnings.extend(ga_result.warnings)
-        else:
-            warnings.append(
-                "The walk-forward-aware GA's best candidate still produced zero out-of-sample "
-                "trades -- keeping the original baseline configuration as final instead of a "
-                "'winner' that never actually traded out-of-sample."
-            )
-    except RefinementError as exc:
-        refinement_skip_reason = str(exc)
-        log(f"  Optimization skipped: {exc}")
+                if ga_result.overfitting_gap is not None and ga_result.overfitting_gap > 0:
+                    warnings.append(
+                        f"Overfitting gap (in-sample fitness minus chained-OOS fitness): "
+                        f"{ga_result.overfitting_gap:.3f}. A large positive gap means the winning "
+                        f"configuration looks noticeably better in-sample than out-of-sample."
+                    )
+                warnings.extend(ga_result.warnings)
+            else:
+                warnings.append(
+                    "The walk-forward-aware GA's best candidate still produced zero out-of-sample "
+                    "trades -- keeping the original baseline configuration as final instead of a "
+                    "'winner' that never actually traded out-of-sample."
+                )
+        except RefinementError as exc:
+            refinement_skip_reason = str(exc)
+            log(f"  Optimization skipped: {exc}")
 
     # -- Build the final strategy -----------------------------------------------
     if final_source_type == "manual":
@@ -736,6 +773,29 @@ class FullPipelineBatchSummary:
         return [o for o in self.outcomes if not o.ok]
 
 
+def _batch_item_worker(
+    i: int, label: str, strategy: Strategy, df: pd.DataFrame, risk: RiskConfig,
+    prop_rules: PropRules, output_dir: str | Path, cfg: FullPipelineConfig,
+    instrument: str, ollama_settings: "OllamaSettings | None", report_basename: str,
+) -> tuple[int, str, bool, "FullPipelineResult | None", str | None]:
+    """Module-level (picklable) target for the batch's ProcessPoolExecutor.
+    Runs exactly one item's full pipeline with no progress_cb (a Tkinter-
+    bound callback can't cross a process boundary) -- per-item step-by-step
+    logging is only available in the serial (max_parallel_strategies=1)
+    path; the parallel path logs only start/finish per item. Returns a
+    plain tuple instead of raising so one bad strategy can never take down
+    `as_completed` for the rest of the batch."""
+    try:
+        result = run_full_pipeline(
+            df, strategy, risk, prop_rules, output_dir, cfg,
+            progress_cb=None, instrument=instrument, ollama_settings=ollama_settings,
+            report_basename=report_basename,
+        )
+        return (i, label, True, result, None)
+    except Exception as exc:  # noqa: BLE001 -- one bad strategy must not stop the batch
+        return (i, label, False, None, str(exc))
+
+
 def run_full_pipeline_batch(
     df: pd.DataFrame,
     items: list[FullPipelineBatchItem],
@@ -746,14 +806,14 @@ def run_full_pipeline_batch(
     instrument: str = "unknown",
     ollama_settings: "OllamaSettings | None" = None,
     progress_cb: ProgressCallback | None = None,
+    max_parallel_strategies: int = 1,
 ) -> FullPipelineBatchSummary:
     """Runs app.orchestration.full_pipeline.run_full_pipeline (the full
     baseline -> walk-forward-aware GA -> final validation -> OOS check ->
     holdout check -> ICIR gate -> report pipeline, not just a plain
-    backtest) against every item in `items`, one after another, writing
-    one full report per strategy and recording each result back onto its
-    own Strategy Library metadata exactly like a single Full Pipeline run
-    already does.
+    backtest) against every item in `items`, writing one full report per
+    strategy and recording each result back onto its own Strategy Library
+    metadata exactly like a single Full Pipeline run already does.
 
     This exists specifically because Strategy Library multi-select +
     the batch queue previously only ever fed app.orchestration.batch_test
@@ -768,37 +828,42 @@ def run_full_pipeline_batch(
     keeps going -- it never aborts the whole run. Every item uses the same
     `cfg` (GA population/generations/etc.) and the same `risk`/`prop_rules`
     -- whatever is configured on the Full Pipeline tab at the moment the
-    batch is started."""
+    batch is started.
+
+    max_parallel_strategies: 1 (default) preserves the original strictly-
+    sequential behavior with full live per-step logging. Set higher (e.g.
+    3-4 on an 8+ core machine) to run that many strategies' pipelines
+    concurrently in separate worker processes -- this was the single
+    biggest lever for cutting a large batch's wall-clock time (a real
+    23-strategy/~1-hour batch is CPU-bound almost entirely inside Step 2's
+    GA search, which already parallelizes ACROSS a genome population; this
+    additionally parallelizes ACROSS strategies). To avoid oversubscribing
+    the machine, each item's own GA worker-process count
+    (cfg.parallel_search_max_workers) is automatically capped to roughly
+    os.cpu_count() // max_parallel_strategies (minimum 1) whenever the
+    caller hasn't already pinned an explicit value; pass a `cfg` with
+    parallel_search_max_workers set to override this. Per-item live
+    progress logs are unavailable in this mode (see _batch_item_worker) --
+    only start/finish lines are logged for each item; drop back to 1 if
+    you need the detailed step-by-step console output for every strategy."""
     def log(msg: str) -> None:
         if progress_cb:
             progress_cb(msg)
 
     cfg = cfg or FullPipelineConfig()
     t0 = time.time()
-    outcomes: list[FullPipelineBatchOutcome] = []
+    outcomes_by_index: dict[int, FullPipelineBatchOutcome] = {}
 
-    for i, item in enumerate(items, start=1):
-        log(f"\n===== [{i}/{len(items)}] Full Pipeline: {item.label} =====")
-
-        def item_log(msg: str, _label=item.label) -> None:
-            log(f"  {msg}")
-
-        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", item.label) or f"strategy_{i}"
-        try:
-            result = run_full_pipeline(
-                df, item.strategy, risk, prop_rules, output_dir, cfg,
-                progress_cb=item_log, instrument=instrument, ollama_settings=ollama_settings,
-                report_basename=f"full_pipeline_{i:03d}_{safe_name}",
-            )
-        except Exception as exc:  # noqa: BLE001 -- one bad strategy must not stop the batch
-            log(f"  Skipped -- Full Pipeline error: {exc}")
-            outcomes.append(FullPipelineBatchOutcome(item.label, ok=False, reason=str(exc)))
-            continue
-
-        if item.library_ref is not None:
+    def _record(i: int, label: str, ok: bool, result, reason: str | None) -> None:
+        if not ok:
+            log(f"  Skipped -- Full Pipeline error: {reason}")
+            outcomes_by_index[i] = FullPipelineBatchOutcome(label, ok=False, reason=reason)
+            return
+        if item_library_refs.get(i) is not None:
             try:
                 from app.strategy.library import record_backtest_result
-                record_backtest_result(item.library_ref[0], item.library_ref[1], {
+                strategy_type, filename = item_library_refs[i]
+                record_backtest_result(strategy_type, filename, {
                     "trades": len(result.final_bt.trades),
                     "net_profit": round(result.final_bt.statistics.net_profit, 2),
                     "win_rate": round(result.final_bt.statistics.win_rate, 1),
@@ -810,21 +875,70 @@ def run_full_pipeline_batch(
                 })
             except Exception:  # noqa: BLE001 -- recording to the library is a convenience, not core output
                 pass
-
         log(
             f"  Verdict: {result.verdict}  |  Trades: {len(result.final_bt.trades)}  |  "
             f"Net profit: ${result.final_bt.statistics.net_profit:,.2f}  |  "
             f"Eval pass probability: {result.final_mc.evaluation_pass_probability:.1f}%  |  "
             f"Report: {result.report_paths['html'].name}"
         )
-        outcomes.append(FullPipelineBatchOutcome(
-            item.label, ok=True, verdict=result.verdict,
+        outcomes_by_index[i] = FullPipelineBatchOutcome(
+            label, ok=True, verdict=result.verdict,
             trades=len(result.final_bt.trades),
             net_profit=result.final_bt.statistics.net_profit,
             eval_pass_probability=result.final_mc.evaluation_pass_probability,
             report_html=result.report_paths["html"], result=result,
-        ))
+        )
 
+    item_library_refs = {i: item.library_ref for i, item in enumerate(items, start=1)}
+    safe_names = {}
+    for i, item in enumerate(items, start=1):
+        safe_names[i] = re.sub(r"[^A-Za-z0-9_-]+", "_", item.label) or f"strategy_{i}"
+
+    if max_parallel_strategies <= 1 or len(items) <= 1:
+        for i, item in enumerate(items, start=1):
+            log(f"\n===== [{i}/{len(items)}] Full Pipeline: {item.label} =====")
+
+            def item_log(msg: str, _label=item.label) -> None:
+                log(f"  {msg}")
+
+            try:
+                result = run_full_pipeline(
+                    df, item.strategy, risk, prop_rules, output_dir, cfg,
+                    progress_cb=item_log, instrument=instrument, ollama_settings=ollama_settings,
+                    report_basename=f"full_pipeline_{i:03d}_{safe_names[i]}",
+                )
+            except Exception as exc:  # noqa: BLE001 -- one bad strategy must not stop the batch
+                _record(i, item.label, False, None, str(exc))
+                continue
+            _record(i, item.label, True, result, None)
+    else:
+        per_item_workers = max(1, (os.cpu_count() or 4) // max_parallel_strategies)
+        item_cfg = cfg if cfg.parallel_search_max_workers is not None else replace(
+            cfg, parallel_search_max_workers=per_item_workers,
+        )
+        log(
+            f"\nRunning {len(items)} strategies with up to {max_parallel_strategies} in parallel "
+            f"(each capped to {item_cfg.parallel_search_max_workers} GA worker process(es))..."
+        )
+        with ProcessPoolExecutor(max_workers=max_parallel_strategies) as pool:
+            futures = {
+                pool.submit(
+                    _batch_item_worker, i, item.label, item.strategy, df, risk, prop_rules,
+                    output_dir, item_cfg, instrument, ollama_settings,
+                    f"full_pipeline_{i:03d}_{safe_names[i]}",
+                ): (i, item.label)
+                for i, item in enumerate(items, start=1)
+            }
+            for future in as_completed(futures):
+                i, label = futures[future]
+                log(f"\n===== [{i}/{len(items)}] Full Pipeline: {label} (finished) =====")
+                try:
+                    _, _, ok, result, reason = future.result()
+                except Exception as exc:  # noqa: BLE001 -- worker crash must not stop the batch
+                    ok, result, reason = False, None, str(exc)
+                _record(i, label, ok, result, reason)
+
+    outcomes = [outcomes_by_index[i] for i in sorted(outcomes_by_index)]
     elapsed = time.time() - t0
     log(
         f"\nBatch Full Pipeline complete in {elapsed:.1f}s. {len(items)} strategy(ies) attempted, "

@@ -70,7 +70,8 @@ CODE_EXTENSIONS = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}
 # Human-readable labels for the fitness-metric dropdown in the UI. Keys
 # here are the exact strings accepted by RefinementConfig.fitness_metric.
 FITNESS_METRICS: dict[str, str] = {
-    "composite_prop_score": "Composite Prop Score (recommended)",
+    "prop_guide_score": "Prop-Oriented Guide Score (recommended)",
+    "composite_prop_score": "Composite Prop Score",
     "eval_pass_probability": "Evaluation Pass Probability",
     "first_payout_probability": "First Payout Probability",
     "expected_payout": "Expected Payout ($)",
@@ -169,6 +170,77 @@ class RefinementResult:
 # Fitness
 # ---------------------------------------------------------------------------
 
+def _band(value: float, floor: float, ceiling: float) -> float:
+    """0 at/below `floor`, ramps linearly to 1 at/above `ceiling`. Small
+    helper for scoring a raw metric against one of the guide's target
+    bands without repeating the same clamp-and-scale logic for each one."""
+    if not math.isfinite(value):
+        return 0.0
+    if value <= floor:
+        return 0.0
+    if value >= ceiling:
+        return 1.0
+    return (value - floor) / (ceiling - floor)
+
+
+def _prop_guide_score(stats: dict, mc: MonteCarloResult) -> float:
+    """Scores a strategy against the PROP-ORIENTED STRATEGY GENERATION
+    GUIDE's "ideal performance profile" (its section 4 target table)
+    instead of collapsing everything to net profit, or even just eval-pass
+    probability alone.
+
+    Two strategies with identical eval-pass probability can still be very
+    different bets to fund: one might clear the bar with a P95 drawdown
+    that hugs the firm's actual limit, a handful of oversized trades, or
+    too few trades to trust the number at all -- exactly the failure
+    patterns the guide calls out by name in its "do not optimize for
+    these alone" section. This blends the guide's own target bands (win
+    rate 50-65%, profit factor >= 1.3, 100+ trades, P95 drawdown under
+    roughly half of a typical prop firm's overall drawdown limit) into
+    the pass/payout-probability objective the guide is actually chasing,
+    so the GA can't win by exploiting the numbers this metric doesn't
+    look at.
+
+    Deliberately NOT normalized to a clean 0-1 range -- what matters for
+    the GA/refinement's tournament selection is relative ordering between
+    candidates, not the absolute scale."""
+    eval_pass = mc.evaluation_pass_probability / 100.0
+    payout = mc.first_payout_probability / 100.0
+    ruin_penalty = mc.risk_of_ruin_pct / 100.0
+
+    pf = stats.get("profit_factor", 0.0)
+    pf_score = _band(pf if math.isfinite(pf) else 0.0, 1.0, 1.5)
+
+    trade_score = _band(stats.get("total_trades", 0), 30, 150)
+
+    win_rate = stats.get("win_rate", 0.0)
+    if 50.0 <= win_rate <= 65.0:
+        win_rate_score = 1.0
+    elif win_rate < 50.0:
+        win_rate_score = _band(win_rate, 30.0, 50.0)
+    else:
+        win_rate_score = max(0.0, 1.0 - (win_rate - 65.0) / 25.0)
+
+    # P95 drawdown vs a typical ~10%-max-drawdown prop firm: the guide
+    # wants P95 drawdown under roughly 50-60% of the firm's actual limit.
+    # compute_fitness doesn't have the active PropRules in scope here, so
+    # this uses that typical 10% figure as a stand-in rather than the
+    # exact configured limit -- close enough to penalize a strategy that
+    # runs uncomfortably close to ANY reasonable drawdown limit, without
+    # needing to thread PropRules through every call site of this metric.
+    dd_score = 1.0 - _band(mc.p95_drawdown_pct, 6.0, 10.0)
+
+    return (
+        eval_pass * 0.40
+        + payout * 0.25
+        + pf_score * 0.10
+        + trade_score * 0.08
+        + win_rate_score * 0.07
+        + dd_score * 0.10
+        - ruin_penalty * 0.15
+    )
+
+
 def compute_fitness(stats: dict, prop_summary: dict | None, mc: MonteCarloResult, metric: str) -> float:
     if metric == "net_profit":
         return float(stats.get("net_profit", 0.0))
@@ -189,6 +261,8 @@ def compute_fitness(stats: dict, prop_summary: dict | None, mc: MonteCarloResult
             + mc.first_payout_probability * 0.3
             - mc.risk_of_ruin_pct * 0.2
         )
+    if metric == "prop_guide_score":
+        return _prop_guide_score(stats, mc)
     raise RefinementError(f"Unknown fitness metric '{metric}'.")
 
 

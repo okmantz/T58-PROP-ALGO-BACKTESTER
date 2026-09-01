@@ -12,7 +12,7 @@ OHLCV schema (timestamp, open, high, low, close, volume) -- ready to feed
 straight into app.data.importer / app.data.storage exactly like any
 manually-imported CSV.
 
-Requires the optional `alpaca-py` package (see requirements.txt). The
+Requires the optional `alpaca-py` package (see config/requirements.txt). The
 import is deferred into each function so the rest of the app still works
 if it isn't installed; callers should catch AlpacaImportError and show it
 as a plain message rather than a stack trace.

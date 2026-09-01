@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Walk-Forward Optimization</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: var(--text); font-size: 15px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15);
+  }
+  textarea { min-height: 140px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tabs button {
+    flex: 1; min-width: 70px; padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: #ccc; font-size: 13px;
+  }
+  .tabs button.active { background: var(--teal); color: #04120e; font-weight: 600; border-color: var(--teal); }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+    box-shadow: 0 0 22px rgba(53,224,176,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .notice { background: #142a1a; border: 1px solid #235a32; color: #b4ffcb; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  details summary { font-size: 13px; color: #999; cursor: pointer; }
+</style>
+</head>
+<body>
+{% set active_page = active_page|default('wfo') %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Walk-Forward Optimization</h1>
+  <p>Re-optimizes on each fold's train window, applies the winner UNCHANGED to that fold's held-out test window, and chains every fold's out-of-sample trades into one continuous result. This is the number to trust over a single in-sample backtest.</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="post" action="/walk-forward-opt/start" enctype="multipart/form-data">
+
+  <div class="card">
+    <h2>1. Market Data</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none, I'm uploading new file(s) below —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }} ({{ (ds.size_bytes / 1024) | round(1) }} KB)</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+    <label>Or upload new CSV file(s) (timestamp, open, high, low, close, volume)</label>
+    <input type="file" name="csv_file" accept=".csv" multiple>
+  </div>
+
+  <div class="card">
+    <h2>2. Strategy to refine</h2>
+    <p class="help">Whatever tunable numeric parameters this strategy has (Manual config fields, or numeric constants in Python/PineScript/MQL5 source) become the genes the GA searches over.</p>
+    <div class="tabs" id="strategy-tabs">
+      <button type="button" data-mode="manual" class="active">Manual</button>
+      <button type="button" data-mode="python">Python</button>
+      <button type="button" data-mode="pinescript">PineScript</button>
+      <button type="button" data-mode="mql5">MQL5</button>
+    </div>
+    <input type="hidden" name="strategy_mode" id="strategy_mode" value="manual">
+
+    <div id="manual-fields">
+      <div class="row">
+        <div><label>SMA fast</label><input type="number" name="sma_fast" value="20"></div>
+        <div><label>SMA slow</label><input type="number" name="sma_slow" value="50"></div>
+      </div>
+      <div class="row">
+        <div><label>Stop loss (pips)</label><input type="number" name="sl_pips" value="20"></div>
+        <div><label>Take profit (pips)</label><input type="number" name="tp_pips" value="40"></div>
+      </div>
+    </div>
+
+    <div id="code-fields" style="display:none;">
+      <label>Search the library (name / description / market)</label>
+      <input type="text" id="strategy_search_input" placeholder="e.g. fvg, XAUUSD..." oninput="onLibraryFiltersChanged()">
+      <div class="row">
+        <div>
+          <label>Browse market</label>
+          <select id="strategy_filter_market" onchange="onLibraryFiltersChanged()"><option value="">All markets</option></select>
+        </div>
+        <div>
+          <label>Browse tag</label>
+          <select id="strategy_filter_tag" onchange="onLibraryFiltersChanged()"><option value="">All tags</option></select>
+        </div>
+        <div>
+          <label>Browse status</label>
+          <select id="strategy_filter_status" onchange="onLibraryFiltersChanged()">
+            <option value="">All statuses</option>
+            {% for s in strategy_statuses|default([]) %}
+            <option value="{{ s }}">{{ s }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <label>Load a saved strategy from the library</label>
+      <select id="existing_strategy_select" onchange="loadFromLibrary()">
+        <option value="">— none, paste or upload below —</option>
+      </select>
+      <p style="font-size:12px;color:#888;margin-top:6px;" id="library-count-note"></p>
+
+      <label style="margin-top:14px;">Or upload a strategy file (from this computer or your phone)</label>
+      <input type="file" id="strategy_file_input" name="strategy_file" accept=".py,.pine,.mq5">
+
+      <label>Or paste strategy source</label>
+      <textarea name="strategy_code" id="strategy_code" placeholder="Paste your Python / PineScript / MQL5 strategy here"></textarea>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Risk &amp; prop rules</h2>
+    <div class="row">
+      <div><label>Initial balance</label><input type="number" name="initial_balance" value="100000"></div>
+      <div><label>Account size (prop rules)</label><input type="number" name="account_size" value="100000"></div>
+    </div>
+    <div class="row">
+      <div><label>Risk mode</label>
+        <select name="risk_mode"><option value="percent">% of balance</option><option value="fixed">Fixed lot</option></select>
+      </div>
+      <div><label>Risk value</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
+    </div>
+    <div class="row">
+      <div><label>Profit target %</label><input type="number" step="0.1" name="profit_target" value="8"></div>
+      <div><label>Daily loss limit %</label><input type="number" step="0.1" name="daily_loss" value="5"></div>
+    </div>
+    <div class="row">
+      <div><label>Max drawdown %</label><input type="number" step="0.1" name="max_dd" value="10"></div>
+      <div><label>Pip size</label><input type="number" step="0.0001" name="pip_size" value="0.0001"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>4. Walk-forward settings</h2>
+    <div class="row">
+      <div><label>Number of folds</label><input type="number" name="n_folds" value="5"></div>
+      <div><label>Window mode</label>
+        <select name="window_mode"><option value="rolling">Rolling</option><option value="anchored">Anchored</option></select>
+      </div>
+    </div>
+    <div class="row">
+      <div><label>Train fraction per fold</label><input type="number" step="0.05" name="train_frac" value="0.6"></div>
+      <div><label>Embargo bars (gap between train/test)</label><input type="number" name="embargo_bars" value="0"></div>
+    </div>
+    <label>Fitness metric (used to pick each fold's train-window winner)</label>
+    <select name="fitness_metric">
+      {% for key, label in fitness_metrics.items() %}
+      <option value="{{ key }}" {{ 'selected' if key == 'composite_prop_score' else '' }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <details style="margin-top:10px;">
+      <summary>Per-fold GA settings</summary>
+      <div class="row">
+        <div><label>Population size</label><input type="number" name="population_size" value="8"></div>
+        <div><label>Generations</label><input type="number" name="generations" value="3"></div>
+      </div>
+      <label>Search-phase MC sims</label>
+      <input type="number" name="search_mc_sims" value="200">
+      <label>Final chained-OOS Monte Carlo sims</label>
+      <input type="number" name="n_sims" value="1000">
+    </details>
+  </div>
+
+  <button class="submit-btn" type="submit">Run Walk-Forward Optimization</button>

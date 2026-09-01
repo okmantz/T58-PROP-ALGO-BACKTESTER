@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Multi-Objective — Job</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#111111">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; background: #0d0d0d; color: #eee; }
+  header { padding: 18px 16px 8px; border-bottom: 1px solid #262626; }
+  header h1 { font-size: 18px; margin: 0; }
+  nav { display: flex; gap: 14px; padding: 10px 16px 0; }
+  nav a { color: #9ecbff; font-size: 13px; text-decoration: none; }
+  main { padding: 16px; max-width: 720px; margin: 0 auto; }
+  .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #aaa; margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #999; margin: 6px 0 0; line-height: 1.5; }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  #log { background: #0d0d0d; border: 1px solid #262626; border-radius: 8px; padding: 10px; font-family: ui-monospace, Menlo, monospace;
+         font-size: 12px; color: #ccc; max-height: 280px; overflow-y: auto; white-space: pre-wrap; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #eee;
+             border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  th, td { padding: 6px 4px; border-bottom: 1px solid #262626; text-align: left; }
+  th { color: #888; font-weight: 600; text-transform: uppercase; font-size: 10px; }
+  .links a { display: block; color: #9ecbff; font-size: 13px; margin-top: 6px; text-decoration: none; }
+  .table-scroll { overflow-x: auto; }
+  .badge { font-size: 10px; padding: 2px 6px; border-radius: 6px; background: #123b1c; color: #7ee08a; }
+  .badge.infeasible { background: #2a1414; color: #ffb4b4; }
+</style>
+</head>
+<body>
+<header><h1>T58 Trading — Multi-Objective Optimization</h1></header>
+<nav>
+  <a href="/">Run &amp; Report</a>
+  <a href="/multi-objective">New Run</a>
+</nav>
+<main>
+
+{% if not_found %}
+<div class="error">Job "{{ job_id }}" was not found (the server may have restarted since it ran).</div>
+{% else %}
+
+<div class="card">
+  <h2 id="status-title"><span class="spinner" id="spinner"></span>Multi-objective search running&hellip;</h2>
+  <div id="log">Starting&hellip;</div>
+</div>
+
+<div class="card" id="summary-card" style="display:none;">
+  <h2>Pareto front</h2>
+  <p class="help" id="s-objectives"></p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr id="pareto-head"></tr></thead>
+      <tbody id="pareto-body"></tbody>
+    </table>
+  </div>
+  <p class="help">No candidate here is strictly worse than any other on every objective at once — picking a single winner is a judgment call about which trade-off matters most to you, deliberately left to you rather than automated.</p>
+  <div class="links" id="s-report-links"></div>
+</div>
+
+<div class="error" id="error-card" style="display:none;"></div>
+
+{% endif %}
+</main>
+
+{% if not not_found %}
+<script>
+  const jobId = {{ job_id | tojson }};
+  const fmt = (v, d) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Number(v).toFixed(d === undefined ? 3 : d);
+
+  function poll() {
+    fetch(`/multi-objective/job/${jobId}/status.json`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.found) return;
+        document.getElementById('log').textContent = data.log.filter(Boolean).join('\n');
+        document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+
+        if (data.error) {
+          document.getElementById('spinner').style.display = 'none';
+          document.getElementById('status-title').textContent = 'Multi-objective search failed';
+          const ec = document.getElementById('error-card');
+          ec.style.display = 'block';
+          ec.textContent = data.error;
+          return;
+        }
+
+        if (data.done) {
+          document.getElementById('spinner').style.display = 'none';
+          document.getElementById('status-title').textContent = 'Multi-objective search complete';
+          const s = data.summary;
+          if (s) {
+            document.getElementById('summary-card').style.display = 'block';
+            document.getElementById('s-objectives').textContent =
+              `Objectives: ${s.objectives.join(', ')}  •  ${s.generations_run} generations  •  ${fmt(s.elapsed_seconds, 0)}s`;
+
+            const head = document.getElementById('pareto-head');
+            head.innerHTML = '<th>#</th>' + s.objectives.map(o => `<th>${o}</th>`).join('') + '<th>Feasible</th>';
+
+            const tbody = document.getElementById('pareto-body');
+            tbody.innerHTML = '';
+            (s.pareto_front || []).forEach((c, i) => {
+              const tr = document.createElement('tr');
+              const cells = s.objectives.map(o => `<td>${fmt(c.objective_values[o])}</td>`).join('');
+              const badge = c.feasible ? '<span class="badge">yes</span>' : '<span class="badge infeasible">no</span>';
+              tr.innerHTML = `<td>${i + 1}</td>${cells}<td>${badge}</td>`;
+              tbody.appendChild(tr);
+            });
+
+            const links = document.getElementById('s-report-links');
+            links.innerHTML = '';
+            if (s.report_html) links.innerHTML += `<a href="${s.report_html}" target="_blank">Open full report &rarr;</a>`;
+          }
+          return;
+        }
+        setTimeout(poll, 2000);
+      })
+      .catch(() => setTimeout(poll, 3000));
+  }
+  poll();
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+{% endif %}
+</body>
+</html>

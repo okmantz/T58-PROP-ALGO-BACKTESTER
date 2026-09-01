@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Research Agent — Job</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#111111">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; background: #0d0d0d; color: #eee; }
+  header { padding: 18px 16px 8px; border-bottom: 1px solid #262626; }
+  header h1 { font-size: 18px; margin: 0; }
+  nav { display: flex; gap: 14px; padding: 10px 16px 0; }
+  nav a { color: #9ecbff; font-size: 13px; text-decoration: none; }
+  main { padding: 16px; max-width: 720px; margin: 0 auto; }
+  .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #aaa; margin: 0 0 10px; }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  #log { background: #0d0d0d; border: 1px solid #262626; border-radius: 8px; padding: 10px; font-family: ui-monospace, Menlo, monospace;
+         font-size: 12px; color: #ccc; max-height: 180px; overflow-y: auto; white-space: pre-wrap; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #eee;
+             border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .step { border-left: 2px solid #333; padding-left: 10px; margin-bottom: 14px; }
+  .step .thought { font-size: 13px; color: #ddd; margin-bottom: 4px; }
+  .step .action { font-size: 12px; color: #9ecbff; font-family: ui-monospace, Menlo, monospace; margin-bottom: 4px; }
+  .step .observation { font-size: 12px; color: #999; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; background: #0d0d0d; border-radius: 6px; padding: 8px; max-height: 200px; overflow-y: auto; }
+  .final-answer { background: #123b1c; border: 1px solid #235a32; color: #d7ffe0; padding: 14px; border-radius: 10px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<header><h1>T58 Trading — Research Agent</h1></header>
+<nav>
+  <a href="/">Run &amp; Report</a>
+  <a href="/research-agent">New Question</a>
+</nav>
+<main>
+
+{% if not_found %}
+<div class="error">Job "{{ job_id }}" was not found (the server may have restarted since it ran).</div>
+{% else %}
+
+<div class="card">
+  <h2 id="status-title"><span class="spinner" id="spinner"></span>Agent working&hellip;</h2>
+  <div id="log">Starting&hellip;</div>
+</div>
+
+<div id="steps"></div>
+
+<div class="card" id="answer-card" style="display:none;">
+  <h2>Final answer</h2>
+  <div class="final-answer" id="final-answer"></div>
+</div>
+
+<div class="error" id="error-card" style="display:none;"></div>
+
+{% endif %}
+</main>
+
+{% if not not_found %}
+<script>
+  const jobId = {{ job_id | tojson }};
+
+  function renderSteps(steps) {
+    const container = document.getElementById('steps');
+    container.innerHTML = '';
+    (steps || []).forEach(s => {
+      const div = document.createElement('div');
+      div.className = 'card step';
+      let html = `<div class="thought"><b>Step ${s.step_index}</b> — ${s.thought || ''}</div>`;
+      if (s.action) html += `<div class="action">${s.action}(${JSON.stringify(s.action_input || {})})</div>`;
+      if (s.observation) html += `<div class="observation">${JSON.stringify(s.observation, null, 2).slice(0, 2000)}</div>`;
+      if (s.note) html += `<div class="thought" style="color:#ffcf7a;">${s.note}</div>`;
+      div.innerHTML = html;
+      container.appendChild(div);
+    });
+  }
+
+  function poll() {
+    fetch(`/research-agent/job/${jobId}/status.json`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.found) return;
+        document.getElementById('log').textContent = data.log.filter(Boolean).join('\n');
+        document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+
+        if (data.error) {
+          document.getElementById('spinner').style.display = 'none';
+          document.getElementById('status-title').textContent = 'Agent failed';
+          const ec = document.getElementById('error-card');
+          ec.style.display = 'block';
+          ec.textContent = data.error;
+          return;
+        }
+
+        if (data.done) {
+          document.getElementById('spinner').style.display = 'none';
+          document.getElementById('status-title').textContent = 'Agent finished';
+          const s = data.summary;
+          if (s) {
+            renderSteps(s.steps);
+            if (s.error) {
+              const ec = document.getElementById('error-card');
+              ec.style.display = 'block';
+              ec.textContent = s.error;
+            } else if (s.final_answer) {
+              document.getElementById('answer-card').style.display = 'block';
+              document.getElementById('final-answer').textContent = s.final_answer;
+            } else {
+              document.getElementById('answer-card').style.display = 'block';
+              document.getElementById('final-answer').textContent = `Stopped without a final answer (${s.stopped_reason || 'unknown reason'}). See the steps above for what it tried.`;
+            }
+          }
+          return;
+        }
+        setTimeout(poll, 2000);
+      })
+      .catch(() => setTimeout(poll, 3000));
+  }
+  poll();
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+{% endif %}
+</body>
+</html>

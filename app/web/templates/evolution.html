@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Evolution Lab</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=number], select { width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light); background: var(--panel-3); color: var(--text); font-size: 15px; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .submit-btn { width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e; font-size: 16px; font-weight: 700; margin-top: 6px; box-shadow: 0 0 22px rgba(53,224,176,0.35); }
+  .stop-btn { width: 100%; padding: 15px; border-radius: 10px; border: 1px solid #6b2323; background: #3a1616; color: #ffb4b4; font-size: 16px; font-weight: 700; margin-top: 6px; }
+  .reset-btn { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border-light); background: var(--panel-3); color: #ccc; font-size: 13px; margin-top: 8px; }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .badge { font-size: 10px; padding: 3px 8px; border-radius: 6px; }
+  .badge.running { background: #123b1c; color: #7ee08a; }
+  .badge.stopped { background: #262626; color: #999; }
+  #log { background: #0d0d0d; border: 1px solid var(--border-light); border-radius: 8px; padding: 10px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #ccc; max-height: 220px; overflow-y: auto; white-space: pre-wrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  th, td { padding: 6px 4px; border-bottom: 1px solid var(--border-light); text-align: left; }
+  th { color: #888; font-weight: 600; text-transform: uppercase; font-size: 10px; }
+  .table-scroll { overflow-x: auto; max-height: 360px; overflow-y: auto; }
+  .journal-entry { font-size: 12px; color: #ccc; border-left: 2px solid var(--border-light); padding-left: 8px; margin-bottom: 8px; white-space: pre-wrap; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .checkbox-row input { width: auto; }
+</style>
+</head>
+<body>
+{% set active_page = active_page|default('evolution') %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Evolution lab</h1>
+  <p>An open-ended search across every strategy family, generation after generation, until you click STOP. Progress checkpoints to disk after every generation -- STOP then START again continues where it left off (same data) instead of starting over.</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<div class="card">
+  <h2>Status <span class="badge {{ 'running' if running else 'stopped' }}" id="status-badge">{{ 'RUNNING' if running else 'STOPPED' }}</span></h2>
+  <div id="log">Loading&hellip;</div>
+  <div id="controls" style="margin-top:10px;">
+    {% if running %}
+    <form method="post" action="/evolution/stop"><button class="stop-btn" type="submit">Stop</button></form>
+    {% else %}
+    <form method="post" action="/evolution/reset" onsubmit="return confirm('Discard the saved checkpoint and start completely fresh next time?');">
+      <button class="reset-btn" type="submit">Reset checkpoint (start fresh next run)</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" id="leaderboard-card" style="display:none;">
+  <h2>Leaderboard (generation <span id="gen-num">0</span>)</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>#</th><th>Candidate</th><th>Net profit</th><th>PF</th><th>Eval pass %</th></tr></thead>
+      <tbody id="leaderboard-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" id="journal-card" style="display:none;">
+  <h2>Journal (recent)</h2>
+  <div id="journal-body"></div>
+</div>
+
+{% if not running %}
+<form method="post" action="/evolution/start" enctype="multipart/form-data">
+  <div class="card">
+    <h2>1. Market Data</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none, I'm uploading a new file below —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }}</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+    <label>Or upload a new CSV</label>
+    <input type="file" name="csv_file" accept=".csv">
+  </div>
+
+  <div class="card">
+    <h2>2. Evolution settings</h2>
+    <div class="row">
+      <div><label>Population size</label><input type="number" name="population_size" value="60"></div>
+      <div><label>Elites kept per generation</label><input type="number" name="elite_keep" value="10"></div>
+    </div>
+    <div class="row">
+      <div><label>Monte Carlo sims (per full eval)</label><input type="number" name="mc_sims" value="1000"></div>
+      <div><label>Max generations (blank = run until STOP)</label><input type="number" name="max_generations" value=""></div>
+    </div>
+    <div><label>Initial account balance</label><input type="number" name="initial_balance" value="100000"></div>
+    <label style="margin-top:10px;">Strategy families to search (none checked = every family)</label>
+    {% for fam in families %}
+    <div class="checkbox-row"><input type="checkbox" name="families" value="{{ fam.name }}" id="fam_{{ loop.index }}"><label for="fam_{{ loop.index }}" style="margin:0;">{{ fam.description }} [{{ fam.name }}]</label></div>
+    {% endfor %}
+    <div class="checkbox-row" style="margin-top:10px;"><input type="checkbox" name="save_to_library" checked><label style="margin:0;">Save new elites to the Strategy Library (tagged "draft")</label></div>
+    <div class="checkbox-row"><input type="checkbox" name="resume_from_checkpoint" checked><label style="margin:0;">Resume from checkpoint if one exists for this data</label></div>
+  </div>
+
+  <button class="submit-btn" type="submit">Start Evolution Lab</button>
+</form>
+{% endif %}
+
+</div>
+</div>
+
+<script>
+  const fmt = (v, d) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Number(v).toFixed(d === undefined ? 2 : d);
+  const money = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : '$' + Number(v).toLocaleString(undefined, {maximumFractionDigits: 0});
+
+  function renderLeaderboard(rows) {
+    const tbody = document.getElementById('leaderboard-body');
+    tbody.innerHTML = '';
+    rows.forEach((c, i) => {
+      const stats = c.stats || {};
+      const mc = c.mc_summary || {};
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${i + 1}</td><td>${c.candidate_id}</td><td>${money(stats.net_profit)}</td>` +
+        `<td>${fmt(stats.profit_factor)}</td><td>${fmt(mc.evaluation_pass_probability, 1)}%</td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById('leaderboard-card').style.display = rows.length ? 'block' : 'none';
+  }
+
+  function renderJournal(entries) {
+    const body = document.getElementById('journal-body');
+    body.innerHTML = '';
+    (entries || []).slice().reverse().forEach(e => {
+      const div = document.createElement('div');
+      div.className = 'journal-entry';
+      div.textContent = e;
+      body.appendChild(div);
+    });
+    document.getElementById('journal-card').style.display = (entries || []).length ? 'block' : 'none';
+  }
+
+  function poll() {
+    fetch('/evolution/status.json')
+      .then(r => r.json())
+      .then(data => {
+        const badge = document.getElementById('status-badge');
+        badge.textContent = data.running ? 'RUNNING' : 'STOPPED';
+        badge.className = 'badge ' + (data.running ? 'running' : 'stopped');
+        document.getElementById('log').textContent = (data.log || []).slice(-100).join('\n') || 'No activity yet.';
+        document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+        if (data.started) {
+          document.getElementById('gen-num').textContent = data.generation;
+          renderLeaderboard(data.leaderboard || []);
+          renderJournal(data.journal || []);
+        }
+        // Reload the page if run state flips, so the start form / stop button swap correctly.
+        if (window._t58EvoRunning !== undefined && window._t58EvoRunning !== data.running) {
+          window.location.reload();
+        }
+        window._t58EvoRunning = data.running;
+        setTimeout(poll, 2500);
+      })
+      .catch(() => setTimeout(poll, 4000));
+  }
+  poll();
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

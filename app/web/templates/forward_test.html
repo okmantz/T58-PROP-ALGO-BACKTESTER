@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Forward Test (MT5)</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 14px; line-height: 1.6; font-size: 14px; color: #ddd; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card ul { margin: 8px 0 0; padding-left: 20px; }
+  .card li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+{% set active_page = active_page|default('forward_test') %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Forward test (MT5)</h1>
+  <p>This one stays desktop-only -- a platform constraint, not a bug.</p>
+</div>
+
+<div class="card">
+  <h2>Why this can't run here</h2>
+  <p>The desktop app's Forward Test tab talks directly to a MetaTrader 5 terminal running on the same Windows machine, via the <code>MetaTrader5</code> Python package -- which itself only works on Windows, and only against a terminal that's actually installed and logged in locally. There's no cloud/web equivalent of "the MT5 terminal on your desk" to connect to from a browser or from Cloud Run.</p>
+</div>
+
+<div class="card">
+  <h2>What this means practically</h2>
+  <ul>
+    <li>Use the T58-Prop-Algo-Backtester.exe (or `python -m app.main`) on Windows for live/demo MT5 forward testing -- that tab works exactly as before.</li>
+    <li>Everything else in this app -- backtesting, Full Pipeline, Search Lab, the Validation Lab tabs, Evolution Lab, the Strategy Library -- works identically whether you're on the desktop app or this web app.</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>If real web-based forward testing matters to you later</h2>
+  <p>The honest options, if this becomes a priority:</p>
+  <ul>
+    <li>Leave it desktop-only permanently (simplest, no new moving parts).</li>
+    <li>Build a small always-on Windows relay service (running wherever a real MT5 terminal lives) that this web app talks to over the network instead of importing the MT5 package directly -- a real project in its own right, not a quick port.</li>
+  </ul>
+</div>
+
+</div>
+</div>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

@@ -5,18 +5,26 @@ folder, instead of only ever guessing from its own training data.
 
 Design goals, in order:
   1. Zero setup: drop a PDF/text/markdown file in `research/`, nothing
-     else to configure. No vector database, no embedding model, no
-     internet call.
-  2. Cheap and deterministic: finding which excerpts are relevant to a
-     given strategy/gene context is a plain keyword-overlap score over
+     else to configure. Works with NO embedding model and NO Ollama
+     connection at all via the plain keyword-overlap scoring below.
+  2. Cheap and deterministic by default: finding which excerpts are
+     relevant to a given query is a plain keyword-overlap score over
      paragraph-sized chunks -- the same "systematic first, AI only where
      it must be" philosophy as app.optimize.gene_fitness_analysis and
-     app.validation.icir. This never calls Ollama itself; it only
-     prepares better CONTEXT for the one Ollama call that already exists
-     (see app.ai.ollama_client.suggest_parameter_adjustments).
-  3. Cheap to keep current: papers are re-parsed only when a file is
-     added, removed, or its modification time changes -- not on every
-     single call.
+     app.validation.icir.
+  3. Real semantic retrieval when available: pass an `OllamaSettings`
+     into `find_relevant_excerpts` / call `embed_index` first, and this
+     module blends in cosine-similarity search over local Ollama
+     embeddings (see app.ai.vector_store) -- catching excerpts that are
+     conceptually relevant but share few exact words with the query
+     ("volatility regime" query surfacing an "ATR-normalized breakout"
+     passage, for instance). This is the actual RAG layer: documents stay
+     on disk as plain text, only their vectors are stored, and retrieval
+     never sends anything to a cloud service -- the embedding model is
+     just another local Ollama pull, same as the chat model.
+  4. Cheap to keep current: papers are re-parsed (and re-embedded, if
+     embeddings are enabled) only when a file is added, removed, or its
+     modification time changes -- not on every single call.
 
 Supported file types: .pdf (via the optional `pypdf` package), .txt, .md.
 A PDF that fails to parse (scanned-image-only, corrupted, password-
@@ -28,6 +36,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from app.ai.ollama_settings import OllamaSettings
+from app.ai.vector_store import OllamaEmbedder, VectorStore, content_hash
+
+VECTOR_COLLECTION = "research"
 
 RESEARCH_DIR_NAME = "research"
 CHUNK_TARGET_CHARS = 900   # roughly a paragraph or two -- small enough to be a focused excerpt,
@@ -183,23 +196,14 @@ def _tokenize(text: str) -> list[str]:
     return [w for w in words if w not in _STOPWORDS]
 
 
-def find_relevant_excerpts(query: str, max_excerpts: int = 3, max_chars_per_excerpt: int = 700) -> list[dict]:
-    """Plain TF-style keyword-overlap scoring, no embeddings/ML dependency
-    -- scores each indexed chunk by how many of the query's (non-stopword)
-    terms it contains, weighted slightly toward rarer terms so a chunk
-    matching on "moving average" doesn't outscore one matching on a
-    specific, less-common term the query cares about. Returns [] with an
-    empty research/ folder or a query with no usable terms -- callers
-    should treat that exactly like having no research library at all.
-    """
-    chunks, _stats = build_index()
-    if not chunks:
-        return []
+def _keyword_scores(query: str, chunks: list[ResearchChunk]) -> dict[int, float]:
+    """Returns {chunk_index: score} for every chunk with nonzero
+    keyword overlap. Split out from find_relevant_excerpts so the hybrid
+    path below can call it directly against the SAME chunk list/indices
+    without re-tokenizing twice."""
     query_terms = set(_tokenize(query))
     if not query_terms:
-        return []
-
-    # Document frequency per term, for the rarity weighting mentioned above.
+        return {}
     doc_freq: dict[str, int] = {}
     chunk_tokens = []
     for chunk in chunks:
@@ -208,17 +212,135 @@ def find_relevant_excerpts(query: str, max_excerpts: int = 3, max_chars_per_exce
         for t in tokens & query_terms:
             doc_freq[t] = doc_freq.get(t, 0) + 1
 
-    scored = []
-    for chunk, tokens in zip(chunks, chunk_tokens):
+    scores: dict[int, float] = {}
+    for i, tokens in enumerate(chunk_tokens):
         overlap = tokens & query_terms
-        if not overlap:
-            continue
-        score = sum(1.0 / doc_freq[t] for t in overlap)
-        scored.append((score, chunk))
+        if overlap:
+            scores[i] = sum(1.0 / doc_freq[t] for t in overlap)
+    return scores
 
-    scored.sort(key=lambda sc: sc[0], reverse=True)
+
+def _chunk_item_id(chunk: ResearchChunk, index: int) -> str:
+    # Stable per (source file, position) so re-embedding an unchanged
+    # chunk is a no-op (VectorStore.has_current checks the text hash too,
+    # so an edited-but-same-position chunk is still correctly re-embedded).
+    return f"{chunk.source}::{index}"
+
+
+@dataclass
+class EmbedIndexStats:
+    chunks_embedded: int = 0     # newly embedded this call
+    chunks_already_current: int = 0
+    total_chunks: int = 0
+    error: str | None = None     # set only if embedding stopped early
+
+
+def embed_index(settings: OllamaSettings, embed_model: str | None = None) -> EmbedIndexStats:
+    """Embeds every research chunk not already stored with a current
+    vector, using a local Ollama embedding model. Safe to call before
+    every retrieval (like build_index()) -- chunks already embedded with
+    unchanged text cost nothing. Stops and reports `.error` at the first
+    embedding failure (Ollama unreachable, model not pulled) rather than
+    hammering an unreachable host once per remaining chunk; whatever was
+    already embedded in prior calls stays usable regardless."""
+    chunks, _stats = build_index()
+    store = VectorStore(VECTOR_COLLECTION)
+    result = EmbedIndexStats(total_chunks=len(chunks))
+    if not settings.is_usable:
+        result.error = "AI Assist is not enabled -- semantic search stays off, keyword search still works."
+        return result
+
+    embedder = OllamaEmbedder(settings, model=embed_model)
+    live_ids = set()
+    for i, chunk in enumerate(chunks):
+        item_id = _chunk_item_id(chunk, i)
+        live_ids.add(item_id)
+        if store.has_current(item_id, chunk.text):
+            result.chunks_already_current += 1
+            continue
+        vector, err = embedder.embed_one(chunk.text)
+        if err is not None:
+            result.error = err
+            return result  # stop early; leave the store as-is -- don't prune on a failed/partial pass
+        store.upsert(item_id, chunk.text, vector, metadata={"source": chunk.source})
+        result.chunks_embedded += 1
+
+    store.prune_to(live_ids)  # drop vectors for chunks from files that were edited/removed since
+    return result
+
+
+def find_relevant_excerpts(
+    query: str,
+    max_excerpts: int = 3,
+    max_chars_per_excerpt: int = 700,
+    settings: OllamaSettings | None = None,
+    embed_model: str | None = None,
+) -> list[dict]:
+    """Finds the excerpts most relevant to `query`.
+
+    With no `settings` (or AI Assist disabled/unreachable), behaves
+    exactly as before: plain TF-style keyword-overlap scoring, no
+    embeddings/ML dependency -- scores each indexed chunk by how many of
+    the query's (non-stopword) terms it contains, weighted slightly
+    toward rarer terms.
+
+    With a usable `settings`, blends in cosine-similarity search over
+    this app's local Ollama embeddings (see app.ai.vector_store) -- run
+    embed_index(settings) at least once first so there's something to
+    search; a chunk that has no stored vector yet (never embedded, or
+    embedding failed) simply falls back to its keyword-only score, so a
+    partially-embedded library still degrades gracefully rather than
+    silently hiding un-embedded papers.
+
+    Returns [] with an empty research/ folder or a query with no usable
+    terms and no semantic match either -- callers should treat that
+    exactly like having no research library at all.
+    """
+    chunks, _stats = build_index()
+    if not chunks:
+        return []
+
+    keyword_scores = _keyword_scores(query, chunks)
+    semantic_scores: dict[int, float] = {}
+
+    if settings is not None and settings.is_usable:
+        store = VectorStore(VECTOR_COLLECTION)
+        if len(store):
+            embedder = OllamaEmbedder(settings, model=embed_model)
+            query_vector, err = embedder.embed_one(query)
+            if query_vector is not None:
+                id_to_index = {_chunk_item_id(chunk, i): i for i, chunk in enumerate(chunks)}
+                for item_id, similarity, _meta in store.search(query_vector, top_k=max(20, max_excerpts * 5)):
+                    idx = id_to_index.get(item_id)
+                    if idx is not None and similarity > 0:
+                        semantic_scores[idx] = similarity
+
+    if not keyword_scores and not semantic_scores:
+        return []
+
+    # Normalize each score set to [0, 1] independently before blending, so
+    # neither scale (unbounded keyword-overlap sum vs. cosine similarity
+    # in [-1, 1]) dominates the other just because of its raw magnitude.
+    def _normalized(scores: dict[int, float]) -> dict[int, float]:
+        if not scores:
+            return {}
+        top = max(scores.values()) or 1.0
+        return {k: v / top for k, v in scores.items()}
+
+    kw_norm = _normalized(keyword_scores)
+    sem_norm = _normalized(semantic_scores)
+    # Weighted toward semantic when both are present -- it's the whole
+    # point of embedding the library in the first place -- but keyword
+    # score still contributes so an exact rare-term hit isn't buried
+    # under a vaguely-similar-sounding passage.
+    combined: dict[int, float] = {}
+    for idx in set(kw_norm) | set(sem_norm):
+        combined[idx] = 0.4 * kw_norm.get(idx, 0.0) + 0.6 * sem_norm.get(idx, 0.0)
+
+    ranked = sorted(combined.items(), key=lambda t: t[1], reverse=True)[:max_excerpts]
     results = []
-    for score, chunk in scored[:max_excerpts]:
+    for idx, score in ranked:
+        chunk = chunks[idx]
         text = chunk.text if len(chunk.text) <= max_chars_per_excerpt else chunk.text[:max_chars_per_excerpt] + "..."
         results.append({"source": chunk.source, "text": text, "score": round(score, 3)})
     return results

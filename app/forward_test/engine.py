@@ -96,6 +96,7 @@ class ForwardTestSession:
         self._open_trade_row_id: Optional[int] = None
         self._daily_realized_pnl = 0.0
         self._daily_key: Optional[str] = None
+        self._mt5_down = False  # tracks reconnect state across polls, for the recovered-log message
 
     # -- public controls ----------------------------------------------------
 
@@ -242,6 +243,19 @@ class ForwardTestSession:
             self._on_status(self.status)
 
     def _poll_once(self) -> None:
+        # Verify the MT5 connection is actually alive before touching it --
+        # a terminal restart, Windows update, or network blip otherwise
+        # leaves the session silently dead (every call below raising or
+        # returning None) until the user notices and manually restarts.
+        was_down = self._mt5_down
+        reconnect = self.connector.ensure_connected()
+        if not reconnect.ok:
+            self._mt5_down = True
+            self._log("error", f"MT5 connection lost, reconnect failed: {reconnect.message}")
+            return
+        self._mt5_down = False
+        if was_down:
+            self._log("info", "MT5 connection recovered -- resuming polling.")
         summary = self.connector.account_summary()
         if summary:
             self.status.balance = summary["balance"]

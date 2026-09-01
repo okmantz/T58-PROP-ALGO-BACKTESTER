@@ -260,11 +260,57 @@ class MT5Connector:
     def is_connected(self) -> bool:
         return self._connected
 
+    def is_alive(self) -> bool:
+        """Actually asks the terminal, instead of trusting the local
+        `_connected` flag left over from the last successful connect().
+        The package can report a stale `initialize()` success for a
+        terminal that has since been closed, lost its network link, or
+        logged out of the account -- both `terminal_info()` and
+        `account_info()` return None the moment that happens, which is
+        the only reliable signal available."""
+        if not self._connected or not is_available():
+            return False
+        try:
+            return mt5.terminal_info() is not None and mt5.account_info() is not None
+        except Exception:
+            return False
+
+    def ensure_connected(self, max_attempts: int = 3, retry_delay_seconds: float = 2.0) -> ConnectionResult:
+        """Verifies the connection is actually live and, if not,
+        transparently reconnects using the same stored credentials/path
+        instead of leaving the session silently dead until the user
+        notices and manually restarts it. Called at the top of every
+        forward-test poll. Returns the last ConnectionResult -- ok=True
+        means the caller can proceed with this poll as normal."""
+        if self.is_alive():
+            return ConnectionResult(ok=True, message="Connected.")
+        # Drop any stale handle before retrying -- initialize() on top of
+        # a half-dead connection is one of the more common causes of the
+        # generic -1 "internal failure" error.
+        if is_available():
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+        self._connected = False
+        last_result = ConnectionResult(ok=False, message="Not connected.")
+        for attempt in range(1, max_attempts + 1):
+            last_result = self.connect()
+            if last_result.ok:
+                return last_result
+            if attempt < max_attempts:
+                time.sleep(retry_delay_seconds)
+        return last_result
+
     def account_summary(self) -> Optional[dict]:
         if not self._connected:
             return None
         info = mt5.account_info()
         if info is None:
+            # The terminal/connection died since the last successful call --
+            # flip the flag so ensure_connected() knows to actually
+            # reconnect rather than silently returning None forever.
+            self._connected = False
             return None
         return {
             "login": info.login, "server": info.server, "balance": info.balance,

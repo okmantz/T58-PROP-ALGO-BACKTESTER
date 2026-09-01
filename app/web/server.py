@@ -46,6 +46,7 @@ from app.data.alpaca_source import (
 )
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
+from app.ensemble.ensemble import EnsembleError, EnsembleVoteConfig, run_ensemble_blend, run_ensemble_vote
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.multi_objective import (
     DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement,
@@ -54,11 +55,13 @@ from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, Refinemen
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
 from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
+from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
 from app.reports.refinement_report import generate_refinement_report
 from app.reports.validation_reports import (
-    generate_multi_objective_report, generate_walk_forward_report, generate_walkforward_ga_report,
+    generate_multi_objective_report, generate_portfolio_report, generate_walk_forward_report,
+    generate_walkforward_ga_report,
 )
 from app.reports import run_history
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
@@ -104,6 +107,10 @@ MULTI_OBJ_DIR = BASE_DIR / "reports" / "multi_objective"
 MULTI_OBJ_DIR.mkdir(parents=True, exist_ok=True)
 WFGA_DIR = BASE_DIR / "reports" / "walkforward_ga"
 WFGA_DIR.mkdir(parents=True, exist_ok=True)
+PORTFOLIO_DIR = BASE_DIR / "reports" / "portfolio"
+PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
+ENSEMBLE_DIR = BASE_DIR / "reports" / "ensemble"
+ENSEMBLE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -1772,6 +1779,217 @@ def wfga_job_status(job_id):
 @app.route("/wfga_reports/<path:filename>")
 def serve_wfga_report(filename):
     return send_from_directory(WFGA_DIR, filename)
+
+
+def _resolve_leg_dataset(form, files, prefix: str):
+    """Resolves ONE instrument leg's dataset for Portfolio -- unlike
+    _resolve_dataset (which picks a single active df for the whole page),
+    Portfolio needs N independent DataFrames at once, one per leg, so each
+    leg gets its own uploaded-file/stored-dataset pair under a distinct
+    form-field prefix (leg1_csv/leg1_existing_dataset, leg2_..., etc.).
+    Returns (df, label) or (None, None) if this leg wasn't filled in."""
+    uploaded = files.get(f"{prefix}_csv")
+    if uploaded and uploaded.filename:
+        content = uploaded.read()
+        result = import_csv_bytes(content)
+        if result.is_valid:
+            store_csv_bytes(content, uploaded.filename)
+            return result.dataframe, uploaded.filename
+        raise StrategyError(f"'{uploaded.filename}': {'; '.join(result.errors)}")
+    existing_choice = (form.get(f"{prefix}_existing_dataset") or "").strip()
+    if existing_choice:
+        candidate = get_raw_data_dir() / existing_choice
+        if candidate.exists():
+            result = import_csv_bytes(candidate.read_bytes())
+            if result.is_valid:
+                return result.dataframe, existing_choice
+    return None, None
+
+
+def _mode_from_filename(filename: str) -> str | None:
+    """Extension-based strategy-type detection for Ensemble's multi-file
+    leg upload, where (unlike every other form on this site) the mode
+    isn't already known from which tab/tab-button the person is on."""
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".py":
+        return "python"
+    if suffix in (".pine", ".pinescript", ".txt"):
+        return "pinescript"
+    if suffix in (".mq5", ".mqh"):
+        return "mql5"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Step 11: Multi-Asset Portfolio -- the SAME strategy config + SAME base
+# risk settings applied to N DIFFERENT instruments at once, correlation-
+# aware re-weighted and chained into one combined equity curve. Fast
+# enough (a handful of plain backtests, no GA) to run synchronously like
+# /run does, rather than the background-job/poll pattern the slower tabs
+# above need.
+# ---------------------------------------------------------------------------
+
+@app.route("/portfolio")
+def portfolio_form():
+    return render_template(
+        "portfolio.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES,
+    )
+
+
+@app.route("/portfolio/run", methods=["POST"])
+def portfolio_run():
+    form = request.form
+    ctx = lambda **kw: dict(stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **kw)
+    try:
+        strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+
+        legs: list[InstrumentLeg] = []
+        leg_labels = []
+        for i in range(1, 5):
+            prefix = f"leg{i}"
+            df, label = _resolve_leg_dataset(form, request.files, prefix)
+            if df is None:
+                continue
+            weight = float(form.get(f"{prefix}_weight", 1.0) or 1.0)
+            legs.append(InstrumentLeg(name=label, df=df, strategy=strategy, risk=risk, weight=weight))
+            leg_labels.append(label)
+
+        if len(legs) < 2:
+            return render_template("portfolio.html", **ctx(error="A portfolio needs at least 2 instrument legs -- fill in a market data file/dataset for at least 2 of the leg slots below.")), 400
+
+        config = PortfolioConfig(
+            initial_balance=risk.initial_balance,
+            correlation_penalty_strength=float(form.get("correlation_penalty_strength", 0.6) or 0.6),
+            max_instrument_weight_frac=float(form.get("max_instrument_weight_frac", 0.5) or 0.5),
+            min_weight_frac=float(form.get("min_weight_frac", 0.15) or 0.15),
+        )
+        result = run_portfolio_backtest(legs, config)
+        run_id = uuid.uuid4().hex[:10]
+        paths = generate_portfolio_report(PORTFOLIO_DIR, result, basename=f"portfolio_{run_id}")
+
+        return render_template("portfolio.html", **ctx(result={
+            "legs": leg_labels,
+            "trades": result.combined_statistics.total_trades,
+            "net_profit": result.combined_statistics.net_profit,
+            "max_dd": result.combined_statistics.max_drawdown_pct,
+            "sharpe": result.combined_statistics.sharpe_ratio,
+            "diversification_ratio": result.diversification_ratio,
+            "warnings": result.warnings,
+            "report_html": f"/portfolio_reports/{Path(paths['html']).name}",
+            "report_json": f"/portfolio_reports/{Path(paths['json']).name}",
+        }))
+    except (StrategyError, PortfolioError) as exc:
+        return render_template("portfolio.html", **ctx(error=str(exc))), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("portfolio.html", **ctx(error=f"Unexpected error: {exc}")), 500
+
+
+@app.route("/portfolio_reports/<path:filename>")
+def serve_portfolio_report(filename):
+    return send_from_directory(PORTFOLIO_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Step 12: Multi-Strategy Ensemble -- the mirror case of Portfolio: N
+# DIFFERENT strategies combined on the SAME instrument. "Blend" mode
+# reuses run_portfolio_backtest under the hood (fast, synchronous, same
+# report template). "Vote" mode is a single combined backtest + Monte
+# Carlo, same shape as /run.
+# ---------------------------------------------------------------------------
+
+@app.route("/ensemble")
+def ensemble_form():
+    return render_template(
+        "ensemble.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES,
+    )
+
+
+@app.route("/ensemble/run", methods=["POST"])
+def ensemble_run():
+    form = request.form
+    ctx = lambda **kw: dict(stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **kw)
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("ensemble.html", **ctx(error=dataset_error)), 400
+
+        strategies, names = [], []
+        for i in range(1, 5):
+            f = request.files.get(f"leg{i}_file")
+            if not f or not f.filename:
+                continue
+            mode = _mode_from_filename(f.filename)
+            if mode is None:
+                return render_template("ensemble.html", **ctx(error=f"'{f.filename}': unrecognized strategy file type (expected .py, .pine, or .mq5).")), 400
+            code = f.read().decode("utf-8", errors="replace")
+            try:
+                strategies.append(build_strategy_from_code(mode, code))
+            except StrategyError as exc:
+                return render_template("ensemble.html", **ctx(error=f"'{f.filename}': {exc}")), 400
+            names.append(Path(f.filename).stem)
+
+        if len(strategies) < 2:
+            return render_template("ensemble.html", **ctx(error="An ensemble needs at least 2 strategy legs -- upload at least 2 strategy files below (Python/PineScript/MQL5, mixing types is fine).")), 400
+
+        balance = float(form.get("initial_balance", 100000) or 100000)
+        risk = RiskConfig(initial_balance=balance)
+        mode = form.get("ensemble_mode", "blend")
+
+        if mode == "vote":
+            min_agreement = int(form.get("min_agreement", 2) or 2)
+            bt_result = run_ensemble_vote(df, strategies, risk, names=names, vote_config=EnsembleVoteConfig(min_agreement=min_agreement))
+            if not bt_result.trades:
+                return render_template("ensemble.html", **ctx(error="This vote ensemble produced zero trades on the given data -- nothing to report.")), 400
+            rules = PropRules(account_size=balance)
+            period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
+            pnls = [t.pnl for t in bt_result.trades]
+            dates = [t.entry_time for t in bt_result.trades]
+            single_run = simulate_account(pnls, dates, rules)
+            mc_result = run_monte_carlo(bt_result.trades, rules, MonteCarloConfig(n_simulations=int(form.get("n_sims", 2000) or 2000)))
+            run_id = uuid.uuid4().hex[:10]
+            paths = generate_full_report(
+                output_dir=ENSEMBLE_DIR, strategy_name=bt_result.strategy_name, strategy_source_type="ensemble_vote",
+                instrument=active_label, timeframe="unknown", backtest_period=period, backtest_result=bt_result,
+                prop_rules=rules, prop_single_run=single_run, monte_carlo_result=mc_result, basename=f"ensemble_vote_{run_id}",
+                risk_config=risk, price_df=df,
+            )
+            return render_template("ensemble.html", **ctx(result={
+                "mode": "vote", "legs": names, "trades": len(bt_result.trades),
+                "net_profit": bt_result.statistics.net_profit, "max_dd": bt_result.statistics.max_drawdown_pct,
+                "eval_pass_probability": mc_result.evaluation_pass_probability,
+                "report_html": f"/ensemble_reports/{Path(paths['html']).name}",
+                "report_json": f"/ensemble_reports/{Path(paths['json']).name}",
+            }))
+
+        config = PortfolioConfig(initial_balance=balance, correlation_penalty_strength=float(form.get("correlation_penalty_strength", 0.6) or 0.6))
+        result = run_ensemble_blend(df, strategies, risk, names=names, config=config)
+        run_id = uuid.uuid4().hex[:10]
+        paths = generate_portfolio_report(ENSEMBLE_DIR, result, basename=f"ensemble_blend_{run_id}")
+        return render_template("ensemble.html", **ctx(result={
+            "mode": "blend", "legs": names, "trades": result.combined_statistics.total_trades,
+            "net_profit": result.combined_statistics.net_profit, "max_dd": result.combined_statistics.max_drawdown_pct,
+            "sharpe": result.combined_statistics.sharpe_ratio, "diversification_ratio": result.diversification_ratio,
+            "warnings": result.warnings,
+            "report_html": f"/ensemble_reports/{Path(paths['html']).name}",
+            "report_json": f"/ensemble_reports/{Path(paths['json']).name}",
+        }))
+    except (StrategyError, EnsembleError, PortfolioError) as exc:
+        return render_template("ensemble.html", **ctx(error=str(exc))), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("ensemble.html", **ctx(error=f"Unexpected error: {exc}")), 500
+
+
+@app.route("/ensemble_reports/<path:filename>")
+def serve_ensemble_report(filename):
+    return send_from_directory(ENSEMBLE_DIR, filename)
 
 
 @app.route("/search")

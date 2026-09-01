@@ -52,7 +52,7 @@ as a workflow artifact — no local Python install needed to get the `.exe`:
 To build it locally on Windows instead:
 
 ```bat
-pip install -r requirements.txt pyinstaller
+pip install -r config/requirements.txt pyinstaller
 pyinstaller --noconfirm --onefile --windowed --name T58-Prop-Algo-Backtester ^
   --paths . --add-data "data/examples;data/examples" run_app.py
 ```
@@ -77,7 +77,7 @@ install — no manual file copying required.
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r config/requirements.txt
 
 python -m app.main                 # desktop GUI
 python -m app.main --cli --csv data/examples/EURUSD_5M_sample.csv --sims 10000   # headless
@@ -115,7 +115,7 @@ stay on while you use it from your phone.
 ### Alternative: run it from source
 
 ```bash
-pip install -r requirements.txt
+pip install -r config/requirements.txt
 python run_web.py
 ```
 
@@ -151,7 +151,7 @@ From your phone's browser:
      header/no-header are both auto-detected. Headerless 6-column files are
      assumed to be `timestamp, open, high, low, close, volume` in that order.
    - `.parquet` — read directly (requires the `pyarrow` package, already
-     listed in `requirements.txt` and bundled into both `.exe` builds).
+     listed in `config/requirements.txt` and bundled into both `.exe` builds).
    - `.zip` / `.7z` archives — opened automatically and whichever member
      inside looks like the actual OHLCV file (`.csv`/`.tsv`/`.txt`/`.parquet`)
      is read, skipping folders and OS junk like `__MACOSX/`/`.DS_Store`.
@@ -507,7 +507,7 @@ was built on MT5 instead.
 
 **Requirements:** Windows, a running MT5 terminal logged into a demo
 account (any MT5 broker's website offers a free demo signup), and
-`pip install MetaTrader5` (already conditional in `requirements.txt` on
+`pip install MetaTrader5` (already conditional in `config/requirements.txt` on
 Windows). On any other OS, or without the package, the tab explains this
 plainly instead of erroring.
 
@@ -916,7 +916,12 @@ also desktop-GUI-only for now; there's no CLI flag or web route for it yet.
 
 ```
 T58-Prop-Algo-Backtester/
-├── run_app.py                  # PyInstaller entry point (repo root — see .exe section)
+├── run_app.py                  # PyInstaller entry point (must stay at repo root — see .exe section)
+├── run_web.py                  # PyInstaller entry point, web/phone edition (must stay at repo root)
+├── config/                     # pyproject.toml, requirements.txt
+├── docker/                     # Dockerfile, .dockerignore (Cloud Run image)
+├── firebase/                   # firebase.json, .firebaserc, FIREBASE_DEPLOY.md
+├── docs/                       # WEB_PARITY_ROADMAP.md
 ├── app/
 │   ├── main.py                 # entry point (GUI, or --cli headless run — see CLI reference)
 │   ├── ui/
@@ -994,7 +999,7 @@ T58-Prop-Algo-Backtester/
 ## Tests
 
 ```bash
-pytest -q
+pytest -q tests
 ```
 
 ## Disclaimer

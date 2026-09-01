@@ -37,6 +37,7 @@ from flask import (
 from app.ai.ollama_settings import OllamaSettings
 from app.ai.ollama_settings import load_settings as load_ollama_settings
 from app.ai.ollama_settings import save_settings as save_ollama_settings
+from app.ai.research_agent import ResearchAgentContext, ResearchAgent
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data import alpaca_credentials
@@ -47,6 +48,7 @@ from app.data.alpaca_source import (
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
 from app.ensemble.ensemble import EnsembleError, EnsembleVoteConfig, run_ensemble_blend, run_ensemble_vote
+from app.evolution.engine import EvolutionConfig, EvolutionRunner
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.multi_objective import (
     DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement,
@@ -55,13 +57,14 @@ from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, Refinemen
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
 from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
+from app.orchestration.quick_optimize import QuickOptimizeConfig, run_quick_optimize
 from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
 from app.reports.refinement_report import generate_refinement_report
 from app.reports.validation_reports import (
-    generate_multi_objective_report, generate_portfolio_report, generate_walk_forward_report,
-    generate_walkforward_ga_report,
+    generate_cpcv_report, generate_multi_objective_report, generate_portfolio_report,
+    generate_sensitivity_report, generate_walk_forward_report, generate_walkforward_ga_report,
 )
 from app.reports import run_history
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
@@ -70,6 +73,8 @@ from app.search.strategy_space import (
     StrategySpaceError, family_description, generate_search_space, list_families,
 )
 from app.strategy.base import StrategyError
+from app.validation.cpcv import CPCVError, run_cpcv
+from app.validation.sensitivity import compute_1d_sensitivity
 from app.validation.walk_forward_opt import run_walk_forward_optimization
 from app.strategy.library import (
     STRATEGY_STATUSES, STRATEGY_TYPES, StrategyAlreadyExists, delete_many,
@@ -111,6 +116,12 @@ PORTFOLIO_DIR = BASE_DIR / "reports" / "portfolio"
 PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
 ENSEMBLE_DIR = BASE_DIR / "reports" / "ensemble"
 ENSEMBLE_DIR.mkdir(parents=True, exist_ok=True)
+CPCV_DIR = BASE_DIR / "reports" / "cpcv"
+CPCV_DIR.mkdir(parents=True, exist_ok=True)
+SENSITIVITY_DIR = BASE_DIR / "reports" / "sensitivity"
+SENSITIVITY_DIR.mkdir(parents=True, exist_ok=True)
+QUICK_OPT_DIR = BASE_DIR / "reports" / "quick_optimize"
+QUICK_OPT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -1990,6 +2001,565 @@ def ensemble_run():
 @app.route("/ensemble_reports/<path:filename>")
 def serve_ensemble_report(filename):
     return send_from_directory(ENSEMBLE_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Step 13: CPCV (Combinatorial Purged Cross-Validation) -- re-backtests one
+# strategy across every combinatorial train/test partition of purged,
+# embargoed groups, instead of trusting a single train/test split. Genuine
+# multi-candidate PBO (Probability of Backtest Overfitting) needs a POOL of
+# already-tried candidates (e.g. a Search Lab leaderboard or a Refinement
+# run's final generation) as input rather than a single strategy config, so
+# it isn't wired up here yet -- see WEB_PARITY_ROADMAP.md.
+# ---------------------------------------------------------------------------
+
+_CPCV_JOBS: dict[str, dict] = {}
+_CPCV_JOBS_LOCK = threading.Lock()
+
+
+def _cpcv_job_log(job_id: str, msg: str) -> None:
+    with _CPCV_JOBS_LOCK:
+        job = _CPCV_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_cpcv_job(job_id: str, df, strategy, risk: RiskConfig, n_groups: int, n_test_groups: int, embargo_frac: float, metric: str, robustness_threshold: float, max_paths: int) -> None:
+    try:
+        _cpcv_job_log(job_id, f"Running CPCV: {n_groups} groups, {n_test_groups} held out per path, metric={metric}...")
+        result = run_cpcv(
+            df, lambda: strategy, risk, n_groups=n_groups, n_test_groups=n_test_groups,
+            embargo_frac=embargo_frac, metric=metric, robustness_threshold=robustness_threshold, max_paths=max_paths,
+        )
+        _cpcv_job_log(job_id, f"Done: {result.n_paths} paths evaluated.")
+        paths = generate_cpcv_report(CPCV_DIR, result, basename=f"cpcv_{job_id}")
+        with _CPCV_JOBS_LOCK:
+            job = _CPCV_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+            job["report_html"] = f"/cpcv_reports/{Path(paths['html']).name}"
+            job["report_json"] = f"/cpcv_reports/{Path(paths['json']).name}"
+    except CPCVError as exc:
+        with _CPCV_JOBS_LOCK:
+            job = _CPCV_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        with _CPCV_JOBS_LOCK:
+            job = _CPCV_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/cpcv")
+def cpcv_form():
+    return render_template("cpcv.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), strategy_statuses=STRATEGY_STATUSES)
+
+
+@app.route("/cpcv/start", methods=["POST"])
+def cpcv_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("cpcv.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+        strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_value=float(form.get("risk_value", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _CPCV_JOBS_LOCK:
+            _CPCV_JOBS[job_id] = {"log": initial_log, "done": False, "error": None, "result": None, "started_at": time.time(), "instrument": active_label}
+        thread = threading.Thread(
+            target=_run_cpcv_job,
+            args=(
+                job_id, df, strategy, risk,
+                int(form.get("n_groups", 6) or 6), int(form.get("n_test_groups", 2) or 2),
+                float(form.get("embargo_frac", 0.01) or 0.01), form.get("metric", "profit_factor"),
+                float(form.get("robustness_threshold", 0.5) or 0.5), int(form.get("max_paths", 30) or 30),
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("cpcv_job", job_id=job_id))
+    except (StrategyError, CPCVError) as exc:
+        return render_template("cpcv.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("cpcv.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 500
+
+
+@app.route("/cpcv/job/<job_id>")
+def cpcv_job(job_id):
+    with _CPCV_JOBS_LOCK:
+        job = _CPCV_JOBS.get(job_id)
+    if job is None:
+        return render_template("cpcv_job.html", job_id=job_id, not_found=True), 404
+    return render_template("cpcv_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/cpcv/job/<job_id>/status.json")
+def cpcv_job_status(job_id):
+    with _CPCV_JOBS_LOCK:
+        job = _CPCV_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    result = job.get("result")
+    summary = None
+    if result is not None:
+        summary = result.to_dict()
+        summary["report_html"] = job.get("report_html")
+        summary["report_json"] = job.get("report_json")
+    return jsonify({"found": True, "done": job["done"], "error": job["error"], "log": job["log"], "instrument": job.get("instrument"), "summary": summary})
+
+
+@app.route("/cpcv_reports/<path:filename>")
+def serve_cpcv_report(filename):
+    return send_from_directory(CPCV_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Step 14: Parameter Sensitivity -- sweeps every tunable numeric parameter
+# independently across +/- a percent range, holding others fixed, and flags
+# any "cliff" (a narrow-edge parameter rather than a stable plateau). 1D
+# sweeps only for now; the 2D heatmap needs a two-step UI (discover tunable
+# parameter names, then pick 2) not yet built -- see WEB_PARITY_ROADMAP.md.
+# ---------------------------------------------------------------------------
+
+_SENS_JOBS: dict[str, dict] = {}
+_SENS_JOBS_LOCK = threading.Lock()
+
+
+def _sens_job_log(job_id: str, msg: str) -> None:
+    with _SENS_JOBS_LOCK:
+        job = _SENS_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_sensitivity_job(job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig, metric: str, pct_range: float, n_steps: int, max_params: int) -> None:
+    try:
+        _sens_job_log(job_id, f"Sweeping up to {max_params} tunable parameter(s), {n_steps} steps each, metric={metric}...")
+        results = compute_1d_sensitivity(df, strategy, risk, rules, mc_cfg, metric=metric, pct_range=pct_range, n_steps=n_steps, max_params=max_params)
+        _sens_job_log(job_id, f"Done: swept {len(results)} parameter(s).")
+        paths = generate_sensitivity_report(SENSITIVITY_DIR, results, basename=f"sensitivity_{job_id}")
+        with _SENS_JOBS_LOCK:
+            job = _SENS_JOBS[job_id]
+            job["done"] = True
+            job["results"] = results
+            job["report_html"] = f"/sensitivity_reports/{Path(paths['html']).name}"
+            job["report_json"] = f"/sensitivity_reports/{Path(paths['json']).name}"
+    except RefinementError as exc:
+        with _SENS_JOBS_LOCK:
+            job = _SENS_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        with _SENS_JOBS_LOCK:
+            job = _SENS_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/sensitivity")
+def sensitivity_form():
+    return render_template("sensitivity.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), strategy_statuses=STRATEGY_STATUSES)
+
+
+@app.route("/sensitivity/start", methods=["POST"])
+def sensitivity_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("sensitivity.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+        strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(initial_balance=float(form.get("initial_balance", 100000)), pip_size=float(form.get("pip_size", 0.0001)))
+        rules = PropRules(account_size=float(form.get("account_size", 100000)))
+        mc_cfg = MonteCarloConfig(n_simulations=int(form.get("mc_sims", 500) or 500))
+
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _SENS_JOBS_LOCK:
+            _SENS_JOBS[job_id] = {"log": initial_log, "done": False, "error": None, "results": None, "started_at": time.time(), "instrument": active_label}
+        thread = threading.Thread(
+            target=_run_sensitivity_job,
+            args=(
+                job_id, df, strategy, risk, rules, mc_cfg, form.get("metric", "profit_factor"),
+                float(form.get("pct_range", 0.5) or 0.5), int(form.get("n_steps", 9) or 9), int(form.get("max_params", 8) or 8),
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("sensitivity_job", job_id=job_id))
+    except (StrategyError, RefinementError) as exc:
+        return render_template("sensitivity.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("sensitivity.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 500
+
+
+@app.route("/sensitivity/job/<job_id>")
+def sensitivity_job(job_id):
+    with _SENS_JOBS_LOCK:
+        job = _SENS_JOBS.get(job_id)
+    if job is None:
+        return render_template("sensitivity_job.html", job_id=job_id, not_found=True), 404
+    return render_template("sensitivity_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/sensitivity/job/<job_id>/status.json")
+def sensitivity_job_status(job_id):
+    with _SENS_JOBS_LOCK:
+        job = _SENS_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    results = job.get("results")
+    summary = None
+    if results is not None:
+        summary = {
+            "sweeps": [r.to_dict() for r in results],
+            "report_html": job.get("report_html"),
+            "report_json": job.get("report_json"),
+        }
+    return jsonify({"found": True, "done": job["done"], "error": job["error"], "log": job["log"], "instrument": job.get("instrument"), "summary": summary})
+
+
+@app.route("/sensitivity_reports/<path:filename>")
+def serve_sensitivity_report(filename):
+    return send_from_directory(SENSITIVITY_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Quick Optimize -- one-click single-strategy GA tune from the Strategy
+# Library (reuses the same walk-forward-aware GA as Full Pipeline/Step 06,
+# saves the winner back into the library tagged "draft"). Same background-
+# job/poll pattern as the other GA-driven tabs.
+# ---------------------------------------------------------------------------
+
+_QUICKOPT_JOBS: dict[str, dict] = {}
+_QUICKOPT_JOBS_LOCK = threading.Lock()
+
+
+def _quickopt_job_log(job_id: str, msg: str) -> None:
+    with _QUICKOPT_JOBS_LOCK:
+        job = _QUICKOPT_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_quickopt_job(job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, cfg: QuickOptimizeConfig) -> None:
+    try:
+        result = run_quick_optimize(df, strategy, risk, rules, cfg, progress_cb=lambda msg: _quickopt_job_log(job_id, msg))
+        with _QUICKOPT_JOBS_LOCK:
+            job = _QUICKOPT_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+    except RefinementError as exc:
+        with _QUICKOPT_JOBS_LOCK:
+            job = _QUICKOPT_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        with _QUICKOPT_JOBS_LOCK:
+            job = _QUICKOPT_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/quick-optimize")
+def quickopt_form():
+    return render_template("quick_optimize.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), strategy_statuses=STRATEGY_STATUSES, fitness_metrics=FITNESS_METRICS)
+
+
+@app.route("/quick-optimize/start", methods=["POST"])
+def quickopt_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("quick_optimize.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+        strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(initial_balance=float(form.get("initial_balance", 100000)), pip_size=float(form.get("pip_size", 0.0001)))
+        rules = PropRules(account_size=float(form.get("account_size", 100000)))
+        cfg = QuickOptimizeConfig(
+            ga_population=int(form.get("ga_population", 16) or 16),
+            ga_generations=int(form.get("ga_generations", 8) or 8),
+            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            n_folds=int(form.get("n_folds", 4) or 4),
+            save_to_library=form.get("save_to_library", "on") == "on",
+        )
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _QUICKOPT_JOBS_LOCK:
+            _QUICKOPT_JOBS[job_id] = {"log": initial_log, "done": False, "error": None, "result": None, "started_at": time.time(), "instrument": active_label}
+        thread = threading.Thread(target=_run_quickopt_job, args=(job_id, df, strategy, risk, rules, cfg), daemon=True)
+        thread.start()
+        return redirect(url_for("quickopt_job", job_id=job_id))
+    except (StrategyError, RefinementError) as exc:
+        return render_template("quick_optimize.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("quick_optimize.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 500
+
+
+@app.route("/quick-optimize/job/<job_id>")
+def quickopt_job(job_id):
+    with _QUICKOPT_JOBS_LOCK:
+        job = _QUICKOPT_JOBS.get(job_id)
+    if job is None:
+        return render_template("quick_optimize_job.html", job_id=job_id, not_found=True), 404
+    return render_template("quick_optimize_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/quick-optimize/job/<job_id>/status.json")
+def quickopt_job_status(job_id):
+    with _QUICKOPT_JOBS_LOCK:
+        job = _QUICKOPT_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    result = job.get("result")
+    summary = None
+    if result is not None:
+        summary = {
+            "strategy_display_name": result.strategy_display_name,
+            "baseline_trades": result.baseline_trades, "baseline_net_profit": result.baseline_net_profit,
+            "baseline_win_rate": result.baseline_win_rate, "baseline_eval_pass_probability": result.baseline_eval_pass_probability,
+            "optimized_trades": result.optimized_trades, "optimized_net_profit": result.optimized_net_profit,
+            "optimized_win_rate": result.optimized_win_rate, "optimized_eval_pass_probability": result.optimized_eval_pass_probability,
+            "improved": result.improved,
+            "saved_library_note": result.saved_library_note,
+            "elapsed_seconds": result.elapsed_seconds,
+            "warnings": result.warnings,
+        }
+    return jsonify({"found": True, "done": job["done"], "error": job["error"], "log": job["log"], "instrument": job.get("instrument"), "summary": summary})
+
+
+# ---------------------------------------------------------------------------
+# Evolution Lab -- an open-ended, resumable multi-family GA search that
+# runs generation after generation until STOP is clicked (or the process
+# restarts, in which case its own on-disk checkpoint resumes it). Unlike
+# every other tab above, this isn't a "start a job, wait for it to finish"
+# shape -- app.evolution.engine.EvolutionRunner already owns its own
+# background thread and start()/stop()/status() control surface, so the
+# web app holds ONE global runner instance (matches this app's existing
+# single-user/LAN trust model) and drives it directly rather than
+# reimplementing job management around it.
+# ---------------------------------------------------------------------------
+
+_EVOLUTION_RUNNER: EvolutionRunner | None = None
+_EVOLUTION_LOCK = threading.Lock()
+_EVOLUTION_LOG: list[str] = []
+_EVOLUTION_LOG_MAX = 500
+
+
+def _evolution_log(msg: str) -> None:
+    _EVOLUTION_LOG.append(msg)
+    del _EVOLUTION_LOG[:-_EVOLUTION_LOG_MAX]
+
+
+@app.route("/evolution")
+def evolution_form():
+    return render_template(
+        "evolution.html", stored_datasets=list_stored_datasets(),
+        families=[{"name": n, "description": family_description(n)} for n in list_families()],
+        running=(_EVOLUTION_RUNNER is not None and _EVOLUTION_RUNNER.is_running),
+    )
+
+
+@app.route("/evolution/start", methods=["POST"])
+def evolution_start():
+    global _EVOLUTION_RUNNER
+    form = request.form
+    with _EVOLUTION_LOCK:
+        if _EVOLUTION_RUNNER is not None and _EVOLUTION_RUNNER.is_running:
+            return redirect(url_for("evolution_form"))
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("evolution.html", error=dataset_error, stored_datasets=list_stored_datasets(), families=[{"name": n, "description": family_description(n)} for n in list_families()], running=False), 400
+
+        risk = RiskConfig(initial_balance=float(form.get("initial_balance", 100000) or 100000))
+        rules = PropRules(account_size=float(form.get("initial_balance", 100000) or 100000))
+        families_selected = form.getlist("families") or None
+        cfg = EvolutionConfig(
+            population_size=int(form.get("population_size", 60) or 60),
+            elite_keep=int(form.get("elite_keep", 10) or 10),
+            families=families_selected,
+            mc_sims=int(form.get("mc_sims", 1000) or 1000),
+            max_generations=(int(form["max_generations"]) if form.get("max_generations") else None),
+            save_to_library=form.get("save_to_library", "on") == "on",
+            resume_from_checkpoint=form.get("resume_from_checkpoint", "on") == "on",
+        )
+        _EVOLUTION_LOG.clear()
+        _EVOLUTION_LOG.append(f"Loaded {len(df)} bars from {active_label}.")
+        with _EVOLUTION_LOCK:
+            _EVOLUTION_RUNNER = EvolutionRunner(df, risk, rules, cfg, progress_cb=_evolution_log)
+            _EVOLUTION_RUNNER.start()
+        return redirect(url_for("evolution_form"))
+    except Exception as exc:  # noqa: BLE001
+        return render_template("evolution.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), families=[{"name": n, "description": family_description(n)} for n in list_families()], running=False), 500
+
+
+@app.route("/evolution/stop", methods=["POST"])
+def evolution_stop():
+    with _EVOLUTION_LOCK:
+        if _EVOLUTION_RUNNER is not None:
+            _EVOLUTION_RUNNER.stop()
+    return redirect(url_for("evolution_form"))
+
+
+@app.route("/evolution/reset", methods=["POST"])
+def evolution_reset():
+    with _EVOLUTION_LOCK:
+        if _EVOLUTION_RUNNER is not None and not _EVOLUTION_RUNNER.is_running:
+            _EVOLUTION_RUNNER.reset()
+            _EVOLUTION_LOG.clear()
+    return redirect(url_for("evolution_form"))
+
+
+@app.route("/evolution/status.json")
+def evolution_status():
+    with _EVOLUTION_LOCK:
+        runner = _EVOLUTION_RUNNER
+    if runner is None:
+        return jsonify({"running": False, "started": False, "log": [], "leaderboard": [], "journal": []})
+    status = runner.status()
+    leaderboard = [r.to_checkpoint_dict() for r in runner.leaderboard]
+    return jsonify({
+        "started": True,
+        "running": status["running"],
+        "generation": status["generation"],
+        "leaderboard_size": status["leaderboard_size"],
+        "resumed": status["resumed"],
+        "log": list(_EVOLUTION_LOG),
+        "leaderboard": leaderboard,
+        "journal": runner.journal[-30:],
+    })
+
+
+# ---------------------------------------------------------------------------
+# 18. Research Agent -- a ReAct-style tool-calling agent whose tools are
+# 100% read-only calls into the real backtest/prop-sim/Monte Carlo/walk-
+# forward/regime/sensitivity/cost-stress engine (see app.ai.research_agent
+# -- no code-editing tool exists, so it can only recommend, never apply).
+# Needs a local Ollama reachable from wherever this server runs -- see the
+# AI Assist note on the Full Pipeline page for what that means if this app
+# is deployed to Cloud Run rather than run locally/on a LAN.
+# ---------------------------------------------------------------------------
+
+_AGENT_JOBS: dict[str, dict] = {}
+_AGENT_JOBS_LOCK = threading.Lock()
+
+
+def _agent_job_log(job_id: str, msg: str) -> None:
+    with _AGENT_JOBS_LOCK:
+        job = _AGENT_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_agent_job(job_id: str, question: str, ctx: ResearchAgentContext, settings: OllamaSettings) -> None:
+    try:
+        agent = ResearchAgent(settings)
+        result = agent.run(question, ctx, progress_cb=lambda msg: _agent_job_log(job_id, msg))
+        with _AGENT_JOBS_LOCK:
+            job = _AGENT_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+    except Exception as exc:  # noqa: BLE001
+        with _AGENT_JOBS_LOCK:
+            job = _AGENT_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/research-agent")
+def research_agent_form():
+    saved_ai = load_ollama_settings()
+    return render_template(
+        "research_agent.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES, ai_enabled=saved_ai.enabled, ai_host=saved_ai.host, ai_model=saved_ai.model,
+    )
+
+
+@app.route("/research-agent/start", methods=["POST"])
+def research_agent_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("research_agent.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), ai_enabled=False, ai_host="", ai_model=""), 400
+
+        strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(initial_balance=float(form.get("initial_balance", 100000) or 100000), pip_size=float(form.get("pip_size", 0.0001) or 0.0001))
+        rules = PropRules(account_size=float(form.get("account_size", 100000) or 100000))
+        question = (form.get("question") or "").strip()
+        if not question:
+            return render_template("research_agent.html", error="Enter a question for the agent to investigate.", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), ai_enabled=False, ai_host="", ai_model=""), 400
+
+        settings = OllamaSettings(enabled=True, host=form.get("ai_host", "http://localhost:11434") or "http://localhost:11434", model=form.get("ai_model", "llama3.1") or "llama3.1")
+        try:
+            save_ollama_settings(settings)
+        except Exception:
+            pass
+
+        ctx = ResearchAgentContext(
+            df=df, strategy_builder=(lambda s=strategy: s), strategy_name=getattr(strategy, "name", "Strategy"),
+            source_type=strategy.source_type, risk=risk, prop_rules=rules, instrument=active_label,
+        )
+
+        job_id = uuid.uuid4().hex[:12]
+        with _AGENT_JOBS_LOCK:
+            _AGENT_JOBS[job_id] = {"log": [f"Loaded {len(df)} bars from {active_label}.", f"Question: {question}"], "done": False, "error": None, "result": None, "started_at": time.time()}
+        thread = threading.Thread(target=_run_agent_job, args=(job_id, question, ctx, settings), daemon=True)
+        thread.start()
+        return redirect(url_for("research_agent_job", job_id=job_id))
+    except StrategyError as exc:
+        return render_template("research_agent.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), ai_enabled=False, ai_host="", ai_model=""), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("research_agent.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), ai_enabled=False, ai_host="", ai_model=""), 500
+
+
+@app.route("/research-agent/job/<job_id>")
+def research_agent_job(job_id):
+    with _AGENT_JOBS_LOCK:
+        job = _AGENT_JOBS.get(job_id)
+    if job is None:
+        return render_template("research_agent_job.html", job_id=job_id, not_found=True), 404
+    return render_template("research_agent_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/research-agent/job/<job_id>/status.json")
+def research_agent_job_status(job_id):
+    with _AGENT_JOBS_LOCK:
+        job = _AGENT_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    result = job.get("result")
+    summary = None
+    if result is not None:
+        summary = {
+            "final_answer": result.final_answer,
+            "error": result.error,
+            "stopped_reason": result.stopped_reason,
+            "steps": [
+                {"step_index": s.step_index, "thought": s.thought, "action": s.action, "action_input": s.action_input, "observation": s.observation, "note": s.note}
+                for s in result.steps
+            ],
+        }
+    return jsonify({"found": True, "done": job["done"], "error": job["error"], "log": job["log"], "summary": summary})
+
+
+@app.route("/forward-test")
+def forward_test_info():
+    return render_template("forward_test.html")
 
 
 @app.route("/search")

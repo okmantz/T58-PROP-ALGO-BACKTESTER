@@ -664,6 +664,90 @@ logged once, never blocking the run. An optional API key field supports
 pointing this at a remote/proxied Ollama endpoint behind auth instead of
 a local install, for anyone running it that way.
 
+## Step 18 — AI Research Engine (RAG + Research Agent)
+
+AI Assist's numeric-only parameter suggestions and the Strategy Generator's
+one-shot code drafts are single request/response calls. The **AI Research
+Agent** (Step 18) is a meaningfully bigger step: a local Ollama model
+investigates a strategy across several reasoning steps by calling a fixed
+toolbox of read-only analysis actions, each of which runs this app's own
+already-validated engine — never a guess, never invented numbers.
+
+```
+RESEARCH LIBRARY                    T58 RESEARCH MEMORY
+research/ papers, books,            every strategy this app has
+your own notes                      ever tested (SQLite + semantic index)
+        │                                   │
+        └───────────────┬───────────────────┘
+                         ↓
+              local Ollama embeddings
+           (e.g. `ollama pull nomic-embed-text`)
+                         ↓
+                  local vector store
+                (data/ai_memory/*.json)
+                         ↓
+              T58 AI RESEARCH AGENT (Ollama)
+                         │
+     proposes which tool to call next, reasons over
+     the result, repeats up to N steps, then answers
+                         ↓
+        run_backtest / run_prop_simulation / run_monte_carlo /
+        run_walk_forward / run_regime_analysis /
+        run_parameter_sensitivity / run_cost_stress /
+        compare_strategies / search_research / search_experiments
+                         ↓
+              T58's real backtest/prop/Monte Carlo engine
+                (the same one every other tab uses)
+```
+
+**The one rule that matters:** the quantitative engine is the authority,
+never the model's own judgment. There is no `edit_strategy_code` or
+`apply_parameters` tool — the agent can recommend a next step in plain
+language ("test tightening the ATR filter — the sensitivity sweep shows a
+cliff there"), but turning that into a tested strategy still goes through
+Step 6 Iterative Refinement / Quick Optimize / Step 15 Full Pipeline, same
+as a human-typed idea would.
+
+**Three layers, in the order they're worth setting up:**
+
+1. **RAG over your research library** (`research/` folder — unchanged
+   location from AI Assist). `app.ai.research_library` now does hybrid
+   retrieval: plain keyword-overlap scoring always works with zero setup,
+   and blends in real semantic search once you pull a local embedding
+   model and hit **EMBED RESEARCH LIBRARY** on the Research Agent tab. No
+   cloud API, no vector-database server — embeddings are stored locally
+   as plain JSON under `data/ai_memory/`.
+2. **T58 Research Memory** (`app.ai.experiment_memory`) — every Full
+   Pipeline run, Quick Optimize run, and Batch Test item is automatically
+   recorded (strategy, verdict, stats, and any lesson learned) into a
+   local SQLite database, searchable semantically the same way as the
+   paper library. Click **REFRESH MEMORY SUMMARY** on the tab to see the
+   running totals (how many strategies tested, broken down by verdict).
+3. **The agent loop itself** — type a research question, hit **RUN
+   RESEARCH AGENT**. It automatically uses the strategy/data/prop
+   rules/risk already configured in Steps 01-04, exactly like Full
+   Pipeline does.
+
+Fine-tuning a model on your own accumulated experiments (Level 2 in the
+original research-engine plan) is intentionally not built yet — RAG plus
+the growing Research Memory table gets most of the value with none of the
+training infrastructure, and the memory table itself is exactly the
+dataset a future fine-tune would need.
+
+**Setup**, on top of the AI Assist setup above:
+
+1. `ollama pull nomic-embed-text` (or another embedding model) for
+   semantic search — optional; without it, `search_research` and
+   `search_experiments` still work via plain keyword matching.
+2. Open the **18 Research Agent** tab, confirm **AI Assist** is enabled
+   and Test Connection passes, optionally click **EMBED RESEARCH
+   LIBRARY**, type a research question, and click **RUN RESEARCH AGENT**.
+
+Off by default, everywhere, and fails exactly the same way AI Assist does:
+an unreachable/misconfigured Ollama surfaces a clear error in the
+transcript rather than a stack trace, and nothing here ever runs
+automatically as part of any other tab's workflow.
+
 ## PineScript support (subset)
 
 Supported: `open/high/low/close/hl2/hlc3/ohlc4`, `input.int`/`input.float`,
@@ -780,7 +864,8 @@ exclusive with the others and with `--search`/plain `--cli`; pick one per
 invocation. All write their report(s) under `--output` (default `reports/`).
 
 AI Assist (above) is currently desktop-GUI-only — `--full-pipeline` runs
-the same search headlessly without it.
+the same search headlessly without it. The AI Research Agent (Step 18) is
+also desktop-GUI-only for now; there's no CLI flag or web route for it yet.
 
 ## MVP scope decisions
 
@@ -835,7 +920,7 @@ T58-Prop-Algo-Backtester/
 ├── app/
 │   ├── main.py                 # entry point (GUI, or --cli headless run — see CLI reference)
 │   ├── ui/
-│   │   ├── main_window.py      # Tkinter desktop GUI (Steps 1-7 core, 8-13 Validation Lab, 14 Ensemble, 15 Full Pipeline, 16 Forward Test, 17 Evolution Lab)
+│   │   ├── main_window.py      # Tkinter desktop GUI (Steps 1-7 core, 8-13 Validation Lab, 14 Ensemble, 15 Full Pipeline, 16 Forward Test, 17 Evolution Lab, 18 AI Research Agent)
 │   │   └── condition_builder.py  # visual condition-row widget used by the Manual Builder
 │   ├── web/                    # Flask mobile/web app (same engine, new front end)
 │   │   ├── server.py
@@ -865,9 +950,14 @@ T58-Prop-Algo-Backtester/
 │   │   ├── checkpoint.py          # on-disk checkpoint (resume) + tested-candidates log
 │   │   ├── prop_fitness.py        # composite PROP FITNESS ranking score
 │   │   └── knowledge_graph.py     # append-only feature-vector -> outcome log + similarity queries
-│   ├── ai/                        # optional local-Ollama AI Assist (off by default)
+│   ├── ai/                        # optional local-Ollama AI Assist + AI Research Engine (off by default)
 │   │   ├── ollama_client.py       # connection test + per-generation parameter-suggestion requests
-│   │   └── ollama_settings.py     # persisted host/model/API-key settings (keyring-backed)
+│   │   ├── ollama_settings.py     # persisted host/model/API-key settings (keyring-backed)
+│   │   ├── strategy_generator.py  # drafts a new strategy file from a plain-language idea (tagged DRAFT)
+│   │   ├── research_library.py    # research/ paper library: keyword + (optional) semantic RAG retrieval
+│   │   ├── vector_store.py        # local embedding store (Ollama /api/embeddings + cosine similarity, JSON-backed)
+│   │   ├── experiment_memory.py   # Step 18: durable + semantically-searchable record of every strategy test
+│   │   └── research_agent.py      # Step 18: ReAct tool-calling research agent over the real engine
 │   ├── optimize/
 │   │   ├── parameter_space.py / code_parameter_space.py   # shared gene discovery (all 4 strategy sources)
 │   │   ├── refinement.py         # Step 6: Iterative Refinement GA

@@ -34,6 +34,9 @@ from flask import (
     Flask, Response, jsonify, redirect, render_template, request, send_from_directory, url_for,
 )
 
+from app.ai.ollama_settings import OllamaSettings
+from app.ai.ollama_settings import load_settings as load_ollama_settings
+from app.ai.ollama_settings import save_settings as save_ollama_settings
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.data import alpaca_credentials
@@ -44,9 +47,12 @@ from app.data.alpaca_source import (
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
+from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, RefinementError, run_iterative_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
+from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
+from app.reports.refinement_report import generate_refinement_report
 from app.reports import run_history
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
 from app.search.search_report import generate_search_report
@@ -80,6 +86,10 @@ REPORTS_DIR = BASE_DIR / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 SEARCH_DIR = BASE_DIR / "reports" / "search"
 SEARCH_DIR.mkdir(parents=True, exist_ok=True)
+REFINEMENT_DIR = BASE_DIR / "reports" / "refinement"
+REFINEMENT_DIR.mkdir(parents=True, exist_ok=True)
+FULL_PIPELINE_DIR = BASE_DIR / "reports" / "full_pipeline"
+FULL_PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -937,6 +947,394 @@ def _run_search_job(
             job = _SEARCH_JOBS[job_id]
             job["done"] = True
             job["error"] = str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Iterative Refinement (Step 6 on desktop) -- same "background job, poll for
+# status" shape as Search Lab above, since a multi-generation GA run over a
+# few hundred backtests is too slow for a single request/response cycle.
+# ---------------------------------------------------------------------------
+
+_REFINEMENT_JOBS: dict[str, dict] = {}
+_REFINEMENT_JOBS_LOCK = threading.Lock()
+
+
+def _refinement_job_log(job_id: str, msg: str) -> None:
+    with _REFINEMENT_JOBS_LOCK:
+        job = _REFINEMENT_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_refinement_job(
+    job_id: str, df, strategy, risk: RiskConfig, rules: PropRules,
+    mc_cfg: MonteCarloConfig, cfg: RefinementConfig, active_label: str,
+    library_ref: tuple[str, str] | None = None,
+) -> None:
+    try:
+        result = run_iterative_refinement(
+            df, strategy, risk, rules, mc_cfg, cfg,
+            progress_cb=lambda msg: _refinement_job_log(job_id, msg),
+        )
+        period = (str(df["timestamp"].iloc[0]), str(df["timestamp"].iloc[-1]))
+        paths = generate_refinement_report(
+            output_dir=REFINEMENT_DIR, result=result,
+            strategy_name=getattr(strategy, "name", "Strategy"),
+            instrument=active_label, timeframe="unknown", backtest_period=period,
+            basename=f"refinement_{job_id}", price_df=df,
+        )
+        if library_ref:
+            try:
+                record_backtest_result(*library_ref, {
+                    "note": "iterative refinement run",
+                    "best_fitness": round(result.best.fitness, 4),
+                    "generations": cfg.generations,
+                    "report_html": f"/refinement_reports/{paths['html'].name}",
+                })
+            except (FileNotFoundError, ValueError):
+                pass
+        with _REFINEMENT_JOBS_LOCK:
+            job = _REFINEMENT_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+            job["report_html"] = f"/refinement_reports/{paths['html'].name}"
+            job["report_json"] = f"/refinement_reports/{paths['json'].name}"
+            best_file_key = "best_config_json" if "best_config_json" in paths else "best_strategy_file"
+            job["best_file"] = f"/refinement_reports/{paths[best_file_key].name}"
+    except RefinementError as exc:
+        with _REFINEMENT_JOBS_LOCK:
+            job = _REFINEMENT_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001 -- must surface on the status page, not crash the thread silently
+        with _REFINEMENT_JOBS_LOCK:
+            job = _REFINEMENT_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/refine")
+def refine_form():
+    return render_template(
+        "refine.html",
+        stored_datasets=list_stored_datasets(),
+        saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES,
+    )
+
+
+@app.route("/refine/start", methods=["POST"])
+def refine_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("refine.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+
+        strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            max_trades_per_day=int(form.get("max_trades_day", 10)),
+            commission_per_trade=float(form.get("commission", 0)),
+            slippage_pips=float(form.get("slippage_pips", 0.5)),
+            spread_pips=float(form.get("spread_pips", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000)),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+            max_drawdown_pct=float(form.get("max_dd", 10)),
+        )
+        mc_cfg = MonteCarloConfig(n_simulations=int(form.get("n_sims", 2000) or 2000))
+
+        cfg = RefinementConfig(
+            enabled=True,
+            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            population_size=int(form.get("population_size", 10) or 10),
+            generations=int(form.get("generations", 5) or 5),
+            elite_count=int(form.get("elite_count", 2) or 2),
+            mutation_rate=float(form.get("mutation_rate", 0.35) or 0.35),
+            mutation_strength=float(form.get("mutation_strength", 0.25) or 0.25),
+            random_immigrants_frac=float(form.get("random_immigrants_frac", 0.15) or 0.15),
+            search_monte_carlo_sims=int(form.get("search_mc_sims", 500) or 500),
+            cost_stress_enabled=form.get("cost_stress_enabled") == "on",
+            cost_stress_multiplier=float(form.get("cost_stress_multiplier", 2.0) or 2.0),
+        )
+
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _REFINEMENT_JOBS_LOCK:
+            _REFINEMENT_JOBS[job_id] = {
+                "log": initial_log, "done": False, "error": None, "result": None,
+                "started_at": time.time(), "instrument": active_label,
+            }
+        thread = threading.Thread(
+            target=_run_refinement_job,
+            args=(job_id, df, strategy, risk, rules, mc_cfg, cfg, active_label, library_ref),
+            daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("refine_job", job_id=job_id))
+
+    except (StrategyError, RefinementError) as exc:
+        return render_template("refine.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("refine.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 500
+
+
+@app.route("/refine/job/<job_id>")
+def refine_job(job_id):
+    with _REFINEMENT_JOBS_LOCK:
+        job = _REFINEMENT_JOBS.get(job_id)
+    if job is None:
+        return render_template("refine_job.html", job_id=job_id, not_found=True), 404
+    return render_template("refine_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/refine/job/<job_id>/status.json")
+def refine_job_status(job_id):
+    with _REFINEMENT_JOBS_LOCK:
+        job = _REFINEMENT_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+
+    result = job.get("result")
+    generations = None
+    if result is not None:
+        generations = [
+            {
+                "generation": g.generation, "best_fitness": g.best_fitness,
+                "mean_fitness": g.mean_fitness, "diversity": g.diversity,
+            }
+            for g in (result.generation_history or [])
+        ]
+
+    return jsonify({
+        "found": True,
+        "done": job["done"],
+        "error": job["error"],
+        "log": job["log"],
+        "instrument": job.get("instrument"),
+        "summary": None if result is None else {
+            "baseline_fitness": result.baseline.fitness,
+            "best_fitness": result.best.fitness,
+            "best_generation": result.best.generation,
+            "improvement_pct": (
+                None if not result.baseline.fitness else
+                round(100 * (result.best.fitness - result.baseline.fitness) / abs(result.baseline.fitness), 1)
+            ),
+            "generations_run": len(generations or []),
+            "report_html": job.get("report_html"),
+            "report_json": job.get("report_json"),
+            "best_file": job.get("best_file"),
+        },
+        "generations": generations,
+    })
+
+
+@app.route("/refinement_reports/<path:filename>")
+def serve_refinement_report(filename):
+    return send_from_directory(REFINEMENT_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Full Pipeline (Step 15 on desktop) -- the "run everything" button:
+# baseline -> walk-forward-aware GA search -> re-validated final Monte Carlo
+# -> OOS fold check -> holdout check -> READY/MARGINAL/NOT READY verdict.
+# Same background-job/poll shape as Search Lab and Iterative Refinement --
+# this is the single slowest thing the app can run.
+# ---------------------------------------------------------------------------
+
+_FULLPIPELINE_JOBS: dict[str, dict] = {}
+_FULLPIPELINE_JOBS_LOCK = threading.Lock()
+
+
+def _fullpipeline_job_log(job_id: str, msg: str) -> None:
+    with _FULLPIPELINE_JOBS_LOCK:
+        job = _FULLPIPELINE_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_fullpipeline_job(
+    job_id: str, df, strategy, risk: RiskConfig, rules: PropRules,
+    cfg: FullPipelineConfig, active_label: str, ollama_settings: OllamaSettings | None,
+) -> None:
+    try:
+        result = run_full_pipeline(
+            df, strategy, risk, rules, FULL_PIPELINE_DIR, cfg,
+            progress_cb=lambda msg: _fullpipeline_job_log(job_id, msg),
+            instrument=active_label, ollama_settings=ollama_settings,
+            report_basename=f"full_pipeline_{job_id}",
+        )
+        with _FULLPIPELINE_JOBS_LOCK:
+            job = _FULLPIPELINE_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+            job["report_html"] = f"/full_pipeline_reports/{Path(result.report_paths['html']).name}"
+            job["report_json"] = f"/full_pipeline_reports/{Path(result.report_paths['json']).name}"
+    except Exception as exc:  # noqa: BLE001 -- must surface on the status page, not crash the thread silently
+        with _FULLPIPELINE_JOBS_LOCK:
+            job = _FULLPIPELINE_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/full-pipeline")
+def full_pipeline_form():
+    saved_ai = load_ollama_settings()
+    return render_template(
+        "full_pipeline.html",
+        stored_datasets=list_stored_datasets(),
+        saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES,
+        fitness_metrics=FITNESS_METRICS,
+        ai_enabled=saved_ai.enabled,
+        ai_host=saved_ai.host,
+        ai_model=saved_ai.model,
+    )
+
+
+@app.route("/full-pipeline/start", methods=["POST"])
+def full_pipeline_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("full_pipeline.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+
+        strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            max_trades_per_day=int(form.get("max_trades_day", 10)),
+            commission_per_trade=float(form.get("commission", 0)),
+            slippage_pips=float(form.get("slippage_pips", 0.5)),
+            spread_pips=float(form.get("spread_pips", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000)),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+            max_drawdown_pct=float(form.get("max_dd", 10)),
+        )
+
+        library_status_raw = (form.get("library_status") or "").strip()
+        cfg = FullPipelineConfig(
+            n_folds=int(form.get("n_folds", 4) or 4),
+            window_mode=form.get("window_mode", "rolling"),
+            ga_population=int(form.get("ga_population", 12) or 12),
+            ga_generations=int(form.get("ga_generations", 6) or 6),
+            ga_search_mc_sims=int(form.get("ga_search_mc_sims", 200) or 200),
+            fitness_metric=form.get("fitness_metric", "prop_guide_score"),
+            final_mc_sims=int(form.get("final_mc_sims", 10000) or 10000),
+            baseline_mc_sims=int(form.get("baseline_mc_sims", 2000) or 2000),
+            holdout_frac=float(form.get("holdout_frac", 0.2) or 0.2),
+            oos_check_folds=int(form.get("oos_check_folds", 4) or 4),
+            random_seed=int(form.get("random_seed", 42) or 42),
+            save_to_library=form.get("save_to_library") == "on",
+            library_status=library_status_raw or None,
+            parallel_search=form.get("parallel_search", "on") == "on",
+        )
+
+        ollama_settings = None
+        if form.get("ai_enabled") == "on":
+            ollama_settings = OllamaSettings(
+                enabled=True,
+                host=form.get("ai_host", "http://localhost:11434") or "http://localhost:11434",
+                model=form.get("ai_model", "llama3.1") or "llama3.1",
+            )
+            try:
+                save_ollama_settings(ollama_settings)  # persists, same as the desktop tab's own checkbox
+            except Exception:
+                pass  # best-effort -- a save failure shouldn't block the run itself
+
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _FULLPIPELINE_JOBS_LOCK:
+            _FULLPIPELINE_JOBS[job_id] = {
+                "log": initial_log, "done": False, "error": None, "result": None,
+                "started_at": time.time(), "instrument": active_label,
+            }
+        thread = threading.Thread(
+            target=_run_fullpipeline_job,
+            args=(job_id, df, strategy, risk, rules, cfg, active_label, ollama_settings),
+            daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("full_pipeline_job", job_id=job_id))
+
+    except StrategyError as exc:
+        return render_template("full_pipeline.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("full_pipeline.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 500
+
+
+@app.route("/full-pipeline/job/<job_id>")
+def full_pipeline_job(job_id):
+    with _FULLPIPELINE_JOBS_LOCK:
+        job = _FULLPIPELINE_JOBS.get(job_id)
+    if job is None:
+        return render_template("full_pipeline_job.html", job_id=job_id, not_found=True), 404
+    return render_template("full_pipeline_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/full-pipeline/job/<job_id>/status.json")
+def full_pipeline_job_status(job_id):
+    with _FULLPIPELINE_JOBS_LOCK:
+        job = _FULLPIPELINE_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+
+    result = job.get("result")
+    summary = None
+    if result is not None:
+        summary = {
+            "verdict": result.verdict,
+            "verdict_reasons": result.verdict_reasons,
+            "baseline_trades": len(result.baseline_bt.trades),
+            "baseline_net_profit": result.baseline_bt.statistics.net_profit,
+            "final_trades": len(result.final_bt.trades),
+            "final_net_profit": result.final_bt.statistics.net_profit,
+            "final_win_rate": result.final_bt.statistics.win_rate,
+            "final_max_dd": result.final_bt.statistics.max_drawdown_pct,
+            "eval_pass_probability": result.final_mc.evaluation_pass_probability,
+            "first_payout_probability": result.final_mc.first_payout_probability,
+            "risk_of_ruin_pct": result.final_mc.risk_of_ruin_pct,
+            "refinement_ran": result.refinement_ran,
+            "refinement_skip_reason": result.refinement_skip_reason,
+            "oos_skip_reason": result.oos_validation_skip_reason,
+            "saved_library_note": result.saved_library_note,
+            "elapsed_seconds": result.elapsed_seconds,
+            "report_html": job.get("report_html"),
+            "report_json": job.get("report_json"),
+            "warnings": result.warnings,
+        }
+
+    return jsonify({
+        "found": True,
+        "done": job["done"],
+        "error": job["error"],
+        "log": job["log"],
+        "instrument": job.get("instrument"),
+        "summary": summary,
+    })
+
+
+@app.route("/full_pipeline_reports/<path:filename>")
+def serve_fullpipeline_report(filename):
+    return send_from_directory(FULL_PIPELINE_DIR, filename)
 
 
 @app.route("/search")

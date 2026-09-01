@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Full Pipeline</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select, textarea, input[type=password] {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: var(--text); font-size: 15px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15);
+  }
+  textarea { min-height: 140px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tabs button {
+    flex: 1; min-width: 70px; padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: #ccc; font-size: 13px;
+  }
+  .tabs button.active { background: var(--teal); color: #04120e; font-weight: 600; border-color: var(--teal); }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+    box-shadow: 0 0 22px rgba(53,224,176,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  details summary { font-size: 13px; color: #999; cursor: pointer; }
+  .ai-note { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; }
+  .checkbox-row input { width: auto; }
+  .checkbox-row label { margin: 0; }
+</style>
+</head>
+<body>
+{% set active_page = active_page|default('full_pipeline') %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Full pipeline</h1>
+  <p>The "run everything" button: baseline &rarr; walk-forward-aware GA search &rarr; re-validated final Monte Carlo &rarr; out-of-sample fold check &rarr; holdout check &rarr; a READY / MARGINAL / NOT READY verdict. Slowest thing this app runs -- expect it to take a while on a full dataset.</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="post" action="/full-pipeline/start" enctype="multipart/form-data">
+
+  <div class="card">
+    <h2>1. Market Data</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none, I'm uploading new file(s) below —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }} ({{ (ds.size_bytes / 1024) | round(1) }} KB)</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+    <label>Or upload new CSV file(s) (timestamp, open, high, low, close, volume)</label>
+    <input type="file" name="csv_file" accept=".csv" multiple>
+  </div>
+
+  <div class="card">
+    <h2>2. Strategy</h2>
+    <div class="tabs" id="strategy-tabs">
+      <button type="button" data-mode="manual" class="active">Manual</button>
+      <button type="button" data-mode="python">Python</button>
+      <button type="button" data-mode="pinescript">PineScript</button>
+      <button type="button" data-mode="mql5">MQL5</button>
+    </div>
+    <input type="hidden" name="strategy_mode" id="strategy_mode" value="manual">
+
+    <div id="manual-fields">
+      <div class="row">
+        <div><label>SMA fast</label><input type="number" name="sma_fast" value="20"></div>
+        <div><label>SMA slow</label><input type="number" name="sma_slow" value="50"></div>
+      </div>
+      <div class="row">
+        <div><label>Stop loss (pips)</label><input type="number" name="sl_pips" value="20"></div>
+        <div><label>Take profit (pips)</label><input type="number" name="tp_pips" value="40"></div>
+      </div>
+    </div>
+
+    <div id="code-fields" style="display:none;">
+      <label>Search the library (name / description / market)</label>
+      <input type="text" id="strategy_search_input" placeholder="e.g. fvg, XAUUSD..." oninput="onLibraryFiltersChanged()">
+      <div class="row">
+        <div>
+          <label>Browse market</label>
+          <select id="strategy_filter_market" onchange="onLibraryFiltersChanged()"><option value="">All markets</option></select>
+        </div>
+        <div>
+          <label>Browse tag</label>
+          <select id="strategy_filter_tag" onchange="onLibraryFiltersChanged()"><option value="">All tags</option></select>
+        </div>
+        <div>
+          <label>Browse status</label>
+          <select id="strategy_filter_status" onchange="onLibraryFiltersChanged()">
+            <option value="">All statuses</option>
+            {% for s in strategy_statuses|default([]) %}
+            <option value="{{ s }}">{{ s }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <label>Load a saved strategy from the library</label>
+      <select id="existing_strategy_select" onchange="loadFromLibrary()">
+        <option value="">— none, paste or upload below —</option>
+      </select>
+      <p style="font-size:12px;color:#888;margin-top:6px;" id="library-count-note"></p>
+
+      <label style="margin-top:14px;">Or upload a strategy file (from this computer or your phone)</label>
+      <input type="file" id="strategy_file_input" name="strategy_file" accept=".py,.pine,.mq5">
+
+      <label>Or paste strategy source</label>
+      <textarea name="strategy_code" id="strategy_code" placeholder="Paste your Python / PineScript / MQL5 strategy here"></textarea>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Risk &amp; prop rules</h2>
+    <div class="row">
+      <div><label>Initial balance</label><input type="number" name="initial_balance" value="100000"></div>
+      <div><label>Account size (prop rules)</label><input type="number" name="account_size" value="100000"></div>
+    </div>
+    <div class="row">
+      <div><label>Risk mode</label>
+        <select name="risk_mode"><option value="percent">% of balance</option><option value="fixed">Fixed lot</option></select>
+      </div>
+      <div><label>Risk value</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
+    </div>
+    <div class="row">
+      <div><label>Profit target %</label><input type="number" step="0.1" name="profit_target" value="8"></div>
+      <div><label>Daily loss limit %</label><input type="number" step="0.1" name="daily_loss" value="5"></div>
+    </div>
+    <div class="row">
+      <div><label>Max drawdown %</label><input type="number" step="0.1" name="max_dd" value="10"></div>
+      <div><label>Pip size</label><input type="number" step="0.0001" name="pip_size" value="0.0001"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>4. Pipeline settings</h2>
+    <div class="row">
+      <div><label>Walk-forward folds</label><input type="number" name="n_folds" value="4"></div>
+      <div><label>Window mode</label>
+        <select name="window_mode"><option value="rolling">Rolling</option><option value="anchored">Anchored</option></select>
+      </div>
+    </div>
+    <label>Fitness metric</label>
+    <select name="fitness_metric">
+      {% for key, label in fitness_metrics.items() %}
+      <option value="{{ key }}" {{ 'selected' if key == 'prop_guide_score' else '' }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <details style="margin-top:10px;" open>
+      <summary>GA search settings</summary>
+      <div class="row">
+        <div><label>GA population</label><input type="number" name="ga_population" value="12"></div>
+        <div><label>GA generations</label><input type="number" name="ga_generations" value="6"></div>
+      </div>
+      <div class="row">
+        <div><label>Search-phase MC sims</label><input type="number" name="ga_search_mc_sims" value="200"></div>
+        <div><label>Final MC sims</label><input type="number" name="final_mc_sims" value="10000"></div>
+      </div>
+      <label class="checkbox-row"><input type="checkbox" name="parallel_search" checked>Parallelize GA search across CPU cores</label>
+    </details>
+    <details style="margin-top:10px;">
+      <summary>Validation &amp; library settings</summary>
+      <div class="row">
+        <div><label>Baseline MC sims (diagnostic only)</label><input type="number" name="baseline_mc_sims" value="2000"></div>
+        <div><label>Holdout fraction</label><input type="number" step="0.05" name="holdout_frac" value="0.2"></div>
+      </div>
+      <div class="row">
+        <div><label>OOS check folds</label><input type="number" name="oos_check_folds" value="4"></div>
+        <div><label>Random seed</label><input type="number" name="random_seed" value="42"></div>
+      </div>
+      <label class="checkbox-row"><input type="checkbox" name="save_to_library" checked>Save the winning strategy to the Strategy Library</label>
+      <label>Library status override (blank = auto-pick from verdict)</label>
+      <select name="library_status">
+        <option value="">— auto (from verdict) —</option>
+        {% for s in strategy_statuses|default([]) %}
+        <option value="{{ s }}">{{ s }}</option>
+        {% endfor %}
+      </select>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>5. AI Assist (optional, off by default)</h2>
+    <p class="ai-note">
+      When enabled, the GA search asks a local Ollama model for candidate parameter values once per generation and seeds them into the population alongside the normal random/bred candidates. Every suggestion still goes through the exact same backtest/prop-sim/Monte Carlo evaluation as any other candidate -- it proposes numbers for parameters that already exist, never code. Needs Ollama reachable at the host below from wherever this server is running (works over LAN; if this app is deployed to Cloud Run, that means a publicly reachable Ollama endpoint, not your own machine's localhost).
+    </p>
+    <label class="checkbox-row"><input type="checkbox" name="ai_enabled" id="ai_enabled" {{ 'checked' if ai_enabled else '' }}>Enable AI Assist for this run</label>
+    <div class="row">
+      <div><label>Ollama host</label><input type="text" name="ai_host" value="{{ ai_host }}"></div>
+      <div><label>Model</label><input type="text" name="ai_model" value="{{ ai_model }}"></div>
+    </div>
+  </div>
+
+  <button class="submit-btn" type="submit">Run Full Pipeline</button>
+</form>
+
+</div>
+</div>
+
+<script>
+  const tabs = document.querySelectorAll('#strategy-tabs button');
+  const modeInput = document.getElementById('strategy_mode');
+  const manualFields = document.getElementById('manual-fields');
+  const codeFields = document.getElementById('code-fields');
+  const SAVED_STRATEGIES = {{ saved_strategies_json | safe }};
+
+  function filteredLibraryItems(mode) {
+    const query = (document.getElementById('strategy_search_input').value || '').toLowerCase().trim();
+    const market = document.getElementById('strategy_filter_market').value;
+    const tag = document.getElementById('strategy_filter_tag').value;
+    const status = document.getElementById('strategy_filter_status').value;
+    const all = SAVED_STRATEGIES[mode] || [];
+    return all.filter(s => {
+      if (query && !(s.name + ' ' + s.description + ' ' + s.market + ' ' + (s.tags || []).join(' ')).toLowerCase().includes(query)) return false;
+      if (market && s.market !== market) return false;
+      if (tag && !(s.tags || []).map(t => t.toLowerCase()).includes(tag.toLowerCase())) return false;
+      if (status && s.status !== status) return false;
+      return true;
+    });
+  }
+
+  function populateFilterOptions(mode) {
+    const all = SAVED_STRATEGIES[mode] || [];
+    const markets = [...new Set(all.map(s => s.market).filter(Boolean))].sort();
+    const tags = [...new Set(all.flatMap(s => s.tags || []))].sort((a, b) => a.localeCompare(b));
+    const marketSelect = document.getElementById('strategy_filter_market');
+    const keepMarket = marketSelect.value;
+    marketSelect.innerHTML = '<option value="">All markets</option>' + markets.map(m => `<option value="${m}">${m}</option>`).join('');
+    if (markets.includes(keepMarket)) marketSelect.value = keepMarket;
+    const tagSelect = document.getElementById('strategy_filter_tag');
+    const keepTag = tagSelect.value;
+    tagSelect.innerHTML = '<option value="">All tags</option>' + tags.map(t => `<option value="${t}">${t}</option>`).join('');
+    if (tags.includes(keepTag)) tagSelect.value = keepTag;
+  }
+
+  function populateLibrarySelect(mode) {
+    populateFilterOptions(mode);
+    const select = document.getElementById('existing_strategy_select');
+    const note = document.getElementById('library-count-note');
+    const all = SAVED_STRATEGIES[mode] || [];
+    const items = filteredLibraryItems(mode);
+    select.innerHTML = '<option value="">— none, paste or upload below —</option>';
+    items.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.name;
+      const label = s.description ? `${s.name} — ${s.description}` : s.name;
+      opt.textContent = `[${s.status}] ${label}`;
+      select.appendChild(opt);
+    });
+    if (!all.length) {
+      note.textContent = `No saved ${mode} strategies yet — upload or paste one below.`;
+    } else if (!items.length) {
+      note.textContent = `No saved ${mode} strategies match the current search/filters.`;
+    } else {
+      note.textContent = items.length === all.length
+        ? `${all.length} saved ${mode} strategy(ies) in the library.`
+        : `${items.length} of ${all.length} saved ${mode} strategy(ies) shown.`;
+    }
+  }
+
+  function onLibraryFiltersChanged() { populateLibrarySelect(modeInput.value); }
+
+  function loadFromLibrary() {
+    const mode = modeInput.value;
+    const name = document.getElementById('existing_strategy_select').value;
+    if (!name) return;
+    fetch(`/strategies/${encodeURIComponent(mode)}/${encodeURIComponent(name)}`)
+      .then(r => r.ok ? r.text() : Promise.reject())
+      .then(text => { document.getElementById('strategy_code').value = text; })
+      .catch(() => alert('Could not load that saved strategy.'));
+  }
+
+  document.getElementById('strategy_file_input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { document.getElementById('strategy_code').value = reader.result; };
+    reader.readAsText(file);
+  });
+
+  tabs.forEach(btn => btn.addEventListener('click', () => {
+    tabs.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    modeInput.value = btn.dataset.mode;
+    if (btn.dataset.mode === 'manual') {
+      manualFields.style.display = 'block';
+      codeFields.style.display = 'none';
+    } else {
+      manualFields.style.display = 'none';
+      codeFields.style.display = 'block';
+      populateLibrarySelect(btn.dataset.mode);
+    }
+  }));
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

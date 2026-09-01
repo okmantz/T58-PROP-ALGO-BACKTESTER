@@ -7,10 +7,12 @@ stubbing all of them thinly at once.
 
 ## Done
 
-- [x] **Round 1 infra**: Cloud Run + Firebase Hosting deploy pipeline
-      (`docker/Dockerfile`, `firebase/firebase.json`, `firebase/.firebaserc`,
-      GitHub Actions workflow).
-      See `FIREBASE_DEPLOY.md`.
+- [x] ~~Round 1 infra: Cloud Run + Firebase Hosting deploy pipeline~~ --
+      **removed**. Owen decided against any paid/cloud hosting tier; the
+      web app is LAN-only now (`run_web.py` / `T58-Web-App.exe`, see the
+      README's "Mobile app" section) and there's no plan to reintroduce a
+      hosted deploy path. `docker/`, `firebase/`, and
+      `.github/workflows/deploy-firebase.yml` have been deleted.
 - [x] **Round 1 feature**: Step 06 Iterative Refinement (`/refine`,
       `/refine/start`, `/refine/job/<id>`) -- same background-job/poll
       pattern as the existing Search Lab.
@@ -120,6 +122,6 @@ deliberate exceptions:
 
 ## Notes for next round
 
-Say which of the above to do next (or "just go in order"), and whether
-Cloud Run's ephemeral-storage tradeoff (see `FIREBASE_DEPLOY.md`) needs
-solving before we go further, or can wait.
+Say which of the above to do next (or "just go in order"). Cloud
+hosting/ephemeral-storage tradeoffs are no longer a consideration -- the
+web app is LAN-only by deliberate choice (see the "Done" section above).

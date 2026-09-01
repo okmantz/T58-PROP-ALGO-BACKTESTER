@@ -27,11 +27,13 @@ stress-testing strategies before you ever risk a real evaluation fee:
 (multi-strategy discovery across a 5-stage funnel), the **Validation
 Lab** (walk-forward optimization, combinatorial purged cross-validation,
 parameter sensitivity, multi-asset portfolios, multi-objective search, and
-a walk-forward-aware GA), and **Full Pipeline** (one button that runs the
+a walk-forward-aware GA), **Full Pipeline** (one button that runs the
 entire stack in order and hands back a single READY/MARGINAL/NOT READY
-verdict) — all described below. An optional local **AI Assist** can
-participate in that search too, suggesting parameters for a local Ollama
-model to try while Full Pipeline runs.
+verdict), and **Evolution Lab** (an unattended generate -> filter ->
+validate -> mutate loop that runs for hours on its own, checkpointing its
+progress so it can be stopped and resumed) — all described below. An
+optional local **AI Assist** can participate in that search too, suggesting
+parameters for a local Ollama model to try while Full Pipeline runs.
 
 Three ways to run it: a **Windows desktop app (.exe)**, a **local Python app**
 (any OS), or a **mobile-friendly web app** you open in a phone browser.
@@ -143,6 +145,27 @@ From your phone's browser:
    dataset is included at `data/examples/EURUSD_5M_sample.csv`. Historical
    backtesting datasets for instruments such as XAUUSD, EURUSD, GBPUSD, S&P500,
    NASDAQ, etc. are also included (`data/raw`).
+
+   **Supported file types**, dispatched automatically by extension:
+   - `.csv` / `.tsv` / `.txt` — delimiter (comma/tab/semicolon/pipe) and
+     header/no-header are both auto-detected. Headerless 6-column files are
+     assumed to be `timestamp, open, high, low, close, volume` in that order.
+   - `.parquet` — read directly (requires the `pyarrow` package, already
+     listed in `requirements.txt` and bundled into both `.exe` builds).
+   - `.zip` / `.7z` archives — opened automatically and whichever member
+     inside looks like the actual OHLCV file (`.csv`/`.tsv`/`.txt`/`.parquet`)
+     is read, skipping folders and OS junk like `__MACOSX/`/`.DS_Store`.
+     `.7z` requires the `py7zr` package (also bundled).
+   - **Column names**: a wide alias list maps common vendor/broker column
+     names to the standard `timestamp/open/high/low/close/volume` schema —
+     e.g. `ts`, `time`, `date`, `datetime`, `Gmt time`, `bar_time` all map to
+     `timestamp`; `o/h/l/c/v` and `Open Price`/`Tick Volume`-style names are
+     recognized too. If a timestamp column uses a name no alias list
+     anticipated, a fallback tries every remaining date/time-looking column
+     name and, if more than one candidate remains, actually test-parses a
+     sample of each as a date and picks whichever one works. Extra columns
+     the schema doesn't use (e.g. a vendor's `symbol` column) are simply
+     ignored rather than causing an import error.
 
    The dataset picker supports selecting **more than one file at once** for
    multi-timeframe analysis — e.g. select a 60-minute file for bias, a
@@ -522,6 +545,95 @@ won't turn it profitable).
 Available on the desktop GUI (sidebar: **16 FORWARD TEST**). No CLI
 equivalent yet — this is an interactive, long-running session by nature.
 
+## Step 17 — Evolution Lab (unattended, run-for-hours strategy discovery)
+
+Every other feature above evaluates or tunes a strategy someone already
+picked. **Evolution Lab** (`app/evolution/`) instead runs the whole
+generate → filter → validate → keep-the-winners → mutate loop by itself,
+unattended, for as long as you leave it running:
+
+```
+RESEARCH (knowledge graph -- informs which families/features get weighted
+          into GENERATE, based on what has historically scored well)
+    v
+GENERATE ~N STRATEGIES   (every family app/search/strategy_space.py knows)
+    v
+PRE-FILTER + BACKTEST    (one cheap backtest: trades / profit factor / DD)
+    v
+ROBUSTNESS + OOS + MONTE CARLO + PROP SIMULATION
+    v
+CPCV / PBO                (real combinatorial-purged CV, top candidates only)
+    v
+STRESS TEST                (re-run at N-x execution costs)
+    v
+CLUSTER                    (correlation-dedupe so the top 10 aren't 10
+                             near-identical variants of the same winner)
+    v
+KEEP TOP N -> record to knowledge graph -> MUTATE -> repeat
+```
+
+Candidates are ranked by **PROP FITNESS** (`app/evolution/prop_fitness.py`)
+— pass probability × payout probability × robustness × OOS consistency,
+divided by drawdown, minus penalties for thin trade counts, high parameter
+sensitivity, high PBO, in/out-of-sample degradation, profit concentrated in
+one lucky trade, and long losing streaks — not raw net profit, so the
+leaderboard reflects "would actually survive a funded account," not just
+"backtested well once."
+
+**Every candidate tested is logged**, not just the winners:
+- The **Tested Strategies** panel lists every candidate the PRE-FILTER
+  stage has backtested this run, pass or fail, with the specific reason it
+  was rejected (`min_trades`, `profit_factor`, `max_drawdown`,
+  `unprofitable`, `no_trades`, or a build/backtest error) if it failed, and
+  how far it got (plus its PROP FITNESS score) if it passed. This is a
+  durable, on-disk log (`data/evolution/tested_candidates.jsonl`), not just
+  console scrollback — click REFRESH any time, including after reopening
+  the app.
+- If a generation produces **zero** PRE-FILTER survivors, the log shows a
+  rejection breakdown (e.g. "min_trades: 40, profit_factor: 12,
+  unprofitable: 3") right there instead of a bare "0 survived." If that
+  happens **3 generations in a row**, the pre-filter thresholds are
+  automatically loosened once (min trades reduced, minimum profit factor
+  relaxed, drawdown buffer widened) — the same auto-relax idea Search Lab's
+  own Stage 1 already uses — so a run doesn't grind for hours with an
+  empty leaderboard and no visible reason why.
+- The **knowledge graph** (`data/evolution/knowledge_graph.jsonl`) is an
+  append-only log of every candidate's structural feature vector (family,
+  session/volatility/trend filters used, indicator mix, direction bias)
+  paired with its outcome, across every run ever started. Each
+  generation's journal entry queries it for similar past candidates, so
+  later generations can say "this mechanism has historically worked 86% of
+  the time" rather than judging each generation in isolation.
+
+**Progress survives STOP and restarting the app.** Generation number,
+current elites (used to seed next generation's mutated children), the
+all-time leaderboard, and the hypothesis journal are all saved to disk
+(`data/evolution/checkpoint.json`) after every generation. Clicking START
+again — even in a new session — resumes exactly where it left off instead
+of starting over from scratch, as long as the same market data is loaded;
+loading different data is detected automatically and starts a fresh run
+instead of silently mixing incompatible runs. Click **RESET** to discard
+the saved checkpoint and tested-candidates log and genuinely start over.
+
+**Confidence rating.** Each generation's HYPOTHESIS journal entry rates its
+winner LOW / MEDIUM / HIGH based on whether it's stable under
+parameter-neighborhood perturbation *and* how many similar historical
+candidates the knowledge graph has seen. Treat LOW-confidence winners
+(the vast majority, especially early on) as leads worth tracking, not
+strategies worth funding.
+
+**Scope, stated plainly:** candidates are Manual Strategy Builder configs
+generated from `app.search.strategy_space`'s families — this does not
+mutate uploaded Python/PineScript/MQL5 files. It runs single-process; each
+generation is currently slower than Search Lab's own multi-worker Stage
+1-3 pipeline, since porting that same `ProcessPoolExecutor` parallelism
+into Evolution Lab is the natural next optimization once the loop's shape
+is validated in practice.
+
+Available on the desktop GUI (sidebar: **EVOLUTION LAB**). Safe to leave
+running for hours while working in other tabs — it runs on a background
+thread and checkpoints itself automatically.
+
 ## AI Assist (optional, local Ollama)
 
 Full Pipeline's walk-forward-aware GA search can optionally ask a local
@@ -723,7 +835,7 @@ T58-Prop-Algo-Backtester/
 ├── app/
 │   ├── main.py                 # entry point (GUI, or --cli headless run — see CLI reference)
 │   ├── ui/
-│   │   ├── main_window.py      # Tkinter desktop GUI (15-step sidebar: Steps 1-7 core, 8-13 Validation Lab, 14 Ensemble, 15 Full Pipeline)
+│   │   ├── main_window.py      # Tkinter desktop GUI (Steps 1-7 core, 8-13 Validation Lab, 14 Ensemble, 15 Full Pipeline, 16 Forward Test, 17 Evolution Lab)
 │   │   └── condition_builder.py  # visual condition-row widget used by the Manual Builder
 │   ├── web/                    # Flask mobile/web app (same engine, new front end)
 │   │   ├── server.py
@@ -748,6 +860,11 @@ T58-Prop-Algo-Backtester/
 │   │   └── adaptive_risk.py      # Step 14: declarative consecutive-loss/daily-P&L/progress-to-target sizing rules
 │   ├── ensemble/ensemble.py       # Step 14: multi-strategy ensembles (blend or vote) on one instrument
 │   ├── orchestration/full_pipeline.py  # Step 15: one-button baseline -> GA -> re-validation -> OOS/holdout -> verdict
+│   ├── evolution/                 # Step 17: Evolution Lab (unattended generate/filter/mutate loop)
+│   │   ├── engine.py              # the generation loop itself (EvolutionRunner)
+│   │   ├── checkpoint.py          # on-disk checkpoint (resume) + tested-candidates log
+│   │   ├── prop_fitness.py        # composite PROP FITNESS ranking score
+│   │   └── knowledge_graph.py     # append-only feature-vector -> outcome log + similarity queries
 │   ├── ai/                        # optional local-Ollama AI Assist (off by default)
 │   │   ├── ollama_client.py       # connection test + per-generation parameter-suggestion requests
 │   │   └── ollama_settings.py     # persisted host/model/API-key settings (keyring-backed)

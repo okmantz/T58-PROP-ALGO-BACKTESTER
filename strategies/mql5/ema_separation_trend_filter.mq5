@@ -1,3 +1,12 @@
+// NOTE (2026-08-31 rescale): the SL/TP pip values below were originally sized for FX pairs
+// (pip_size 0.0001) and produced near-instant catastrophic stop-outs when run against gold-scaled
+// (XAUUSD, pip_size ~0.01) data -- a 20-40 "pip" stop is $0.002-0.004 at FX scale but only
+// $0.20-0.40 at gold scale, nowhere near gold's typical per-bar ATR, so almost every entry was
+// stopped out by normal noise on the very next bar. Values below are rescaled ~25x for gold-scale
+// instruments. Before running this strategy: click "detect pip size from data" on the Data tab
+// so pip_size actually reflects the loaded instrument -- these numbers assume pip_size ~0.01
+// (2-decimal gold-style quoting), NOT the FX default of 0.0001. If you load an FX pair instead,
+// use the original (much smaller) pip counts.
 //+------------------------------------------------------------------+
 //|                       EMA Separation Trend Filter.mq5             |
 //+------------------------------------------------------------------+
@@ -36,8 +45,8 @@
 #include <Trade\Trade.mqh>
 CTrade trade;
 
-// T58_SL_PIPS=40
-// T58_TP_PIPS=80
+// T58_SL_PIPS=1000
+// T58_TP_PIPS=2000
 
 int OnInit()
 {

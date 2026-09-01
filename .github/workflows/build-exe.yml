@@ -117,6 +117,14 @@ jobs:
             --hidden-import "app.reports.generator" `
             --hidden-import "app.reports.charts" `
             --hidden-import "app.reports._assets" `
+            --hidden-import "app.reports.run_history" `
+            --hidden-import "app.evolution" `
+            --hidden-import "app.evolution.engine" `
+            --hidden-import "app.evolution.checkpoint" `
+            --hidden-import "app.evolution.knowledge_graph" `
+            --hidden-import "app.evolution.prop_fitness" `
+            --collect-all "py7zr" `
+            --collect-all "pyarrow" `
             --add-data "data/examples;data/examples" `
             --add-data "app/ui/assets;app/ui/assets" `
             --add-data "strategies;strategies" `

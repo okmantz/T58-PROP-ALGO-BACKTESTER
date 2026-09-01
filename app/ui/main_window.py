@@ -834,14 +834,15 @@ class MainWindow:
 
     def _build_ui(self):
         self.root.configure(bg=BG)
-
         self._configure_styles()
+        self._pump_splash("Configuring theme...")
 
         # Main application shell.
         shell = Frame(self.root, bg=BG)
         shell.pack(fill="both", expand=True)
 
         self._build_header(shell)
+        self._pump_splash("Building navigation...")
 
         # ---------------------------------------------------------------
         # Sidebar navigation + page switcher (replaces the old top-tab
@@ -975,30 +976,51 @@ class MainWindow:
         self._build_sidebar_nav()
         self.active_page = "dashboard"
 
-        self._build_dashboard_tab()
-        self._build_manual_tab()
-        self._build_data_tab()
-        self._build_strategy_tab()
-        self._build_prop_tab()
-        self._build_risk_tab()
-        self._build_run_tab()
-        self._build_refine_tab()
-        self._build_search_tab()
-        self._build_wfo_tab()
-        self._build_cpcv_tab()
-        self._build_sensitivity_tab()
-        self._build_portfolio_tab()
-        self._build_multiobj_tab()
-        self._build_wfga_tab()
-        self._build_ensemble_tab()
-        self._build_generate_strategies_tab()
-        self._build_evolution_lab_tab()
-        self._build_full_pipeline_tab()
-        self._build_forward_test_tab()
-        self._build_deploy_live_tab()
-        self._build_live_market_tab()
+        for label, builder in (
+            ("Dashboard", self._build_dashboard_tab),
+            ("Manual builder", self._build_manual_tab),
+            ("Data", self._build_data_tab),
+            ("Strategy", self._build_strategy_tab),
+            ("Prop rules", self._build_prop_tab),
+            ("Risk", self._build_risk_tab),
+            ("Run", self._build_run_tab),
+            ("Refinement", self._build_refine_tab),
+            ("Search Lab", self._build_search_tab),
+            ("Walk-forward", self._build_wfo_tab),
+            ("CPCV", self._build_cpcv_tab),
+            ("Sensitivity", self._build_sensitivity_tab),
+            ("Portfolio", self._build_portfolio_tab),
+            ("Multi-objective", self._build_multiobj_tab),
+            ("Walk-forward GA", self._build_wfga_tab),
+            ("Ensemble", self._build_ensemble_tab),
+            ("Strategy generator", self._build_generate_strategies_tab),
+            ("Evolution Lab", self._build_evolution_lab_tab),
+            ("Full Pipeline", self._build_full_pipeline_tab),
+            ("Forward Test", self._build_forward_test_tab),
+            ("Deploy Live", self._build_deploy_live_tab),
+            ("Live Market", self._build_live_market_tab),
+        ):
+            self._pump_splash(f"Loading {label}...")
+            builder()
 
         self._show_page("dashboard")
+
+    def _pump_splash(self, status: str) -> None:
+        """Best-effort: updates the boot splash's status text and pumps
+        the Tk event loop once, so the splash's glow animation actually
+        animates through _build_ui()'s otherwise fully synchronous,
+        several-second widget construction instead of freezing on its
+        first frame and only reappearing once everything is already
+        built. Silently does nothing if there's no splash (e.g. this
+        MainWindow wasn't created via launch(), such as in tests)."""
+        splash = getattr(self.root, "_t58_splash", None)
+        if splash is None:
+            return
+        try:
+            splash.set_status(status)
+            self.root.update()
+        except Exception:
+            pass
 
     def _build_sidebar_nav(self):
         def _wheel(event):
@@ -7297,14 +7319,33 @@ class MainWindow:
             f, "Leaderboard (all-time best seen)",
             "Refreshed after every generation. Sorted by PROP FITNESS, which already accounts for "
             "pass probability, payout probability, robustness, OOS consistency, drawdown, and the "
-            "penalties described above -- not just net profit.",
+            "penalties described above -- not just net profit. Double-click (or select + VIEW "
+            "DETAILS) to see the full stat breakdown and generated code/config for any leader, and "
+            "PROMOTE it straight into the Strategy Library to run it through 15 Full Pipeline.",
         )
+        lb_frame = Frame(lb_section, bg=PANEL)
+        lb_frame.pack(fill="x", padx=18, pady=(2, 6))
+        lb_frame.columnconfigure(0, weight=1)
         self.evo_leaderboard_listbox = Listbox(
-            lb_section, height=8, exportselection=False, bg=PANEL_3, fg=TEXT,
+            lb_frame, height=16, exportselection=False, bg=PANEL_3, fg=TEXT,
             activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
             font=(MONO, 9),
         )
-        self.evo_leaderboard_listbox.pack(fill="x", padx=18, pady=(2, 12))
+        evo_lb_scrollbar = ttk.Scrollbar(
+            lb_frame, orient="vertical", command=self.evo_leaderboard_listbox.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.evo_leaderboard_listbox.config(yscrollcommand=evo_lb_scrollbar.set)
+        self.evo_leaderboard_listbox.grid(row=0, column=0, sticky="nsew")
+        evo_lb_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.evo_leaderboard_listbox.bind("<Double-Button-1>", lambda e: self._view_evolution_leader_detail())
+
+        lb_btn_row = Frame(lb_section, bg=PANEL)
+        lb_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
+        self._button(lb_btn_row, "VIEW DETAILS", self._view_evolution_leader_detail, primary=True).pack(side="left")
+        self._button(lb_btn_row, "PROMOTE TO STRATEGY LIBRARY", self._promote_selected_evolution_leader).pack(side="left", padx=8)
+        self._button(lb_btn_row, "REFRESH FROM DISK", self._load_evolution_leaderboard_from_disk).pack(side="left", padx=8)
+
+        self._evo_leaderboard_cache: list[dict] = []  # index-aligned with evo_leaderboard_listbox rows
 
         tested_section = self._section(
             f, "Tested strategies (most recent first)",
@@ -7340,6 +7381,11 @@ class MainWindow:
         evo_log_scrollbar.pack(side="right", fill="y")
 
         self._evolution_runner = None
+        try:
+            self._load_evolution_leaderboard_from_disk()
+            self._refresh_evolution_tested()
+        except Exception:
+            pass
 
     def _evo_log(self, msg: str) -> None:
         def _do():
@@ -7437,6 +7483,7 @@ class MainWindow:
         self.evo_log_text.delete("1.0", END)
         self.evo_leaderboard_listbox.delete(0, END)
         self.evo_tested_listbox.delete(0, END)
+        self._evo_leaderboard_cache = []
         self.evo_status_label.config(text="Not running. (Saved progress cleared.)", fg=TEXT_DIM)
         self._evo_log("Evolution Lab progress reset -- the next START begins a fresh run.")
 
@@ -7468,6 +7515,205 @@ class MainWindow:
         except Exception:
             pass
 
+    def _refresh_evo_leaderboard_listbox(self, records: list[dict]) -> None:
+        """`records` is a list of checkpoint-shaped dicts (candidate_id,
+        spec, meta, stats, mc_summary, fitness, ...) -- the same shape
+        whether they came from a live runner (via to_checkpoint_dict())
+        or straight off disk. Keeps `self._evo_leaderboard_cache`
+        index-aligned with the listbox rows so VIEW DETAILS / PROMOTE
+        can look up the right one from the current selection."""
+        self.evo_leaderboard_listbox.delete(0, END)
+        self._evo_leaderboard_cache = records
+        for r in records:
+            fitness = r.get("fitness") or {}
+            score = fitness.get("final_score", float("nan"))
+            fam = str((r.get("meta") or {}).get("family", "?"))[:18]
+            stats = r.get("stats") or {}
+            wr = stats.get("win_rate")
+            wr_str = f"{wr:5.1f}% WR" if isinstance(wr, (int, float)) else "   n/a WR"
+            trades = stats.get("total_trades")
+            trades_str = f"{trades:4d} trades" if isinstance(trades, int) else "   ? trades"
+            self.evo_leaderboard_listbox.insert(
+                END,
+                f"  {score:8.2f}   {fam:18s}  {trades_str}  {wr_str}  {r.get('candidate_id', '?')}",
+            )
+
+    def _load_evolution_leaderboard_from_disk(self) -> None:
+        """Populates the leaderboard from the saved checkpoint even when
+        no EvolutionRunner is currently alive in this process (e.g. the
+        app was closed and reopened after an overnight run) -- Evolution
+        Lab saves progress to disk after every generation specifically so
+        this works."""
+        if self._evolution_runner is not None:
+            try:
+                self._refresh_evo_leaderboard_listbox([r.to_checkpoint_dict() for r in self._evolution_runner.leaderboard])
+                return
+            except Exception:
+                pass
+        try:
+            checkpoint = evo_checkpoint.load_checkpoint()
+        except Exception:
+            checkpoint = None
+        if checkpoint is None:
+            return
+        try:
+            self._refresh_evo_leaderboard_listbox(list(checkpoint.leaderboard))
+        except Exception:
+            pass
+
+    def _selected_evolution_leader(self) -> dict | None:
+        sel = self.evo_leaderboard_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a strategy from the Leaderboard first.")
+            return None
+        idx = sel[0]
+        if idx >= len(self._evo_leaderboard_cache):
+            return None
+        return self._evo_leaderboard_cache[idx]
+
+    def _view_evolution_leader_detail(self) -> None:
+        record = self._selected_evolution_leader()
+        if record is None:
+            return
+        stats = record.get("stats") or {}
+        mc = record.get("mc_summary") or {}
+        fitness = record.get("fitness") or {}
+        robustness = record.get("robustness") or {}
+        walk_forward = record.get("walk_forward") or {}
+
+        def pct(v):
+            return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "n/a"
+
+        def num(v, fmt="{:.2f}"):
+            return fmt.format(v) if isinstance(v, (int, float)) else "n/a"
+
+        lines = [
+            f"Candidate: {record.get('candidate_id', '?')}",
+            f"Family: {(record.get('meta') or {}).get('family', '?')}",
+            "",
+            "-- Prop fitness --",
+            f"  Final score:          {num(fitness.get('final_score'))}",
+            f"  Pass probability:     {pct(fitness.get('pass_probability'))}",
+            f"  Payout probability:   {pct(fitness.get('payout_probability'))}",
+            f"  Robustness:           {num(fitness.get('robustness'))}",
+            f"  OOS consistency:      {num(fitness.get('oos_consistency'))}",
+            "",
+            "-- Backtest stats --",
+            f"  Total trades:         {stats.get('total_trades', 'n/a')}",
+            f"  Win rate:             {(num(stats.get('win_rate'), '{:.1f}') + '%') if isinstance(stats.get('win_rate'), (int, float)) else 'n/a'}",
+            f"  Net profit:           ${num(stats.get('net_profit'))}",
+            f"  Profit factor:        {num(stats.get('profit_factor'))}",
+            f"  Sharpe ratio:         {num(stats.get('sharpe_ratio'))}",
+            f"  Sortino ratio:        {num(stats.get('sortino_ratio'))}",
+            f"  Max drawdown:         {num(stats.get('max_drawdown_pct'), '{:.1f}')}%",
+            f"  Expectancy:           {num(stats.get('expectancy'))}",
+            "",
+            "-- Monte Carlo / eval simulation --",
+            f"  Evaluation pass probability:  {pct(mc.get('evaluation_pass_probability'))}",
+            f"  First payout probability:     {pct(mc.get('first_payout_probability'))}",
+            "",
+            "-- Robustness / walk-forward --",
+            f"  Parameter-neighborhood stable:  {robustness.get('is_stable', 'n/a')}  "
+            f"(stability ratio {num(robustness.get('stability_ratio'))})",
+            f"  Walk-forward stable:            {walk_forward.get('is_stable', 'n/a')}  "
+            f"(WF efficiency {num(walk_forward.get('walk_forward_efficiency'))})",
+        ]
+        if record.get("pbo") is not None:
+            lines.append(f"  PBO (probability of backtest overfitting): {num(record.get('pbo'))}")
+        if record.get("cpcv_degradation") is not None:
+            lines.append(f"  CPCV degradation: {num(record.get('cpcv_degradation'))}")
+
+        win = Toplevel(self.root)
+        win.title(f"Leaderboard detail -- {record.get('candidate_id', '?')}")
+        win.configure(bg=BG)
+        win.geometry("760x680")
+        Label(
+            win, text="LEADERBOARD DETAIL", bg=BG, fg=TEXT, font=_safe_font(13, "bold"),
+        ).pack(anchor="w", padx=16, pady=(14, 6))
+
+        text_frame = Frame(win, bg=BG)
+        text_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+        txt = Text(
+            text_frame, wrap="word", bg=PANEL_3, fg=TEXT, font=(MONO, 10), relief="flat", bd=0,
+        )
+        vs = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview, style="T58.Vertical.TScrollbar")
+        txt.config(yscrollcommand=vs.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        txt.insert("1.0", "\n".join(lines))
+        txt.config(state="disabled")
+
+        btn_row = Frame(win, bg=BG)
+        btn_row.pack(fill="x", padx=16, pady=(0, 14))
+        config = (record.get("spec") or {}).get("config")
+
+        def _view_code():
+            if not config:
+                messagebox.showinfo("No config", "This candidate has no saved manual-builder config to show.")
+                return
+            self._show_text_viewer(
+                f"Config -- {record.get('candidate_id', '?')}", json.dumps(config, indent=2),
+            )
+
+        def _promote():
+            self._promote_evolution_leader_record(record)
+
+        self._button(btn_row, "VIEW CODE / CONFIG", _view_code, primary=True).pack(side="left")
+        self._button(btn_row, "PROMOTE TO STRATEGY LIBRARY", _promote).pack(side="left", padx=8)
+        self._button(btn_row, "CLOSE", win.destroy).pack(side="left", padx=8)
+
+    def _promote_selected_evolution_leader(self) -> None:
+        record = self._selected_evolution_leader()
+        if record is None:
+            return
+        self._promote_evolution_leader_record(record)
+
+    def _promote_evolution_leader_record(self, record: dict) -> None:
+        """Saves a specific leaderboard entry into the Strategy Library
+        (manual-builder JSON, same format Evolution Lab's own
+        save_to_library option writes) tagged 'promoted', independent of
+        whether auto-save-to-library is enabled for the run -- this is
+        the on-demand version so a leader found overnight can be pushed
+        into the library and run through 15 Full Pipeline without
+        needing to re-run the whole generation with that option on."""
+        config = (record.get("spec") or {}).get("config")
+        if not config:
+            messagebox.showwarning(
+                "Nothing to promote",
+                "This candidate has no manual-builder config attached, so there's nothing to save "
+                "to the Strategy Library.",
+            )
+            return
+        family = (record.get("meta") or {}).get("family", "strategy")
+        cid = record.get("candidate_id", "unknown")
+        filename = f"evolab_promoted_{family}_{cid[-8:]}.json"
+        text = json.dumps(config, indent=2)
+        try:
+            try:
+                save_strategy_text(text, filename, "manual", overwrite=False)
+            except StrategyAlreadyExists:
+                if not messagebox.askyesno(
+                    "Already promoted", f"'{filename}' is already in the Strategy Library. Overwrite it?",
+                ):
+                    return
+                save_strategy_text(text, filename, "manual", overwrite=True)
+            set_strategy_status("manual", filename, "promoted")
+        except Exception as exc:
+            messagebox.showerror("Could not promote", str(exc))
+            return
+        messagebox.showinfo(
+            "Promoted",
+            f"Saved to Strategy Library as '{filename}' (manual, status: promoted). "
+            "Find it in 06 Strategy Library / 15 Full Pipeline's batch queue to run it through "
+            "the full validation pipeline.",
+        )
+        try:
+            self._refresh_strategy_library()
+        except Exception:
+            pass
+
     def _poll_evolution_status(self):
         runner = self._evolution_runner
         if runner is None:
@@ -7482,12 +7728,7 @@ class MainWindow:
             fg=GREEN if status["running"] else TEXT_DIM,
         )
         try:
-            self.evo_leaderboard_listbox.delete(0, END)
-            for r in runner.leaderboard:
-                score = r.fitness.final_score if r.fitness else float("nan")
-                self.evo_leaderboard_listbox.insert(
-                    END, f"  {score:8.2f}   {r.meta.get('family', '?'):18s}  {r.candidate_id}"
-                )
+            self._refresh_evo_leaderboard_listbox([r.to_checkpoint_dict() for r in runner.leaderboard])
         except Exception:
             pass
         if status["running"]:
@@ -9077,9 +9318,121 @@ class MainWindow:
         self._dl_session = None
 
 
+class _SplashScreen(Toplevel):
+    """Dark, borderless boot splash shown while MainWindow builds its ~17
+    tabs' worth of widgets. Without this, the very first thing the user
+    sees is the real window rendering itself piece by piece (sidebar, then
+    each tab's frame, then charts) which reads as glitchy -- the splash
+    covers exactly that window with something intentional instead, and
+    disappears the instant the real UI is fully built and ready to show."""
+
+    WIDTH, HEIGHT = 520, 320
+
+    def __init__(self, parent: Tk):
+        super().__init__(parent)
+        self.overrideredirect(True)
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+        bg = "#05060A"  # deliberately darker/more "ominous" than the app's own BG
+        self.configure(bg=bg)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x, y = (sw - self.WIDTH) // 2, (sh - self.HEIGHT) // 2
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+
+        self._canvas = Canvas(self, width=self.WIDTH, height=self.HEIGHT, bg=bg, highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True)
+        self._glow_color = NEON_CYAN
+        self._bg = bg
+        self._tick = 0
+        self._status = "Booting T58 Prop Algo Backtester..."
+        self._draw()
+        self._animate()
+
+    def set_status(self, text: str) -> None:
+        self._status = text
+        self._draw()
+
+    def _draw(self) -> None:
+        c = self._canvas
+        c.delete("all")
+        cx, cy = self.WIDTH / 2, self.HEIGHT / 2 - 20
+
+        # Pulsing neon-blue glow halo behind the wordmark -- several
+        # progressively larger, more transparent rings, the same
+        # "layered outline" trick GlowCard uses elsewhere in this app,
+        # with the pulse driven by a slow sine wave instead of a fixed
+        # radius so it reads as alive rather than static.
+        import math
+        pulse = 0.5 + 0.5 * math.sin(self._tick / 14.0)
+        for i, base_alpha in ((5, 0.04), (4, 0.07), (3, 0.11), (2, 0.16), (1, 0.24)):
+            alpha = base_alpha * (0.6 + 0.4 * pulse)
+            r = 70 + i * 16
+            c.create_oval(
+                cx - r, cy - r, cx + r, cy + r,
+                outline=_blend_hex(self._bg, self._glow_color, alpha), width=3,
+            )
+
+        c.create_text(
+            cx, cy, text="T58", fill=_blend_hex(self._bg, self._glow_color, 0.85 + 0.15 * pulse),
+            font=_safe_font(46, "bold"),
+        )
+        c.create_text(
+            cx, cy + 44, text="PROP ALGO BACKTESTER", fill=self._glow_color,
+            font=_safe_font(11, "bold"),
+        )
+        c.create_text(
+            cx, self.HEIGHT - 34, text=self._status, fill="#5C6472",
+            font=_safe_font(9),
+        )
+        # Small horizontal "loading" tick marching left-to-right, since a
+        # real determinate percentage isn't available for widget
+        # construction -- just enough motion to read as "working," not
+        # "frozen."
+        bar_w = 220
+        bx0, by = cx - bar_w / 2, self.HEIGHT - 54
+        c.create_line(bx0, by, bx0 + bar_w, by, fill="#1E232E", width=3)
+        pos = (self._tick * 6) % (bar_w + 60) - 30
+        c.create_line(
+            max(bx0, bx0 + pos - 30), by, min(bx0 + bar_w, bx0 + pos + 30), by,
+            fill=self._glow_color, width=3,
+        )
+
+    def _animate(self) -> None:
+        self._tick += 1
+        try:
+            self._draw()
+            self.after(60, self._animate)
+        except Exception:
+            pass  # splash already destroyed
+
+
 def launch():
     root = Tk()
-    MainWindow(root)
+    root.withdraw()  # hidden while the real window builds, splash covers that gap
+    splash = None
+    try:
+        splash = _SplashScreen(root)
+        root._t58_splash = splash
+        root.update()
+    except Exception:
+        splash = None  # never let a cosmetic splash failure block the real app
+
+    window = MainWindow(root)
+
+    if splash is not None:
+        try:
+            del root._t58_splash
+            splash.destroy()
+        except Exception:
+            pass
+    root.deiconify()
+    try:
+        root.lift()
+        root.focus_force()
+    except Exception:
+        pass
     root.mainloop()
 
 

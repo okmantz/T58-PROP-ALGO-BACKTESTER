@@ -47,12 +47,19 @@ from app.data.alpaca_source import (
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
+from app.optimize.multi_objective import (
+    DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement,
+)
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, RefinementError, run_iterative_refinement
+from app.optimize.walkforward_ga import run_walkforward_aware_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
 from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
 from app.prop.simulator import PropRules, simulate_account
 from app.reports.generator import generate_full_report
 from app.reports.refinement_report import generate_refinement_report
+from app.reports.validation_reports import (
+    generate_multi_objective_report, generate_walk_forward_report, generate_walkforward_ga_report,
+)
 from app.reports import run_history
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
 from app.search.search_report import generate_search_report
@@ -60,6 +67,7 @@ from app.search.strategy_space import (
     StrategySpaceError, family_description, generate_search_space, list_families,
 )
 from app.strategy.base import StrategyError
+from app.validation.walk_forward_opt import run_walk_forward_optimization
 from app.strategy.library import (
     STRATEGY_STATUSES, STRATEGY_TYPES, StrategyAlreadyExists, delete_many,
     delete_saved_strategy, export_library_zip_bytes, list_all_markets, list_all_tags,
@@ -90,6 +98,12 @@ REFINEMENT_DIR = BASE_DIR / "reports" / "refinement"
 REFINEMENT_DIR.mkdir(parents=True, exist_ok=True)
 FULL_PIPELINE_DIR = BASE_DIR / "reports" / "full_pipeline"
 FULL_PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
+WFO_DIR = BASE_DIR / "reports" / "walk_forward_opt"
+WFO_DIR.mkdir(parents=True, exist_ok=True)
+MULTI_OBJ_DIR = BASE_DIR / "reports" / "multi_objective"
+MULTI_OBJ_DIR.mkdir(parents=True, exist_ok=True)
+WFGA_DIR = BASE_DIR / "reports" / "walkforward_ga"
+WFGA_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -1335,6 +1349,429 @@ def full_pipeline_job_status(job_id):
 @app.route("/full_pipeline_reports/<path:filename>")
 def serve_fullpipeline_report(filename):
     return send_from_directory(FULL_PIPELINE_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Step 08: Walk-Forward Optimization -- re-optimizes on each fold's train
+# window, applies the winner UNCHANGED to that fold's held-out test window,
+# and chains every fold's OOS trades into one continuous result. Same
+# background-job/poll shape as the other slow tabs above.
+# ---------------------------------------------------------------------------
+
+_WFO_JOBS: dict[str, dict] = {}
+_WFO_JOBS_LOCK = threading.Lock()
+
+
+def _wfo_job_log(job_id: str, msg: str) -> None:
+    with _WFO_JOBS_LOCK:
+        job = _WFO_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_wfo_job(
+    job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig,
+    n_folds: int, window_mode: str, train_frac: float, embargo_bars: int, refine_cfg: RefinementConfig,
+) -> None:
+    try:
+        result = run_walk_forward_optimization(
+            df, strategy, risk, rules, mc_cfg, n_folds=n_folds, window_mode=window_mode,
+            train_frac=train_frac, embargo_bars=embargo_bars, refine_cfg=refine_cfg,
+            progress_cb=lambda msg: _wfo_job_log(job_id, msg),
+        )
+        paths = generate_walk_forward_report(WFO_DIR, result, basename=f"walk_forward_opt_{job_id}")
+        with _WFO_JOBS_LOCK:
+            job = _WFO_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+            job["report_html"] = f"/wfo_reports/{Path(paths['html']).name}"
+            job["report_json"] = f"/wfo_reports/{Path(paths['json']).name}"
+    except RefinementError as exc:
+        with _WFO_JOBS_LOCK:
+            job = _WFO_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        with _WFO_JOBS_LOCK:
+            job = _WFO_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/walk-forward-opt")
+def wfo_form():
+    return render_template(
+        "wfo.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES, fitness_metrics=FITNESS_METRICS,
+    )
+
+
+@app.route("/walk-forward-opt/start", methods=["POST"])
+def wfo_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("wfo.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+
+        strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            commission_per_trade=float(form.get("commission", 0)),
+            slippage_pips=float(form.get("slippage_pips", 0.5)),
+            spread_pips=float(form.get("spread_pips", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000)),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+            max_drawdown_pct=float(form.get("max_dd", 10)),
+        )
+        mc_cfg = MonteCarloConfig(n_simulations=int(form.get("n_sims", 1000) or 1000))
+        refine_cfg = RefinementConfig(
+            population_size=int(form.get("population_size", 8) or 8),
+            generations=int(form.get("generations", 3) or 3),
+            search_monte_carlo_sims=int(form.get("search_mc_sims", 200) or 200),
+            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+        )
+
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _WFO_JOBS_LOCK:
+            _WFO_JOBS[job_id] = {"log": initial_log, "done": False, "error": None, "result": None, "started_at": time.time(), "instrument": active_label}
+        thread = threading.Thread(
+            target=_run_wfo_job,
+            args=(
+                job_id, df, strategy, risk, rules, mc_cfg,
+                int(form.get("n_folds", 5) or 5), form.get("window_mode", "rolling"),
+                float(form.get("train_frac", 0.6) or 0.6), int(form.get("embargo_bars", 0) or 0), refine_cfg,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("wfo_job", job_id=job_id))
+    except (StrategyError, RefinementError) as exc:
+        return render_template("wfo.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("wfo.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 500
+
+
+@app.route("/walk-forward-opt/job/<job_id>")
+def wfo_job(job_id):
+    with _WFO_JOBS_LOCK:
+        job = _WFO_JOBS.get(job_id)
+    if job is None:
+        return render_template("wfo_job.html", job_id=job_id, not_found=True), 404
+    return render_template("wfo_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/walk-forward-opt/job/<job_id>/status.json")
+def wfo_job_status(job_id):
+    with _WFO_JOBS_LOCK:
+        job = _WFO_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    result = job.get("result")
+    summary = None
+    if result is not None:
+        d = result.to_summary_dict()
+        d["report_html"] = job.get("report_html")
+        d["report_json"] = job.get("report_json")
+        summary = d
+    return jsonify({"found": True, "done": job["done"], "error": job["error"], "log": job["log"], "instrument": job.get("instrument"), "summary": summary})
+
+
+@app.route("/wfo_reports/<path:filename>")
+def serve_wfo_report(filename):
+    return send_from_directory(WFO_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Step 09: Multi-Objective (NSGA-II) Optimization -- searches for a Pareto
+# front across 2+ objectives at once (e.g. Sharpe vs. max drawdown vs. eval
+# pass probability) instead of collapsing everything into one fitness
+# number. Same background-job/poll shape as the other slow tabs.
+# ---------------------------------------------------------------------------
+
+_MO_JOBS: dict[str, dict] = {}
+_MO_JOBS_LOCK = threading.Lock()
+
+
+def _mo_job_log(job_id: str, msg: str) -> None:
+    with _MO_JOBS_LOCK:
+        job = _MO_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_mo_job(job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig, mo_cfg: MultiObjectiveConfig) -> None:
+    try:
+        result = run_multi_objective_refinement(
+            df, strategy, risk, rules, mc_cfg, mo_cfg,
+            progress_cb=lambda msg: _mo_job_log(job_id, msg),
+        )
+        paths = generate_multi_objective_report(MULTI_OBJ_DIR, result, basename=f"multi_objective_{job_id}")
+        with _MO_JOBS_LOCK:
+            job = _MO_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+            job["report_html"] = f"/mo_reports/{Path(paths['html']).name}"
+            job["report_json"] = f"/mo_reports/{Path(paths['json']).name}"
+    except RefinementError as exc:
+        with _MO_JOBS_LOCK:
+            job = _MO_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        with _MO_JOBS_LOCK:
+            job = _MO_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/multi-objective")
+def mo_form():
+    return render_template(
+        "multi_objective.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES, all_objectives=sorted(OBJECTIVE_DIRECTIONS), default_objectives=DEFAULT_OBJECTIVES,
+    )
+
+
+@app.route("/multi-objective/start", methods=["POST"])
+def mo_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("multi_objective.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), all_objectives=sorted(OBJECTIVE_DIRECTIONS), default_objectives=DEFAULT_OBJECTIVES), 400
+
+        strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            commission_per_trade=float(form.get("commission", 0)),
+            slippage_pips=float(form.get("slippage_pips", 0.5)),
+            spread_pips=float(form.get("spread_pips", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000)),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+            max_drawdown_pct=float(form.get("max_dd", 10)),
+        )
+        mc_cfg = MonteCarloConfig(n_simulations=int(form.get("n_sims", 1000) or 1000))
+
+        objectives = form.getlist("objectives") or list(DEFAULT_OBJECTIVES)
+        mo_cfg = MultiObjectiveConfig(
+            objectives=objectives,
+            population_size=int(form.get("population_size", 20) or 20),
+            generations=int(form.get("generations", 8) or 8),
+            search_monte_carlo_sims=int(form.get("search_mc_sims", 300) or 300),
+        )
+
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _MO_JOBS_LOCK:
+            _MO_JOBS[job_id] = {"log": initial_log, "done": False, "error": None, "result": None, "started_at": time.time(), "instrument": active_label}
+        thread = threading.Thread(target=_run_mo_job, args=(job_id, df, strategy, risk, rules, mc_cfg, mo_cfg), daemon=True)
+        thread.start()
+        return redirect(url_for("mo_job", job_id=job_id))
+    except (StrategyError, RefinementError) as exc:
+        return render_template("multi_objective.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), all_objectives=sorted(OBJECTIVE_DIRECTIONS), default_objectives=DEFAULT_OBJECTIVES), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("multi_objective.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), all_objectives=sorted(OBJECTIVE_DIRECTIONS), default_objectives=DEFAULT_OBJECTIVES), 500
+
+
+@app.route("/multi-objective/job/<job_id>")
+def mo_job(job_id):
+    with _MO_JOBS_LOCK:
+        job = _MO_JOBS.get(job_id)
+    if job is None:
+        return render_template("multi_objective_job.html", job_id=job_id, not_found=True), 404
+    return render_template("multi_objective_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/multi-objective/job/<job_id>/status.json")
+def mo_job_status(job_id):
+    with _MO_JOBS_LOCK:
+        job = _MO_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    result = job.get("result")
+    summary = None
+    if result is not None:
+        summary = {
+            "objectives": result.config.objectives,
+            "pareto_front": [
+                {"objective_values": dict(zip(result.config.objectives, c.objective_values)), "feasible": c.feasible}
+                for c in result.pareto_front
+            ],
+            "generations_run": len(result.generation_history or []),
+            "elapsed_seconds": result.elapsed_seconds,
+            "report_html": job.get("report_html"),
+            "report_json": job.get("report_json"),
+        }
+    return jsonify({"found": True, "done": job["done"], "error": job["error"], "log": job["log"], "instrument": job.get("instrument"), "summary": summary})
+
+
+@app.route("/mo_reports/<path:filename>")
+def serve_mo_report(filename):
+    return send_from_directory(MULTI_OBJ_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Step 10: Walk-Forward-Aware GA -- the same GA engine as Iterative
+# Refinement (Step 06), but every candidate's fitness is scored ONLY on
+# chained out-of-sample fold performance instead of a single in-sample run.
+# Same background-job/poll shape as the other slow tabs.
+# ---------------------------------------------------------------------------
+
+_WFGA_JOBS: dict[str, dict] = {}
+_WFGA_JOBS_LOCK = threading.Lock()
+
+
+def _wfga_job_log(job_id: str, msg: str) -> None:
+    with _WFGA_JOBS_LOCK:
+        job = _WFGA_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_wfga_job(
+    job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig,
+    refine_cfg: RefinementConfig, n_folds: int, window_mode: str, train_frac: float,
+) -> None:
+    try:
+        result = run_walkforward_aware_refinement(
+            df, strategy, risk, rules, mc_cfg, refine_cfg, n_folds=n_folds, window_mode=window_mode,
+            train_frac=train_frac, progress_cb=lambda msg: _wfga_job_log(job_id, msg),
+        )
+        paths = generate_walkforward_ga_report(WFGA_DIR, result, basename=f"walkforward_ga_{job_id}")
+        with _WFGA_JOBS_LOCK:
+            job = _WFGA_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+            job["report_html"] = f"/wfga_reports/{Path(paths['html']).name}"
+            job["report_json"] = f"/wfga_reports/{Path(paths['json']).name}"
+    except RefinementError as exc:
+        with _WFGA_JOBS_LOCK:
+            job = _WFGA_JOBS[job_id]
+            job["done"] = True
+            job["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        with _WFGA_JOBS_LOCK:
+            job = _WFGA_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/walk-forward-ga")
+def wfga_form():
+    return render_template(
+        "wfga.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        strategy_statuses=STRATEGY_STATUSES, fitness_metrics=FITNESS_METRICS,
+    )
+
+
+@app.route("/walk-forward-ga/start", methods=["POST"])
+def wfga_start():
+    form = request.form
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("wfga.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+
+        strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            commission_per_trade=float(form.get("commission", 0)),
+            slippage_pips=float(form.get("slippage_pips", 0.5)),
+            spread_pips=float(form.get("spread_pips", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000)),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+            max_drawdown_pct=float(form.get("max_dd", 10)),
+        )
+        mc_cfg = MonteCarloConfig(n_simulations=int(form.get("n_sims", 1000) or 1000))
+        refine_cfg = RefinementConfig(
+            population_size=int(form.get("population_size", 10) or 10),
+            generations=int(form.get("generations", 5) or 5),
+            search_monte_carlo_sims=int(form.get("search_mc_sims", 200) or 200),
+            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+        )
+
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _WFGA_JOBS_LOCK:
+            _WFGA_JOBS[job_id] = {"log": initial_log, "done": False, "error": None, "result": None, "started_at": time.time(), "instrument": active_label}
+        thread = threading.Thread(
+            target=_run_wfga_job,
+            args=(
+                job_id, df, strategy, risk, rules, mc_cfg, refine_cfg,
+                int(form.get("n_folds", 4) or 4), form.get("window_mode", "rolling"), float(form.get("train_frac", 0.6) or 0.6),
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("wfga_job", job_id=job_id))
+    except (StrategyError, RefinementError) as exc:
+        return render_template("wfga.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("wfga.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 500
+
+
+@app.route("/walk-forward-ga/job/<job_id>")
+def wfga_job(job_id):
+    with _WFGA_JOBS_LOCK:
+        job = _WFGA_JOBS.get(job_id)
+    if job is None:
+        return render_template("wfga_job.html", job_id=job_id, not_found=True), 404
+    return render_template("wfga_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/walk-forward-ga/job/<job_id>/status.json")
+def wfga_job_status(job_id):
+    with _WFGA_JOBS_LOCK:
+        job = _WFGA_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    result = job.get("result")
+    summary = None
+    if result is not None:
+        summary = {
+            "best_fitness": result.best.fitness,
+            "best_in_sample_fitness": result.best.in_sample_fitness,
+            "overfitting_gap": result.overfitting_gap,
+            "oos_trade_count": result.best.oos_trade_count,
+            "n_folds": result.n_folds,
+            "window_mode": result.window_mode,
+            "generations_run": len(result.generation_history or []),
+            "elapsed_seconds": result.elapsed_seconds,
+            "report_html": job.get("report_html"),
+            "report_json": job.get("report_json"),
+        }
+    return jsonify({"found": True, "done": job["done"], "error": job["error"], "log": job["log"], "instrument": job.get("instrument"), "summary": summary})
+
+
+@app.route("/wfga_reports/<path:filename>")
+def serve_wfga_report(filename):
+    return send_from_directory(WFGA_DIR, filename)
 
 
 @app.route("/search")

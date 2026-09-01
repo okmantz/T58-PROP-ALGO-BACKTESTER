@@ -6,10 +6,10 @@ Firebase Hosting only serves static files -- it cannot run this app's Python
 backend (real pandas/numpy backtests, Monte Carlo, GA search). So:
 
 - **Cloud Run** runs the actual Flask app, in the Docker container defined
-  by `Dockerfile`, at the repo root.
+  by `docker/Dockerfile` (built with the repo root as its build context).
 - **Firebase Hosting** sits in front of it and proxies every request to that
-  Cloud Run service (see `firebase.json`'s `rewrites`). Your phone/browser
-  only ever sees one URL -- the Firebase Hosting domain.
+  Cloud Run service (see this folder's `firebase.json`'s `rewrites`). Your
+  phone/browser only ever sees one URL -- the Firebase Hosting domain.
 - The app is already a PWA (`app/web/static/manifest.json` + `sw.js`) --
   "Add to Home Screen" on that URL installs it with its own icon, standalone
   window, no App Store/Play Store submission.
@@ -27,7 +27,8 @@ not something Firebase alone provides.
    shown under Project Settings.
 
 2. **Put that Project ID in two places:**
-   - `.firebaserc` in this repo, replacing `REPLACE_WITH_YOUR_FIREBASE_PROJECT_ID`.
+   - `.firebaserc` in this `firebase/` folder, replacing
+     `REPLACE_WITH_YOUR_FIREBASE_PROJECT_ID`.
    - A GitHub repo secret named `GCP_PROJECT_ID` (Settings -> Secrets and
      variables -> Actions -> New repository secret).
 
@@ -62,9 +63,14 @@ npm install -g firebase-tools
 gcloud auth login
 firebase login
 
-# Every deploy
-gcloud run deploy t58-backtester --source . --region us-central1 --allow-unauthenticated
-firebase deploy --only hosting
+# Every deploy (run from the repo root) -- build via docker/Dockerfile
+# explicitly rather than `gcloud run deploy --source .`, since --source's
+# auto-build only looks for a Dockerfile at the repo root.
+IMAGE="us-central1-docker.pkg.dev/<your-project-id>/t58-images/t58-backtester:manual"
+docker build -f docker/Dockerfile -t "$IMAGE" .
+docker push "$IMAGE"
+gcloud run deploy t58-backtester --image "$IMAGE" --region us-central1 --allow-unauthenticated
+cd firebase && firebase deploy --only hosting
 ```
 
 ## Important limitation: storage is not durable

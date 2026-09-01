@@ -28,6 +28,7 @@ from tkinter import (
     Checkbutton, PhotoImage, Toplevel,
 )
 
+import app.evolution.checkpoint as evo_checkpoint
 from app.backtest.adaptive_risk import AdaptiveRiskConfig, AdaptiveRiskError, AdaptiveRiskRule
 from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig, suggest_pip_size
@@ -7250,11 +7251,21 @@ class MainWindow:
         btn_row.pack(anchor="w", padx=18, pady=(10, 6))
         self._button(btn_row, "START EVOLUTION LAB", self._start_evolution_lab, primary=True).pack(side="left")
         self._button(btn_row, "STOP", self._stop_evolution_lab).pack(side="left", padx=8)
+        self._button(btn_row, "RESET (discard saved progress)", self._reset_evolution_lab).pack(side="left", padx=8)
 
         self.evo_status_label = Label(
             cfg_section, text="Not running.", bg=PANEL, fg=TEXT_DIM, font=_safe_font(9),
         )
-        self.evo_status_label.pack(anchor="w", padx=18, pady=(0, 12))
+        self.evo_status_label.pack(anchor="w", padx=18, pady=(0, 2))
+        Label(
+            cfg_section,
+            text=(
+                "Progress (generation, leaderboard, journal) is saved to disk after every generation. "
+                "STOP then START AGAIN resumes from exactly where it left off, as long as the same market "
+                "data is still loaded -- click RESET first if you want a genuinely fresh run instead."
+            ),
+            bg=PANEL, fg=TEXT_MUTED, font=_safe_font(8), wraplength=900, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 12))
 
         lb_section = self._section(
             f, "Leaderboard (all-time best seen)",
@@ -7268,6 +7279,22 @@ class MainWindow:
             font=(MONO, 9),
         )
         self.evo_leaderboard_listbox.pack(fill="x", padx=18, pady=(2, 12))
+
+        tested_section = self._section(
+            f, "Tested strategies (most recent first)",
+            "Every candidate the PRE-FILTER stage has actually backtested this run -- pass or fail, "
+            "with the reason it was rejected if it was, and how far it got if it passed. Persists "
+            "across STOP/START and survives closing the app; click REFRESH to pull the latest.",
+        )
+        tested_btn_row = Frame(tested_section, bg=PANEL)
+        tested_btn_row.pack(anchor="w", padx=18, pady=(2, 4))
+        self._button(tested_btn_row, "REFRESH", self._refresh_evolution_tested).pack(side="left")
+        self.evo_tested_listbox = Listbox(
+            tested_section, height=10, exportselection=False, bg=PANEL_3, fg=TEXT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+            font=(MONO, 9),
+        )
+        self.evo_tested_listbox.pack(fill="x", padx=18, pady=(2, 12))
 
         log_section = self._section(
             f, "Live log + hypothesis journal",
@@ -7354,23 +7381,77 @@ class MainWindow:
             f"{'unlimited generations' if cfg.max_generations is None else f'max {cfg.max_generations} generations'}."
         )
         self._poll_evolution_status()
+        self._refresh_evolution_tested()
 
     def _stop_evolution_lab(self):
         if self._evolution_runner is None or not self._evolution_runner.is_running:
             messagebox.showinfo("Not running", "Evolution Lab isn't currently running.")
             return
         self._evolution_runner.stop()
-        self._evo_log("Stop requested -- finishing the current generation, then stopping.")
+        self._evo_log("Stop requested -- finishing the current generation, then stopping. Progress up to "
+                       "that point is saved -- START again to resume.")
+
+    def _reset_evolution_lab(self):
+        if self._evolution_runner is not None and self._evolution_runner.is_running:
+            messagebox.showwarning(
+                "Still running", "Click STOP first, then RESET once it's finished the current generation."
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset Evolution Lab",
+            "This discards the saved generation/leaderboard/journal checkpoint and the tested-strategies "
+            "log, so the next START begins a completely fresh run. This cannot be undone. Continue?",
+        ):
+            return
+        if self._evolution_runner is None:
+            evo_checkpoint.clear_checkpoint()
+            evo_checkpoint.clear_tested_log()
+        else:
+            self._evolution_runner.reset()
+        self.evo_log_text.delete("1.0", END)
+        self.evo_leaderboard_listbox.delete(0, END)
+        self.evo_tested_listbox.delete(0, END)
+        self.evo_status_label.config(text="Not running. (Saved progress cleared.)", fg=TEXT_DIM)
+        self._evo_log("Evolution Lab progress reset -- the next START begins a fresh run.")
+
+    def _refresh_evolution_tested(self):
+        try:
+            self.evo_tested_listbox.delete(0, END)
+            if self._evolution_runner is not None:
+                rows = self._evolution_runner.tested_candidates(limit=300)
+            else:
+                rows = evo_checkpoint.read_tested_rows(limit=300)
+            for row in reversed(rows):
+                gen = row.get("generation", "?")
+                fam = str(row.get("family", "?"))[:16]
+                stage = row.get("stage", "?")
+                if row.get("passed"):
+                    if stage == "full_eval":
+                        score = row.get("fitness_score")
+                        detail = f"PASSED prefilter, fitness {score:.2f}" if isinstance(score, (int, float)) else "PASSED prefilter"
+                    else:
+                        detail = "PASSED prefilter"
+                else:
+                    reasons = ", ".join(row.get("reasons") or []) or (row.get("error") or "unknown")
+                    detail = f"rejected: {reasons}"
+                trades = row.get("n_trades")
+                trades_str = f"{trades} trades" if trades is not None else ""
+                self.evo_tested_listbox.insert(
+                    END, f"  gen {gen:>3}  {fam:16s}  {trades_str:12s}  {detail}"
+                )
+        except Exception:
+            pass
 
     def _poll_evolution_status(self):
         runner = self._evolution_runner
         if runner is None:
             return
         status = runner.status()
+        resumed_note = " (resumed)" if status.get("resumed") else ""
         self.evo_status_label.config(
             text=(
                 f"{'RUNNING' if status['running'] else 'STOPPED'} -- generation {status['generation']}, "
-                f"leaderboard size {status['leaderboard_size']}"
+                f"leaderboard size {status['leaderboard_size']}{resumed_note}"
             ),
             fg=GREEN if status["running"] else TEXT_DIM,
         )
@@ -7386,6 +7467,7 @@ class MainWindow:
         if status["running"]:
             try:
                 self.root.after(2000, self._poll_evolution_status)
+                self.root.after(4000, self._refresh_evolution_tested)
             except Exception:
                 pass
 

@@ -20,7 +20,22 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_KG_PATH = Path("data/evolution/knowledge_graph.jsonl")
+from app.data.storage import get_app_base_dir
+
+
+def _default_kg_path() -> Path:
+    # Routed through get_app_base_dir() (same helper app/data/storage.py,
+    # app/reports/run_history.py, app/strategy/library.py, and the theme/
+    # settings files all use) instead of a bare relative path -- a plain
+    # "data/evolution/..." path resolves against the current working
+    # directory, which for a double-clicked packaged .exe is NOT
+    # guaranteed to be the exe's own folder (or even writable), so the
+    # knowledge graph could silently fail to persist, or write somewhere
+    # the user never finds, across restarts.
+    return get_app_base_dir() / "data" / "evolution" / "knowledge_graph.jsonl"
+
+
+DEFAULT_KG_PATH = _default_kg_path()
 
 
 def feature_vector_for_spec(spec: dict, meta: dict | None = None) -> dict:

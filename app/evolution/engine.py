@@ -66,8 +66,9 @@ import pandas as pd
 
 from app.backtest.engine import run_backtest
 from app.backtest.risk import RiskConfig
+from app.evolution import checkpoint as evo_checkpoint
 from app.evolution.knowledge_graph import DEFAULT_KG_PATH, KnowledgeGraph, feature_vector_for_spec
-from app.evolution.prop_fitness import compute_prop_fitness
+from app.evolution.prop_fitness import PropFitnessBreakdown, compute_prop_fitness
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.parameter_space import apply_genome, extract_genome
 from app.optimize.refinement import _mutate, _stressed_risk_config
@@ -129,6 +130,23 @@ class EvolutionConfig:
     library_status: str = "draft"
     knowledge_graph_path: str = str(DEFAULT_KG_PATH)
 
+    # Checkpoint / resume -- so STOP then START again continues from the
+    # last completed generation (same elites, leaderboard, journal)
+    # instead of starting a brand new run from scratch. Resuming is
+    # refused (with a clear log message, falling back to a fresh run)
+    # if the market data being started with doesn't match what the
+    # checkpoint was built from -- see app.evolution.checkpoint.
+    resume_from_checkpoint: bool = True
+    checkpoint_path: str = str(evo_checkpoint.default_checkpoint_path())
+    tested_log_path: str = str(evo_checkpoint.default_tested_log_path())
+
+    # Auto-relax -- if this many generations IN A ROW produce zero
+    # PRE-FILTER survivors, the pre-filter thresholds are automatically
+    # loosened once (same idea as Search Lab's own Stage 1 auto-relax)
+    # instead of the run silently grinding forever with an empty
+    # leaderboard and no indication why.
+    auto_relax_after_empty_generations: int = 3
+
 
 @dataclass
 class EvolutionCandidateRecord:
@@ -145,6 +163,48 @@ class EvolutionCandidateRecord:
     fitness: object = None                     # PropFitnessBreakdown
     trade_pnls: list = field(default_factory=list)
     trades: list = field(default_factory=list)  # raw Trade objects, for date-aligned cluster correlation
+
+    def to_checkpoint_dict(self) -> dict:
+        """Serializes everything needed to redisplay this record and seed
+        future generations -- NOT the raw `trades` objects (not JSON-
+        serializable and only needed transiently for same-generation
+        cluster-dedupe correlation), and pnls are capped since a
+        checkpoint is meant to be a small, fast-to-load file, not a full
+        trade-by-trade record (the strategy itself is always saved to
+        the Strategy Library separately, in full, if save_to_library is on)."""
+        return {
+            "candidate_id": self.candidate_id,
+            "spec": self.spec,
+            "meta": self.meta,
+            "stats": self.stats,
+            "mc_summary": self.mc_summary,
+            "robustness": self.robustness,
+            "walk_forward": self.walk_forward,
+            "pbo": self.pbo,
+            "cpcv_degradation": self.cpcv_degradation,
+            "stressed_ok": self.stressed_ok,
+            "fitness": self.fitness.to_dict() if self.fitness is not None else None,
+            "trade_pnls": self.trade_pnls[:500],
+        }
+
+
+def _record_from_dict(d: dict) -> EvolutionCandidateRecord:
+    fitness = PropFitnessBreakdown(**d["fitness"]) if d.get("fitness") else None
+    return EvolutionCandidateRecord(
+        candidate_id=d.get("candidate_id", ""),
+        spec=d.get("spec") or {},
+        meta=d.get("meta") or {},
+        stats=d.get("stats"),
+        mc_summary=d.get("mc_summary"),
+        robustness=d.get("robustness"),
+        walk_forward=d.get("walk_forward"),
+        pbo=d.get("pbo"),
+        cpcv_degradation=d.get("cpcv_degradation"),
+        stressed_ok=d.get("stressed_ok"),
+        fitness=fitness,
+        trade_pnls=d.get("trade_pnls") or [],
+        trades=[],
+    )
 
 
 def _daily_pnl_series(trades) -> pd.Series:
@@ -183,6 +243,77 @@ class EvolutionRunner:
         self.generation = 0
         self.leaderboard: list[EvolutionCandidateRecord] = []      # current top N (all-time best seen)
         self.journal: list[str] = []                                 # numbered HYPOTHESIS-style entries
+        self._elites: list[tuple[dict, dict]] = []                    # seeds mutated children next gen
+        self._consecutive_empty_generations = 0
+        self.resumed = False                                          # set True if a checkpoint was loaded
+
+        self._load_checkpoint_if_compatible()
+
+    # -- checkpoint / resume ----------------------------------------------
+    def _load_checkpoint_if_compatible(self) -> None:
+        """Loads generation/elites/leaderboard/journal from disk if the
+        config asks to resume AND the checkpoint was built from the same
+        market data this runner is starting with. Otherwise starts clean
+        (still logging why, so a mismatched-data situation isn't silent)."""
+        if not self.cfg.resume_from_checkpoint:
+            return
+        saved = evo_checkpoint.load_checkpoint(Path(self.cfg.checkpoint_path))
+        if saved is None:
+            return
+        current_fp = evo_checkpoint.data_fingerprint(self.df)
+        if saved.data_fingerprint and saved.data_fingerprint != current_fp:
+            self._log(
+                f"Found a saved Evolution Lab checkpoint (generation {saved.generation}, "
+                f"{len(saved.leaderboard)} on its leaderboard) but it was built from different "
+                f"market data than what's loaded now -- starting a fresh run instead of resuming "
+                f"against mismatched data. (Use the same data file to resume that run.)"
+            )
+            return
+        try:
+            self.generation = saved.generation
+            self._elites = [(e["spec"], e["meta"]) for e in saved.elites]
+            self.leaderboard = [_record_from_dict(r) for r in saved.leaderboard]
+            self.journal = list(saved.journal)
+            self.resumed = True
+            self._log(
+                f"Resuming Evolution Lab from checkpoint: generation {self.generation}, "
+                f"{len(self.leaderboard)} on the leaderboard, {len(self.journal)} journal "
+                f"entries carried over. Click STOP at any time -- progress keeps saving after "
+                f"every generation."
+            )
+        except Exception:
+            self._log("Found a saved Evolution Lab checkpoint but couldn't load it cleanly -- starting fresh.")
+            self.generation = 0
+            self._elites = []
+            self.leaderboard = []
+            self.journal = []
+            self.resumed = False
+
+    def _save_checkpoint(self, next_generation: int) -> None:
+        try:
+            ckpt = evo_checkpoint.EvolutionCheckpoint(
+                generation=next_generation,
+                elites=[{"spec": s, "meta": m} for s, m in self._elites],
+                leaderboard=[r.to_checkpoint_dict() for r in self.leaderboard],
+                journal=list(self.journal),
+                data_fingerprint=evo_checkpoint.data_fingerprint(self.df),
+                saved_at=pd.Timestamp.now("UTC").isoformat(),
+            )
+            evo_checkpoint.save_checkpoint(ckpt, Path(self.cfg.checkpoint_path))
+        except Exception:
+            pass  # checkpointing is best-effort -- must never break the run itself
+
+    def reset(self) -> None:
+        """Discards the on-disk checkpoint and tested-candidates log so the
+        next START begins a genuinely fresh run. Only safe to call while
+        not running."""
+        evo_checkpoint.clear_checkpoint(Path(self.cfg.checkpoint_path))
+        evo_checkpoint.clear_tested_log(Path(self.cfg.tested_log_path))
+        self.generation = 0
+        self._elites = []
+        self.leaderboard = []
+        self.journal = []
+        self.resumed = False
 
     # -- public controls ------------------------------------------------
     def start(self) -> None:
@@ -201,7 +332,16 @@ class EvolutionRunner:
             "running": self.is_running,
             "generation": self.generation,
             "leaderboard_size": len(self.leaderboard),
+            "resumed": self.resumed,
         }
+
+    def tested_candidates(self, limit: int = 500) -> list[dict]:
+        """The "what was actually tested" record -- every candidate the
+        PRE-FILTER stage has backtested this run (and prior resumed runs
+        against the same data), pass or fail, with the reason it was
+        rejected if it was. Read from disk so it survives a restart same
+        as the checkpoint does."""
+        return evo_checkpoint.read_tested_rows(Path(self.cfg.tested_log_path), limit=limit)
 
     # -- internals --------------------------------------------------------
     def _log(self, msg: str) -> None:
@@ -209,8 +349,7 @@ class EvolutionRunner:
             self.progress_cb(msg)
 
     def _run_loop(self) -> None:
-        elites: list[tuple[dict, dict]] = []
-        gen = 0
+        gen = self.generation
         try:
             while not self._stop_flag.is_set():
                 if self.cfg.max_generations is not None and gen >= self.cfg.max_generations:
@@ -219,22 +358,27 @@ class EvolutionRunner:
                 t0 = time.time()
                 self._log(f"===== GENERATION {gen} =====")
 
-                population = self._generate_population(gen, elites)
+                population = self._generate_population(gen, self._elites)
                 self._log(f"GENERATE: {len(population)} candidates.")
                 if self._stop_flag.is_set():
                     break
 
-                stage1_survivors = self._prefilter(population)
+                stage1_survivors, rejection_counts = self._prefilter(population, gen)
                 self._log(f"PRE-FILTER + BACKTEST: {len(stage1_survivors)}/{len(population)} survived.")
+                if not stage1_survivors:
+                    self._handle_empty_prefilter(gen, rejection_counts)
                 if self._stop_flag.is_set() or not stage1_survivors:
                     self._finish_empty_generation(gen, population)
+                    self._save_checkpoint(next_generation=gen + 1)
                     gen += 1
                     continue
+                self._consecutive_empty_generations = 0
 
                 evaluated = self._full_eval(stage1_survivors)
                 self._log(f"ROBUSTNESS / OOS / MONTE CARLO / PROP SIMULATION: {len(evaluated)} candidates scored.")
                 if self._stop_flag.is_set() or not evaluated:
                     self._finish_empty_generation(gen, population, evaluated)
+                    self._save_checkpoint(next_generation=gen + 1)
                     gen += 1
                     continue
 
@@ -252,6 +396,7 @@ class EvolutionRunner:
                 new_elites = clustered[: self.cfg.elite_keep]
 
                 self._record_generation_to_knowledge_graph(evaluated, {r.candidate_id for r in new_elites})
+                self._append_tested_log_full_eval(evaluated, gen)
                 self._update_leaderboard(new_elites)
                 self._maybe_save_to_library(new_elites)
                 self._write_journal_entry(gen, population, stage1_survivors, evaluated, cpcv_pool, stress_survivors, new_elites)
@@ -260,13 +405,41 @@ class EvolutionRunner:
                 self._log(f"Generation {gen} complete in {elapsed:.1f}s. Best fitness so far: "
                           f"{self.leaderboard[0].fitness.final_score:.2f}" if self.leaderboard else f"Generation {gen} complete in {elapsed:.1f}s.")
 
-                elites = [(r.spec, r.meta) for r in new_elites]
+                self._elites = [(r.spec, r.meta) for r in new_elites]
+                self._save_checkpoint(next_generation=gen + 1)
                 gen += 1
         except Exception:
             self._log("Evolution Lab crashed:\n" + traceback.format_exc())
         finally:
             self.is_running = False
-            self._log("Evolution Lab stopped.")
+            self._log("Evolution Lab stopped. Progress is saved -- clicking START again resumes from here.")
+
+    def _handle_empty_prefilter(self, gen: int, rejection_counts: dict) -> None:
+        """Logs WHY nothing survived (instead of just "0 survived", which
+        gives no way to tell "your data/settings genuinely can't produce
+        a passing strategy" from "something's silently broken"), and
+        auto-relaxes the pre-filter thresholds once every
+        `auto_relax_after_empty_generations` consecutive empty
+        generations -- same philosophy as Search Lab's own Stage 1
+        auto-relax (app.search.batch_runner), so a run doesn't grind for
+        hours with a leaderboard stuck at 0 for no visible reason."""
+        breakdown = ", ".join(f"{k}: {v}" for k, v in rejection_counts.items() if v) or "no candidates built successfully"
+        self._log(f"  Rejection breakdown -- {breakdown}.")
+        self._consecutive_empty_generations += 1
+        if self._consecutive_empty_generations >= self.cfg.auto_relax_after_empty_generations:
+            old_trades, old_pf = self.cfg.min_trades, self.cfg.min_profit_factor
+            self.cfg.min_trades = max(5, int(self.cfg.min_trades * 0.6))
+            self.cfg.min_profit_factor = max(1.0, round(self.cfg.min_profit_factor * 0.9, 3))
+            self.cfg.max_drawdown_buffer_mult = round(self.cfg.max_drawdown_buffer_mult * 1.25, 3)
+            self._log(
+                f"  AUTO-RELAX: {self._consecutive_empty_generations} generations in a row produced zero "
+                f"pre-filter survivors, so the thresholds were automatically loosened -- min trades "
+                f"{old_trades} -> {self.cfg.min_trades}, min profit factor {old_pf:.2f} -> "
+                f"{self.cfg.min_profit_factor:.2f}, drawdown buffer x{self.cfg.max_drawdown_buffer_mult:.2f}. "
+                f"If generations keep coming back empty even after this, the market data or the selected "
+                f"families likely can't produce a profitable strategy at all on this instrument/timeframe."
+            )
+            self._consecutive_empty_generations = 0
 
     def _finish_empty_generation(self, gen, population, evaluated=None) -> None:
         self._log(f"Generation {gen}: nothing survived far enough to update the leaderboard -- continuing to the next generation.")
@@ -309,32 +482,104 @@ class EvolutionRunner:
         return out[: max(self.cfg.population_size, len(out))]
 
     # -- PRE-FILTER + BACKTEST --------------------------------------------
-    def _prefilter(self, population: list[tuple[str, dict, dict]]):
+    def _prefilter(self, population: list[tuple[str, dict, dict]], gen: int):
         survivors = []
+        rejection_counts = {
+            "build_or_backtest_error": 0, "no_trades": 0, "min_trades": 0,
+            "profit_factor": 0, "max_drawdown": 0, "unprofitable": 0,
+        }
+        tested_rows = []
         for cid, spec, meta in population:
             if self._stop_flag.is_set():
                 break
             try:
                 strategy = build_strategy_from_spec(spec)
                 bt = run_backtest(self.df, strategy, self.risk)
-            except Exception:
+            except Exception as exc:
+                rejection_counts["build_or_backtest_error"] += 1
+                tested_rows.append(self._tested_row(cid, meta, gen, passed=False, reasons=["build_or_backtest_error"],
+                                                     error=str(exc)[:300]))
                 continue
             if not bt.trades:
+                rejection_counts["no_trades"] += 1
+                tested_rows.append(self._tested_row(cid, meta, gen, passed=False, reasons=["no_trades"]))
                 continue
             stats = bt.statistics.to_dict()
             pf = stats.get("profit_factor", 0.0)
             pf_val = 10.0 if pf == float("inf") else float(pf or 0.0)
             n_trades = stats.get("total_trades", 0)
             max_dd = stats.get("max_drawdown_pct", 0.0) or 0.0
-            passed = (
-                n_trades >= self.cfg.min_trades
-                and pf_val >= self.cfg.min_profit_factor
-                and max_dd <= self.prop_rules.max_drawdown_pct * self.cfg.max_drawdown_buffer_mult
-                and stats.get("net_profit", 0.0) > 0
-            )
-            if passed:
+
+            reasons = []
+            if n_trades < self.cfg.min_trades:
+                reasons.append("min_trades")
+            if pf_val < self.cfg.min_profit_factor:
+                reasons.append("profit_factor")
+            if max_dd > self.prop_rules.max_drawdown_pct * self.cfg.max_drawdown_buffer_mult:
+                reasons.append("max_drawdown")
+            if stats.get("net_profit", 0.0) <= 0:
+                reasons.append("unprofitable")
+
+            tested_rows.append(self._tested_row(
+                cid, meta, gen, passed=not reasons, reasons=reasons,
+                n_trades=n_trades, profit_factor=pf_val, net_profit=stats.get("net_profit"),
+                max_drawdown_pct=max_dd,
+            ))
+            if reasons:
+                for r in reasons:
+                    rejection_counts[r] += 1
+            else:
                 survivors.append((cid, spec, meta, bt))
-        return survivors
+        evo_checkpoint.append_tested_rows(tested_rows, Path(self.cfg.tested_log_path))
+        return survivors, rejection_counts
+
+    def _tested_row(self, cid: str, meta: dict, gen: int, passed: bool, reasons: list[str],
+                     n_trades=None, profit_factor=None, net_profit=None, max_drawdown_pct=None,
+                     error: str | None = None) -> dict:
+        """One row of the durable "what was tested" log -- deliberately
+        flat/small (no spec/config blob) so the log stays cheap to append
+        to and to read back for a multi-hour, many-thousand-candidate
+        run; the full spec for anything that mattered (an elite/leaderboard
+        entry) is separately captured in the checkpoint and, when
+        save_to_library is on, the Strategy Library."""
+        return {
+            "generation": gen,
+            "candidate_id": cid,
+            "family": meta.get("family", "?"),
+            "stage": "prefilter",
+            "passed": passed,
+            "reasons": reasons,
+            "n_trades": n_trades,
+            "profit_factor": profit_factor,
+            "net_profit": net_profit,
+            "max_drawdown_pct": max_drawdown_pct,
+            "error": error,
+        }
+
+    def _append_tested_log_full_eval(self, evaluated: list["EvolutionCandidateRecord"], gen: int) -> None:
+        """Appends a second row for every candidate that made it past
+        PRE-FILTER into the expensive robustness/OOS/Monte Carlo/prop-sim
+        stage, this time with the PROP FITNESS score -- so "what was
+        tested" shows not just the cheap pass/fail but how far a
+        candidate actually got and how good it turned out to be."""
+        rows = []
+        for r in evaluated:
+            rows.append({
+                "generation": gen,
+                "candidate_id": r.candidate_id,
+                "family": r.meta.get("family", "?"),
+                "stage": "full_eval",
+                "passed": True,
+                "reasons": [],
+                "n_trades": (r.stats or {}).get("total_trades"),
+                "profit_factor": (r.stats or {}).get("profit_factor"),
+                "net_profit": (r.stats or {}).get("net_profit"),
+                "max_drawdown_pct": (r.stats or {}).get("max_drawdown_pct"),
+                "fitness_score": r.fitness.final_score if r.fitness else None,
+                "pass_probability": (r.mc_summary or {}).get("evaluation_pass_probability"),
+                "error": None,
+            })
+        evo_checkpoint.append_tested_rows(rows, Path(self.cfg.tested_log_path))
 
     # -- ROBUSTNESS + OOS + MONTE CARLO + PROP SIMULATION ------------------
     def _full_eval(self, stage1_survivors) -> list[EvolutionCandidateRecord]:

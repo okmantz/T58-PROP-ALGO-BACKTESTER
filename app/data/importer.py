@@ -45,14 +45,23 @@ STANDARD_COLUMNS = [
 COLUMN_ALIASES = {
     "timestamp": [
         "timestamp",
+        "ts",
         "time",
         "date",
         "datetime",
         "date_time",
+        "dt",
+        "bar_time",
+        "bartime",
+        "period",
         "local time",
         "local_time",
         "datetime utc",
         "date time",
+        "date (utc)",
+        "time (utc)",
+        "utc",
+        "utc time",
     ],
     "open": [
         "open",
@@ -411,9 +420,17 @@ def _read_csv_like(path_or_buffer) -> pd.DataFrame:
     return raw
 
 
-def _auto_map_columns(columns: list[str]) -> dict[str, str]:
+def _auto_map_columns(columns: list[str], raw: "pd.DataFrame | None" = None) -> dict[str, str]:
     """
     Map raw column names to standard column names.
+
+    Falls back to fuzzy timestamp detection when no exact alias matches --
+    real vendor/broker exports use all kinds of naming ("Gmt time",
+    "Timestamp (ms)", "bar_start", "trade_date") that a fixed alias list
+    can never fully enumerate. The fallback only fires for the timestamp
+    column (the one Owen actually hit -- a "ts" column with no exact
+    alias) and only when the exact-match pass found nothing, so a file
+    that already matches cleanly is never second-guessed.
     """
 
     lower_map = {
@@ -428,6 +445,28 @@ def _auto_map_columns(columns: list[str]) -> dict[str, str]:
             if alias in lower_map:
                 mapping[standard] = lower_map[alias]
                 break
+
+    if "timestamp" not in mapping:
+        already_used = set(mapping.values())
+        candidates = [
+            lower_map[key] for key in lower_map
+            if lower_map[key] not in already_used
+            and ("date" in key or "time" in key or key in ("ts", "dt"))
+        ]
+        if len(candidates) == 1:
+            mapping["timestamp"] = candidates[0]
+        elif len(candidates) > 1 and raw is not None:
+            # Prefer whichever candidate pandas can actually parse as a
+            # datetime on a real sample of the data, rather than guessing
+            # from the name alone.
+            for cand in candidates:
+                try:
+                    parsed = pd.to_datetime(raw[cand].head(20), errors="coerce")
+                    if parsed.notna().sum() >= max(1, int(len(parsed) * 0.8)):
+                        mapping["timestamp"] = cand
+                        break
+                except Exception:
+                    continue
 
     return mapping
 
@@ -471,7 +510,7 @@ def import_csv(
         )
 
     mapping = _auto_map_columns(
-        list(raw.columns)
+        list(raw.columns), raw
     )
 
     if manual_mapping:

@@ -61,8 +61,10 @@ from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipelin
 from app.orchestration.quick_optimize import QuickOptimizeConfig, run_quick_optimize
 from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
+from app.prop.survival_engine import PropSurvivalConfig, ResetEconomics, run_prop_survival_analysis
 from app.reports.generator import generate_full_report
 from app.reports.refinement_report import generate_refinement_report
+from app.reports.survival_report import generate_survival_report
 from app.reports.validation_reports import (
     generate_cpcv_report, generate_multi_objective_report, generate_portfolio_report,
     generate_sensitivity_report, generate_walk_forward_report, generate_walkforward_ga_report,
@@ -123,6 +125,8 @@ SENSITIVITY_DIR = BASE_DIR / "reports" / "sensitivity"
 SENSITIVITY_DIR.mkdir(parents=True, exist_ok=True)
 QUICK_OPT_DIR = BASE_DIR / "reports" / "quick_optimize"
 QUICK_OPT_DIR.mkdir(parents=True, exist_ok=True)
+PAYOUT_DIR = BASE_DIR / "reports" / "payout_probability"
+PAYOUT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -1268,6 +1272,7 @@ def full_pipeline_start():
             ga_population=int(form.get("ga_population", 12) or 12),
             ga_generations=int(form.get("ga_generations", 6) or 6),
             ga_search_mc_sims=int(form.get("ga_search_mc_sims", 200) or 200),
+            adaptive_risk_enabled=form.get("adaptive_risk_enabled") == "on",
             fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
             final_mc_sims=int(form.get("final_mc_sims", 10000) or 10000),
             baseline_mc_sims=int(form.get("baseline_mc_sims", 2000) or 2000),
@@ -1870,8 +1875,29 @@ def portfolio_run():
             if df is None:
                 continue
             weight = float(form.get(f"{prefix}_weight", 1.0) or 1.0)
-            legs.append(InstrumentLeg(name=label, df=df, strategy=strategy, risk=risk, weight=weight))
-            leg_labels.append(label)
+
+            # Library-based leg picker: each leg can override the shared
+            # Step-1 strategy with a specific saved strategy from the
+            # library (mirrors the desktop app's "ADD LEG FROM LIBRARY"
+            # button), so a portfolio can combine genuinely DIFFERENT
+            # strategies -- not just one strategy across instruments.
+            leg_mode = (form.get(f"{prefix}_library_mode") or "").strip()
+            leg_name = (form.get(f"{prefix}_library_name") or "").strip()
+            if leg_mode and leg_name:
+                try:
+                    leg_code = load_strategy_text(leg_mode, leg_name)
+                    leg_strategy = build_strategy_from_code(leg_mode, leg_code)
+                except (StrategyError, FileNotFoundError, OSError) as exc:
+                    return render_template("portfolio.html", **ctx(
+                        error=f"Could not load library strategy '{leg_name}' for leg {i}: {exc}"
+                    )), 400
+                leg_label = f"{label} ({leg_name})"
+            else:
+                leg_strategy = strategy
+                leg_label = label
+
+            legs.append(InstrumentLeg(name=leg_label, df=df, strategy=leg_strategy, risk=risk, weight=weight))
+            leg_labels.append(leg_label)
 
         if len(legs) < 2:
             return render_template("portfolio.html", **ctx(error="A portfolio needs at least 2 instrument legs -- fill in a market data file/dataset for at least 2 of the leg slots below.")), 400
@@ -1906,6 +1932,87 @@ def portfolio_run():
 @app.route("/portfolio_reports/<path:filename>")
 def serve_portfolio_report(filename):
     return send_from_directory(PORTFOLIO_DIR, filename)
+
+
+@app.route("/payout-probability")
+def payout_probability_form():
+    return render_template(
+        "payout_probability.html", stored_datasets=list_stored_datasets(),
+        saved_strategies_json=_saved_strategies_json(),
+    )
+
+
+@app.route("/payout-probability/run", methods=["POST"])
+def payout_probability_run():
+    form = request.form
+    ctx = lambda **kw: dict(stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **kw)
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("payout_probability.html", **ctx(error=dataset_error)), 400
+
+        strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000)),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+            max_drawdown_pct=float(form.get("max_dd", 10)),
+        )
+
+        bt_result = run_backtest(df, strategy, risk)
+        if not bt_result.trades:
+            return render_template("payout_probability.html", **ctx(
+                error="No trades were generated by this strategy over the given data -- there is "
+                      "nothing to run a lifecycle simulation on."
+            )), 400
+
+        reset_fee_raw = (form.get("reset_fee") or "").strip()
+        econ = ResetEconomics(
+            evaluation_fee=float(form.get("evaluation_fee", 0) or 0),
+            reset_fee=(float(reset_fee_raw) if reset_fee_raw else None),
+            profit_split_pct=float(form.get("profit_split", 80) or 80),
+            max_attempts=int(form.get("max_attempts", 3) or 3),
+        )
+        cfg = PropSurvivalConfig(
+            n_simulations=min(int(form.get("n_sims", 5000) or 5000), 50_000),
+            max_payouts_tracked=int(form.get("max_payouts_tracked", 5) or 5),
+            funding_approval_probability=float(form.get("funding_approval_pct", 100) or 100),
+            reset_economics=econ,
+        )
+        result = run_prop_survival_analysis(bt_result.trades, rules, cfg)
+
+        run_id = uuid.uuid4().hex[:10]
+        paths = generate_survival_report(
+            PAYOUT_DIR, result, bt_result.strategy_name, active_label, rules, cfg,
+            basename=f"payout_{run_id}",
+        )
+
+        return render_template("payout_probability.html", **ctx(result={
+            "strategy_name": bt_result.strategy_name,
+            "instrument": active_label,
+            "score": result.prop_survival_score,
+            "funnel": result.funnel.to_dict(),
+            "net_positive_after_resets": result.reset_economics.probability_net_positive_after_resets,
+            "expected_net_profit_after_resets": result.reset_economics.expected_net_profit_after_resets,
+            "notes": result.notes,
+            "report_html": f"/payout_reports/{Path(paths['html']).name}",
+            "report_json": f"/payout_reports/{Path(paths['json']).name}",
+        }))
+    except StrategyError as exc:
+        return render_template("payout_probability.html", **ctx(error=str(exc))), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("payout_probability.html", **ctx(error=f"Unexpected error: {exc}")), 500
+
+
+@app.route("/payout_reports/<path:filename>")
+def serve_payout_report(filename):
+    return send_from_directory(PAYOUT_DIR, filename)
 
 
 # ---------------------------------------------------------------------------
@@ -2297,6 +2404,7 @@ def quickopt_start():
             fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
             n_folds=int(form.get("n_folds", 4) or 4),
             save_to_library=form.get("save_to_library", "on") == "on",
+            adaptive_risk_enabled=form.get("adaptive_risk_enabled") == "on",
         )
         job_id = uuid.uuid4().hex[:12]
         initial_log = [f"Loaded {len(df)} bars from {active_label}."]

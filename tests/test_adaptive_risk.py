@@ -5,7 +5,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.backtest.adaptive_risk import AdaptiveRiskConfig, AdaptiveRiskError, AdaptiveRiskRule, AdaptiveRiskState
+from app.backtest.adaptive_risk import (
+    AdaptiveRiskConfig,
+    AdaptiveRiskError,
+    AdaptiveRiskRule,
+    AdaptiveRiskState,
+    build_limit_aware_preset,
+)
 from app.backtest.engine import run_backtest
 from app.backtest.risk import RiskConfig
 from app.strategy.manual import ManualStrategy
@@ -183,3 +189,78 @@ def test_adaptive_risk_never_increases_size_above_nominal():
     )
     result = run_backtest(df, strategy, RiskConfig(), adaptive_risk=adaptive)
     assert all(t.adaptive_risk_multiplier <= 1.0 for t in result.trades)
+
+
+# ---------------------------------------------------------------------------
+# drawdown_pct trigger (all-time, vs. a prop firm's overall drawdown floor,
+# as opposed to daily_loss_pct which only looks at today) + the one-click
+# limit-aware preset built from PropRules
+# ---------------------------------------------------------------------------
+
+def test_drawdown_pct_tracks_distance_from_realized_peak_not_just_today():
+    state = AdaptiveRiskState(initial_balance=100_000.0)
+    state.record_trade_close(-3_000.0, is_new_day=True)
+    assert state.current_drawdown_pct() == pytest.approx(3.0)
+
+    # A new peak resets drawdown to 0, unlike daily_loss_pct which only
+    # resets on a new calendar day.
+    state.record_trade_close(8_000.0, is_new_day=False)
+    assert state.current_drawdown_pct() == pytest.approx(0.0)
+    assert state.peak_realized_balance == pytest.approx(105_000.0)
+
+    state.record_trade_close(-4_000.0, is_new_day=False)
+    assert state.current_drawdown_pct() == pytest.approx(4.0)
+
+
+def test_drawdown_pct_rule_throttles_size_once_triggered():
+    state = AdaptiveRiskState(initial_balance=100_000.0)
+    state.record_trade_close(-6_000.0, is_new_day=True)  # 6% drawdown from peak
+    cfg = AdaptiveRiskConfig(enabled=True, rules=[
+        AdaptiveRiskRule(trigger="drawdown_pct", threshold=5.0, risk_multiplier=0.5),
+    ])
+    assert state.active_multiplier(cfg) == pytest.approx(0.5)
+
+
+def test_build_limit_aware_preset_scales_thresholds_off_prop_rules():
+    from app.prop.simulator import PropRules
+
+    rules = PropRules(daily_loss_limit_pct=4.0, max_drawdown_pct=8.0)
+    cfg = build_limit_aware_preset(rules)
+
+    assert cfg.enabled
+    dd_rules = [r for r in cfg.rules if r.trigger == "drawdown_pct"]
+    daily_rules = [r for r in cfg.rules if r.trigger == "daily_loss_pct"]
+    lock_rules = [r for r in cfg.rules if r.trigger == "daily_profit_pct"]
+
+    assert sorted(r.threshold for r in dd_rules) == [4.0, 6.0]      # 50%/75% of 8.0
+    assert sorted(r.threshold for r in daily_rules) == [2.0, 3.0]   # 50%/75% of 4.0
+    assert len(lock_rules) == 1 and lock_rules[0].risk_multiplier == 0.0
+
+
+def test_build_limit_aware_preset_can_disable_profit_lock():
+    from app.prop.simulator import PropRules
+
+    cfg = build_limit_aware_preset(PropRules(), daily_profit_lock_pct=None)
+    assert not any(r.trigger == "daily_profit_pct" for r in cfg.rules)
+
+
+def test_limit_aware_preset_actually_throttles_a_real_backtest():
+    """End-to-end: wiring a losing streak into a real run_backtest call
+    with the preset applied should reduce total risk taken vs. the same
+    run with adaptive risk off, once the account is meaningfully down
+    from its peak."""
+    from app.prop.simulator import PropRules
+
+    df = _synthetic_df(n=2000, seed=7)
+    risk = RiskConfig(initial_balance=100_000.0, risk_value=1.0)
+    preset = build_limit_aware_preset(PropRules(daily_loss_limit_pct=5.0, max_drawdown_pct=10.0))
+
+    baseline = run_backtest(df, ManualStrategy(_FREQUENT_TRADER), risk)
+    throttled = run_backtest(df, ManualStrategy(_FREQUENT_TRADER), risk, adaptive_risk=preset)
+
+    # Should not change WHICH bars get signals, only entry sizing -- same
+    # trade count, but total notional risked should be <= baseline once
+    # any throttling rule ever fired (it can only ever scale size down).
+    assert len(throttled.trades) == len(baseline.trades)
+    if baseline.trades:
+        assert sum(abs(t.size) for t in throttled.trades) <= sum(abs(t.size) for t in baseline.trades) + 1e-6

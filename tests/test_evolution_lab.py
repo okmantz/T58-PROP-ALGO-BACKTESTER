@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from app.backtest.risk import RiskConfig
-from app.evolution.engine import EvolutionConfig, EvolutionRunner
+from app.evolution.engine import EvolutionCandidateRecord, EvolutionConfig, EvolutionRunner
 from app.evolution.knowledge_graph import KnowledgeGraph, feature_vector_for_spec
 from app.evolution.prop_fitness import compute_prop_fitness
 from app.prop.simulator import PropRules
@@ -234,3 +234,119 @@ def test_promoting_a_leaderboard_candidate_to_the_library_does_not_raise(tmp_pat
     assert saved_path.parent.name == "manual"
     items = library.list_saved_strategies("manual")
     assert any(i.name == filename and i.status == "validated" for i in items)
+
+
+# ---------------------------------------------------------------------------
+# Family diversity: stratified immigrant sampling + capped elite pool
+# ---------------------------------------------------------------------------
+
+def test_generate_population_stratifies_immigrants_across_all_families():
+    """Generation 0 (no elites yet) must sample every active family, not
+    just whichever family has the biggest parameter grid. Families that
+    require a second instrument's data (e.g. stat_pairs) are skipped
+    when no pair data is merged in -- that's correct behavior, not a
+    diversity failure, so they're excluded from the expected set here."""
+    from app.search.strategy_space import FAMILIES_REQUIRING_PAIR_DATA, list_families
+
+    cfg = EvolutionConfig(population_size=30, elite_keep=8, random_seed=1,
+                           knowledge_graph_path="/tmp/t58_test_kg_gen0.json")
+    runner = EvolutionRunner(_trending_df(n=500), RiskConfig(), PropRules(), cfg)
+
+    population = runner._generate_population(0, [])
+    families_seen = {meta.get("family") for _, _, meta in population}
+    expected = set(list_families().keys()) - set(FAMILIES_REQUIRING_PAIR_DATA)
+
+    assert families_seen == expected
+
+
+def test_generate_population_keeps_minority_families_after_convergence():
+    """Even once every elite comes from ONE family (a converged/degenerate
+    run), later generations must still seed at least
+    min_immigrants_per_family fresh candidates for every OTHER family --
+    otherwise those families can never be rediscovered."""
+    cfg = EvolutionConfig(population_size=30, elite_keep=8, random_seed=1,
+                           min_immigrants_per_family=2,
+                           knowledge_graph_path="/tmp/t58_test_kg_gen5.json")
+    runner = EvolutionRunner(_trending_df(n=500), RiskConfig(), PropRules(), cfg)
+
+    gen0 = runner._generate_population(0, [])
+    one_family = gen0[0][2]["family"]
+    converged_elites = [(spec, meta) for _, spec, meta in gen0 if meta["family"] == one_family][:8]
+
+    population = runner._generate_population(5, converged_elites)
+    counts: dict[str, int] = {}
+    for _, _, meta in population:
+        fam = meta.get("family")
+        counts[fam] = counts.get(fam, 0) + 1
+
+    other_families = set(counts) - {one_family}
+    assert other_families, "every other family disappeared after convergence"
+    for fam in other_families:
+        assert counts[fam] >= cfg.min_immigrants_per_family
+
+
+def test_diversify_elites_caps_any_single_family_share():
+    cfg = EvolutionConfig(elite_keep=10, max_elite_frac_per_family=0.5,
+                           knowledge_graph_path="/tmp/t58_test_kg_diversify.json")
+    runner = EvolutionRunner(pd.DataFrame(), RiskConfig(), PropRules(), cfg)
+
+    class _Fitness:
+        def __init__(self, score):
+            self.final_score = score
+
+    records = [
+        EvolutionCandidateRecord(candidate_id=f"mtf-{i}", spec={}, meta={"family": "mtf_pullback"},
+                                  fitness=_Fitness(100 - i))
+        for i in range(8)
+    ]
+    for fam in ["mean_reversion_band", "volatility_breakout", "session_time_effect", "volume_imbalance"]:
+        for i in range(2):
+            records.append(EvolutionCandidateRecord(candidate_id=f"{fam}-{i}", spec={}, meta={"family": fam},
+                                                      fitness=_Fitness(50 - i)))
+    records.sort(key=lambda r: r.fitness.final_score, reverse=True)
+
+    elites = runner._diversify_elites(records)
+    family_counts: dict[str, int] = {}
+    for r in elites:
+        fam = r.meta["family"]
+        family_counts[fam] = family_counts.get(fam, 0) + 1
+
+    assert len(elites) == cfg.elite_keep
+    assert family_counts["mtf_pullback"] <= int(cfg.elite_keep * cfg.max_elite_frac_per_family)
+    assert len(family_counts) > 1  # other families made it into the elite/breeding pool
+
+
+def test_evolution_runner_smoke_with_adaptive_risk_enabled(tmp_path):
+    """Same funnel as the smoke test above, but with adaptive_risk_enabled
+    -- must run end-to-end without raising (serial path, parallel_workers=1
+    so this doesn't need a real worker pool), confirming the preset threads
+    through pre-filter, full-eval, and stress test without breaking any of
+    them."""
+    df = _trending_df()
+    cfg = EvolutionConfig(
+        population_size=10, elite_keep=2, max_generations=1,
+        min_trades=3, min_profit_factor=0.0, max_drawdown_buffer_mult=20.0,
+        mc_sims=50, robustness_neighbors=1, walk_forward_folds=2,
+        cpcv_top_n=2, cpcv_max_paths=3, cpcv_n_groups=3,
+        save_to_library=False, knowledge_graph_path=str(tmp_path / "kg.jsonl"),
+        checkpoint_path=str(tmp_path / "checkpoint.json"),
+        tested_log_path=str(tmp_path / "tested_candidates.jsonl"),
+        parallel_workers=1,
+        adaptive_risk_enabled=True, adaptive_risk_daily_profit_lock_pct=80.0,
+    )
+    runner = EvolutionRunner(df, RiskConfig(), PropRules(), cfg, progress_cb=None)
+
+    assert runner.adaptive_risk is not None
+    assert runner.adaptive_risk.enabled
+
+    runner._run_loop()
+
+    assert runner.generation == 0
+    assert not runner.is_running
+    assert (tmp_path / "checkpoint.json").exists()
+
+
+def test_evolution_runner_adaptive_risk_disabled_by_default(tmp_path):
+    cfg = EvolutionConfig(knowledge_graph_path=str(tmp_path / "kg.jsonl"))
+    runner = EvolutionRunner(_trending_df(n=500), RiskConfig(), PropRules(), cfg)
+    assert runner.adaptive_risk is None

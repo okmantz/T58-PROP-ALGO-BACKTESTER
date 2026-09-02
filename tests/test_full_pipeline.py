@@ -93,6 +93,27 @@ def test_full_pipeline_raises_fast_on_zero_trade_baseline(tmp_path):
         run_full_pipeline(df, strategy, RiskConfig(), PropRules(), tmp_path, _cfg())
 
 
+def test_full_pipeline_with_adaptive_risk_enabled_runs_end_to_end(tmp_path):
+    """adaptive_risk_enabled must thread through baseline, the GA search,
+    and the final re-validated run without breaking the pipeline -- and
+    must not change WHICH trades are taken, only their sizing."""
+    df = _trending_df()
+    strategy = ManualStrategy(_sma_config())
+
+    plain = run_full_pipeline(
+        df, strategy, RiskConfig(), PropRules(), tmp_path / "plain", _cfg(), progress_cb=None,
+    )
+    throttled = run_full_pipeline(
+        df, strategy, RiskConfig(), PropRules(), tmp_path / "throttled",
+        _cfg(adaptive_risk_enabled=True, adaptive_risk_daily_profit_lock_pct=80.0),
+        progress_cb=None,
+    )
+
+    assert len(throttled.baseline_bt.trades) == len(plain.baseline_bt.trades)
+    assert throttled.verdict in ("READY", "MARGINAL", "NOT READY")
+    assert throttled.report_paths["html"].exists()
+
+
 def test_full_pipeline_python_strategy_saves_winner_to_library(tmp_path):
     df = _trending_df(n=2400, seed=9)
     py_source = '''

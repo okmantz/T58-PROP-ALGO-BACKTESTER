@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Strategy Family Diversity</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  select { width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light); background: var(--panel-3); color: var(--text); font-size: 15px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e;
+    font-size: 16px; font-weight: 700; margin-top: 6px; box-shadow: 0 0 22px rgba(53,224,176,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .headline { background: #142a1a; border: 1px solid #235a32; color: #b4ffcb; padding: 12px; border-radius: 10px; margin: 12px 0; font-size: 14px; font-weight: 600; }
+  table.families { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  table.families th { text-align: left; padding: 7px 8px; background: var(--panel-3); color: #9AA0A6; border-bottom: 1px solid var(--border-light); }
+  table.families td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+</style>
+</head>
+<body>
+{% set active_page = 'family_diversity' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Strategy family diversity</h1>
+  <p>Groups a Search Lab run's candidates by hypothesis family (trend following, breakout, mean reversion, liquidity sweep, momentum, VWAP, opening range, market structure, volatility expansion/contraction, pullback, statistical arbitrage, relative strength, regime switching) and ranks the FAMILIES themselves, not just individual candidates -- so 10,000 variations of one idea can't quietly dominate the picture.</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<div class="card">
+  <h2>Pick a search run</h2>
+  {% if not runs %}
+  <p class="help">No completed Search Lab runs found yet -- run a search from the <a href="/search">Search Lab</a> first.</p>
+  {% else %}
+  <form method="get" action="/family-diversity">
+    <label>Run</label>
+    <select name="run_choice" onchange="applyChoice(this.value)">
+      <option value="">— choose a run —</option>
+      {% for r in runs %}
+      <option value="{{ r.db_path }}|{{ r.run_id }}" {% if r.db_path == selected_db_path and r.run_id == selected_run_id %}selected{% endif %}>
+        {{ r.run_id }} -- {{ r.mode }}{% if r.family %} ({{ r.family }}){% endif %}{% if r.instrument %} -- {{ r.instrument }}{% endif %}
+      </option>
+      {% endfor %}
+    </select>
+    <label>Stage</label>
+    <select name="stage" onchange="this.form.submit()">
+      <option value="stage1" {% if selected_stage == 'stage1' %}selected{% endif %}>Stage 1 (cheap filter)</option>
+      <option value="stage2" {% if selected_stage == 'stage2' %}selected{% endif %}>Stage 2 (GA refined)</option>
+      <option value="stage3" {% if selected_stage == 'stage3' %}selected{% endif %}>Stage 3 (validated)</option>
+    </select>
+    <input type="hidden" name="db_path" id="db_path_field" value="{{ selected_db_path }}">
+    <input type="hidden" name="run_id" id="run_id_field" value="{{ selected_run_id }}">
+    <button class="submit-btn" type="submit">Show family breakdown</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if result %}
+<div class="card">
+  <h2>{{ result.run_id }} -- {{ result.stage }} ({{ result.n_records }} candidates)</h2>
+  <table class="families">
+    <tr><th>Family</th><th>Candidates</th><th>Passed Gate</th><th>Best Score</th><th>Median</th></tr>
+    {% for s in result.summaries %}
+    <tr>
+      <td>{{ s.label }}</td>
+      <td>{{ s.n_candidates }}</td>
+      <td>{{ s.n_passed_gate }}</td>
+      <td>{{ '%.2f' % s.best_score if s.best_score is not none else '--' }}</td>
+      <td>{{ '%.2f' % s.median_score if s.median_score is not none else '--' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% set scored = result.summaries | selectattr('best_score', 'ne', none) | list %}
+  {% if scored %}
+  <div class="headline">
+    Best strategy family for this market/data: {{ scored[0].label }}{% if scored|length > 1 %} + {{ scored[1].label }}{% endif %}.
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+</div>
+</div>
+
+<script>
+  function applyChoice(value) {
+    if (!value) return;
+    const [dbPath, runId] = value.split('|');
+    document.getElementById('db_path_field').value = dbPath;
+    document.getElementById('run_id_field').value = runId;
+  }
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

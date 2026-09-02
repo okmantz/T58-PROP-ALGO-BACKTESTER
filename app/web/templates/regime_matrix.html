@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Regime Survival Matrix</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: var(--text); font-size: 15px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15);
+  }
+  textarea { min-height: 140px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tabs button {
+    flex: 1; min-width: 70px; padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: #ccc; font-size: 13px;
+  }
+  .tabs button.active { background: var(--teal); color: #04120e; font-weight: 600; border-color: var(--teal); }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+    box-shadow: 0 0 22px rgba(53,224,176,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .notice { background: #142a1a; border: 1px solid #235a32; color: #b4ffcb; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  table.matrix { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  table.matrix th { text-align: left; padding: 7px 8px; background: var(--panel-3); color: #9AA0A6; border-bottom: 1px solid var(--border-light); }
+  table.matrix td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  tr.disable td.verdict { color: #E5533D; font-weight: 700; }
+  tr.keep td.verdict { color: #3CCB7F; font-weight: 700; }
+  tr.unproven td.verdict { color: #888; }
+  details.dim-block { margin-top: 10px; }
+  details.dim-block summary { cursor: pointer; color: #9ecbff; font-size: 13px; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+{% set active_page = 'regime_matrix' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Regime survival matrix</h1>
+  <p>Classifies every bar on trend, volatility, session, and market environment, then attributes this strategy's OWN trades to whichever regime was active at entry -- so you can see exactly which market conditions to gate the strategy off in, not just an aggregate backtest number.</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+{% if result %}
+<div class="card">
+  <h2>Result -- {{ result.dimensions[0] }} &times; {{ result.dimensions[1] }}</h2>
+  <p class="help">Dataset: {{ result.dataset }}</p>
+  <table class="matrix">
+    <tr><th>Regime</th><th>Trades</th><th>Win Rate</th><th>PF</th><th>Return</th><th>DD</th><th>Verdict</th></tr>
+    {% for c in result.cells %}
+    <tr class="{{ 'disable' if c.recommend_disable else ('keep' if c.n_trades >= 15 else 'unproven') }}">
+      <td>{{ c.label }}</td>
+      <td>{{ c.n_trades }}</td>
+      <td>{{ '%.0f' % c.win_rate }}%</td>
+      <td>{{ '%.2f' % c.profit_factor }}</td>
+      <td>{{ '%+.1f' % c.return_pct }}%</td>
+      <td>{{ '%.1f' % c.max_drawdown_pct }}%</td>
+      <td class="verdict">{{ 'DISABLE' if c.recommend_disable else ('keep' if c.n_trades >= 15 else 'unproven') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  {% if result.disable_regimes %}
+  <div class="notice" style="margin-top:12px;">
+    Recommended OFF regimes: {{ result.disable_regimes | map(attribute='label') | join(', ') }}
+  </div>
+  {% endif %}
+
+  {% for dim_name, cells in result.single_dimension.items() %}
+  <details class="dim-block">
+    <summary>{{ dim_name | capitalize }} breakdown (single dimension)</summary>
+    <table class="matrix">
+      <tr><th>Regime</th><th>Trades</th><th>Win Rate</th><th>PF</th><th>Return</th><th>DD</th></tr>
+      {% for c in cells %}
+      <tr>
+        <td>{{ c.label }}</td><td>{{ c.n_trades }}</td><td>{{ '%.0f' % c.win_rate }}%</td>
+        <td>{{ '%.2f' % c.profit_factor }}</td><td>{{ '%+.1f' % c.return_pct }}%</td><td>{{ '%.1f' % c.max_drawdown_pct }}%</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </details>
+  {% endfor %}
+
+  {% for n in result.notes %}<p class="help" style="margin-top:8px;">{{ n }}</p>{% endfor %}
+</div>
+{% endif %}
+
+<form method="post" action="/regime-matrix/run" enctype="multipart/form-data">
+
+  <div class="card">
+    <h2>1. Market data</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }}</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+    <label>Or upload a CSV</label>
+    <input type="file" name="csv_file" accept=".csv">
+  </div>
+
+  <div class="card">
+    <h2>2. Strategy</h2>
+    <div class="tabs" id="strategy-tabs">
+      <button type="button" data-mode="manual" class="active">Manual</button>
+      <button type="button" data-mode="python">Python</button>
+      <button type="button" data-mode="pinescript">PineScript</button>
+      <button type="button" data-mode="mql5">MQL5</button>
+    </div>
+    <input type="hidden" name="strategy_mode" id="strategy_mode" value="manual">
+
+    <div id="manual-fields">
+      <div class="row">
+        <div><label>SMA fast</label><input type="number" name="sma_fast" value="20"></div>
+        <div><label>SMA slow</label><input type="number" name="sma_slow" value="50"></div>
+      </div>
+      <div class="row">
+        <div><label>Stop loss (pips)</label><input type="number" name="sl_pips" value="20"></div>
+        <div><label>Take profit (pips)</label><input type="number" name="tp_pips" value="40"></div>
+      </div>
+    </div>
+
+    <div id="code-fields" style="display:none;">
+      <label>Load a saved strategy from the library</label>
+      <select id="existing_strategy_select" onchange="loadFromLibrary()">
+        <option value="">— none, paste or upload below —</option>
+      </select>
+      <label style="margin-top:14px;">Or upload a strategy file</label>
+      <input type="file" id="strategy_file_input" name="strategy_file" accept=".py,.pine,.mq5">
+      <label>Or paste strategy source</label>
+      <textarea name="strategy_code" id="strategy_code" placeholder="Paste your Python / PineScript / MQL5 strategy here"></textarea>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Risk settings</h2>
+    <div class="row">
+      <div><label>Initial account balance</label><input type="number" name="initial_balance" value="100000"></div>
+      <div><label>Risk value</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
+    </div>
+    <div class="row">
+      <div><label>Risk mode</label>
+        <select name="risk_mode"><option value="percent">% of balance</option><option value="fixed">Fixed lot</option></select>
+      </div>
+      <div><label>Pip size</label><input type="number" step="0.0001" name="pip_size" value="0.0001"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>4. Matrix dimensions to cross</h2>
+    <p class="help">Trend, volatility, session, and environment are all classified either way -- the other two always show up as single-dimension breakdowns below the main table.</p>
+    <div class="row">
+      <div><label>Dimension A</label>
+        <select name="dimension_a">
+          <option value="volatility" selected>Volatility</option>
+          <option value="trend">Trend</option>
+          <option value="session">Session</option>
+          <option value="environment">Environment</option>
+        </select>
+      </div>
+      <div><label>Dimension B</label>
+        <select name="dimension_b">
+          <option value="environment" selected>Environment</option>
+          <option value="trend">Trend</option>
+          <option value="volatility">Volatility</option>
+          <option value="session">Session</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <button class="submit-btn" type="submit">Run Regime Survival Matrix</button>
+</form>
+
+</div>
+</div>
+
+<script>
+  const tabs = document.querySelectorAll('#strategy-tabs button');
+  const modeInput = document.getElementById('strategy_mode');
+  const manualFields = document.getElementById('manual-fields');
+  const codeFields = document.getElementById('code-fields');
+  const SAVED_STRATEGIES = {{ saved_strategies_json | safe }};
+
+  function populateLibrarySelect(mode) {
+    const select = document.getElementById('existing_strategy_select');
+    const all = SAVED_STRATEGIES[mode] || [];
+    select.innerHTML = '<option value="">— none, paste or upload below —</option>';
+    all.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.name;
+      opt.textContent = s.description ? `${s.name} — ${s.description}` : s.name;
+      select.appendChild(opt);
+    });
+  }
+
+  function loadFromLibrary() {
+    const mode = modeInput.value;
+    const name = document.getElementById('existing_strategy_select').value;
+    if (!name) return;
+    fetch(`/strategies/${encodeURIComponent(mode)}/${encodeURIComponent(name)}`)
+      .then(r => r.ok ? r.text() : Promise.reject())
+      .then(text => { document.getElementById('strategy_code').value = text; })
+      .catch(() => alert('Could not load that saved strategy.'));
+  }
+
+  document.getElementById('strategy_file_input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { document.getElementById('strategy_code').value = reader.result; };
+    reader.readAsText(file);
+  });
+
+  tabs.forEach(btn => btn.addEventListener('click', () => {
+    tabs.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    modeInput.value = btn.dataset.mode;
+    if (btn.dataset.mode === 'manual') {
+      manualFields.style.display = 'block';
+      codeFields.style.display = 'none';
+    } else {
+      manualFields.style.display = 'none';
+      codeFields.style.display = 'block';
+      populateLibrarySelect(btn.dataset.mode);
+    }
+  }));
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

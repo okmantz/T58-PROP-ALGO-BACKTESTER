@@ -68,6 +68,7 @@ from typing import Callable
 import pandas as pd
 
 from app.backtest.engine import BacktestResult, run_backtest, run_holdout_comparison
+from app.backtest.adaptive_risk import build_limit_aware_preset
 from app.backtest.risk import RiskConfig, with_prop_safety_defaults
 from app.monte_carlo.engine import MonteCarloConfig, MonteCarloResult, run_monte_carlo
 from app.optimize.code_parameter_space import patched_source_for_strategy
@@ -107,6 +108,17 @@ class FullPipelineConfig:
     oos_check_folds: int = 4               # for the post-hoc run_walk_forward check
     oos_check_metric: str = "eval_pass_probability"
     random_seed: int | None = 42
+    # Adaptive, limit-aware position sizing (see app.backtest.adaptive_risk):
+    # when enabled, every backtest this pipeline runs -- the baseline, the
+    # walk-forward-aware GA's own search, and the final validated run --
+    # uses a graduated risk-throttle preset derived from THIS run's own
+    # PropRules (cut size as the account nears its daily-loss/drawdown
+    # floor; optionally lock in a good day's profit). Off by default so
+    # existing behavior/reports are unchanged unless explicitly turned on.
+    # This directly targets the eval_pass_probability objective itself,
+    # independent of whatever edge the strategy has.
+    adaptive_risk_enabled: bool = False
+    adaptive_risk_daily_profit_lock_pct: float | None = 80.0
     save_to_library: bool = True           # code strategies only -- manual configs aren't files
     library_status: str | None = None      # None = auto-pick from the READY/MARGINAL/NOT READY
                                             # verdict (see _VERDICT_TO_LIBRARY_STATUS below);
@@ -312,10 +324,15 @@ def run_full_pipeline(
     # max_account_drawdown_pct explicitly.
     risk = with_prop_safety_defaults(risk, prop_rules)
 
+    adaptive_risk = build_limit_aware_preset(prop_rules, daily_profit_lock_pct=cfg.adaptive_risk_daily_profit_lock_pct) \
+        if cfg.adaptive_risk_enabled else None
+    if adaptive_risk is not None:
+        log(f"Adaptive risk enabled: {len(adaptive_risk.rules)} limit-aware throttle rule(s) applied to every backtest below.")
+
     # -- Step 1: baseline -----------------------------------------------
     log(f"Step 1/7: Baseline run for '{display_name}'...")
     preflight_signal_check(df, strategy, risk, "Full Pipeline")
-    baseline_bt = run_backtest(df, strategy, risk)
+    baseline_bt = run_backtest(df, strategy, risk, adaptive_risk=adaptive_risk)
     for w in baseline_bt.warnings:
         log(f"  WARNING: {w}")
         warnings.append(w)
@@ -473,6 +490,7 @@ def run_full_pipeline(
                 ai_suggest_cb=ai_suggest_cb,
                 parallel=cfg.parallel_search,
                 max_workers=cfg.parallel_search_max_workers,
+                adaptive_risk=adaptive_risk,
             )
             refinement_ran = True
             if ga_result.best.oos_trade_count > 0:
@@ -514,7 +532,7 @@ def run_full_pipeline(
 
         # -- Step 3: final validation ------------------------------------
         log("Step 3/7: Final validation (full backtest, prop simulation, Monte Carlo)...")
-        final_bt = run_backtest(df, final_strategy, risk)
+        final_bt = run_backtest(df, final_strategy, risk, adaptive_risk=adaptive_risk)
         for w in final_bt.warnings:
             log(f"  WARNING: {w}")
             warnings.append(w)

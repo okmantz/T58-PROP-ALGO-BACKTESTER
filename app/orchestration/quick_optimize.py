@@ -36,6 +36,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from app.backtest.adaptive_risk import build_limit_aware_preset
 from app.backtest.engine import run_backtest
 from app.backtest.risk import RiskConfig
 from app.monte_carlo.engine import MonteCarloConfig, MonteCarloResult, run_monte_carlo
@@ -78,6 +79,12 @@ class QuickOptimizeConfig:
     parallel: bool = True
     parallel_max_workers: int | None = None
     save_to_library: bool = True          # code strategies only -- manual configs aren't files
+    # Same limit-aware risk-throttle preset as Full Pipeline (see
+    # app.backtest.adaptive_risk.build_limit_aware_preset) -- off by
+    # default; applies to the baseline run, the GA search itself, and
+    # the final re-validated run alike.
+    adaptive_risk_enabled: bool = False
+    adaptive_risk_daily_profit_lock_pct: float | None = 80.0
     # Must be one of app.strategy.library's STATUS_LABELS_ORDERED. "draft" is
     # deliberately conservative -- Quick Optimize only re-runs the GA + one
     # backtest, not Full Pipeline's OOS holdout check or significance gate,
@@ -139,8 +146,13 @@ def run_quick_optimize(
     log(f"Checking '{display_name}' produces trades on this data...")
     preflight_signal_check(df, strategy, risk, "Quick Optimize")
 
+    adaptive_risk = build_limit_aware_preset(prop_rules, daily_profit_lock_pct=cfg.adaptive_risk_daily_profit_lock_pct) \
+        if cfg.adaptive_risk_enabled else None
+    if adaptive_risk is not None:
+        log(f"Adaptive risk enabled: {len(adaptive_risk.rules)} limit-aware throttle rule(s) applied.")
+
     log("Running baseline backtest...")
-    baseline_bt = run_backtest(df, strategy, risk)
+    baseline_bt = run_backtest(df, strategy, risk, adaptive_risk=adaptive_risk)
     warnings.extend(baseline_bt.warnings)
     baseline_pnls = [t.pnl for t in baseline_bt.trades]
     baseline_dates = [t.entry_time for t in baseline_bt.trades]
@@ -169,6 +181,7 @@ def run_quick_optimize(
         n_folds=cfg.n_folds, window_mode=cfg.window_mode,
         progress_cb=lambda m: log(f"  {m}"),
         parallel=cfg.parallel, max_workers=cfg.parallel_max_workers,
+        adaptive_risk=adaptive_risk,
     )
     warnings.extend(ga_result.warnings)
 
@@ -208,7 +221,7 @@ def run_quick_optimize(
     else:
         final_spec = {"source_type": final_source_type, "code_text": final_code_text, "code_extension": final_code_ext}
     final_strategy = build_strategy_from_spec(final_spec)
-    final_bt = run_backtest(df, final_strategy, risk)
+    final_bt = run_backtest(df, final_strategy, risk, adaptive_risk=adaptive_risk)
     warnings.extend(final_bt.warnings)
     final_mc = run_monte_carlo(
         final_bt.trades, prop_rules, MonteCarloConfig(n_simulations=cfg.final_mc_sims, random_seed=cfg.random_seed)

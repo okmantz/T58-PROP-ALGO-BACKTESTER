@@ -132,6 +132,23 @@ class PropSurvivalConfig:
     # reset-economics distribution; lower it if this is the slow part of
     # a larger pipeline (e.g. Strategy Lab scoring dozens of finalists).
     life_simulations: int = 2_000
+    # Not every prop firm converts a passed evaluation into a live funded
+    # account automatically -- some run a manual/KYC review step that a
+    # small fraction of otherwise-passing traders never clear for reasons
+    # that have nothing to do with the strategy itself. Defaults to 100
+    # (passing == funded, this app's historical assumption) so existing
+    # callers see no behavior change; lower it to model a firm with a
+    # real onboarding dropout rate.
+    funding_approval_probability: float = 100.0
+    # How many sequential payout milestones the funnel below tracks.
+    # probability_first/second/third_payout on FundedSurvivalStats always
+    # exist for backward compatibility; this controls the length of the
+    # newer PayoutFunnelStats.payout_counts / payout_probabilities lists.
+    max_payouts_tracked: int = 5
+
+    def __post_init__(self):
+        self.funding_approval_probability = min(max(float(self.funding_approval_probability), 0.0), 100.0)
+        self.max_payouts_tracked = max(int(self.max_payouts_tracked), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +189,47 @@ class FundedSurvivalStats:
 
 
 @dataclass
+class PayoutFunnelStats:
+    """The 'N simulated accounts, cascading through stages' view -- the
+    same numbers behind EvaluationSurvivalStats/FundedSurvivalStats,
+    reshaped into the funnel format a trader actually thinks in:
+    'of 10,000 simulated accounts, how many made it through each
+    milestone.' Reached-funded is modeled as passing evaluation AND
+    independently clearing the firm's funding-approval step (see
+    PropSurvivalConfig.funding_approval_probability) -- at the default
+    100% that step never drops anyone, so reached_funded == passed_evaluation.
+    """
+    n_accounts: int
+    passed_evaluation_count: int
+    passed_evaluation_pct: float
+    reached_funded_count: int
+    reached_funded_pct: float
+    payout_counts: list          # length == max_payouts_tracked; count reaching payout #1..N
+    payout_probabilities: list   # same length, as % of n_accounts
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+    def render_table(self, strategy_name: str | None = None) -> str:
+        """Plain-text funnel table in the 'N simulated accounts' format --
+        suitable for a report, a console log, or an experiment-memory
+        entry. Not localized/currency-aware on purpose; this is a count
+        table, not a financial statement."""
+        lines = []
+        title = f"{strategy_name} -- " if strategy_name else ""
+        lines.append(f"{title}{self.n_accounts:,} simulated accounts")
+        lines.append("")
+        lines.append(f"{'Passed Evaluation':<22}{self.passed_evaluation_count:>10,}")
+        lines.append(f"{'Reached Funded':<22}{self.reached_funded_count:>10,}")
+        for i, count in enumerate(self.payout_counts, start=1):
+            lines.append(f"{'Reached Payout #' + str(i):<22}{count:>10,}")
+        lines.append("")
+        for i, pct in enumerate(self.payout_probabilities, start=1):
+            lines.append(f"{'Payout #' + str(i) + ' probability':<28}{pct:>8.1f}%")
+        return "\n".join(lines)
+
+
+@dataclass
 class ResetEconomicsResult:
     expected_net_profit_after_resets: float
     median_net_profit_after_resets: float
@@ -193,6 +251,7 @@ class PropSurvivalResult:
     evaluation: EvaluationSurvivalStats
     funded: FundedSurvivalStats
     reset_economics: ResetEconomicsResult
+    funnel: PayoutFunnelStats
     prop_survival_score: float               # 0-100 composite -- see _compute_survival_score
     score_breakdown: dict                    # {label: contribution} -- the "Explain" behind the score
     n_simulations: int
@@ -203,6 +262,7 @@ class PropSurvivalResult:
             "evaluation": self.evaluation.to_dict(),
             "funded": self.funded.to_dict(),
             "reset_economics": self.reset_economics.to_dict(),
+            "funnel": self.funnel.to_dict(),
             "prop_survival_score": self.prop_survival_score,
             "score_breakdown": self.score_breakdown,
             "n_simulations": self.n_simulations,
@@ -277,12 +337,13 @@ def _run_single_attempt_survival(
     cfg: PropSurvivalConfig,
     day_structure: DayStructure,
     rng: np.random.Generator,
-) -> tuple[EvaluationSurvivalStats, FundedSurvivalStats]:
+) -> tuple[EvaluationSurvivalStats, FundedSurvivalStats, PayoutFunnelStats]:
     n = cfg.n_simulations
     target_balance = rules.account_size * (1 + rules.evaluation_profit_target_pct / 100.0)
 
     reached_target_flags: list[bool] = []
     passed_eval_flags: list[bool] = []
+    reached_funded_flags: list[bool] = []
     hit_daily_loss_flags: list[bool] = []
     hit_max_dd_flags: list[bool] = []
     days_required: list[float] = []
@@ -295,6 +356,13 @@ def _run_single_attempt_survival(
     individual_payout_amounts: list[float] = []
     lifetime_days: list[float] = []
     days_to_first_payout: list[float] = []
+    approval_p = cfg.funding_approval_probability / 100.0
+    # A separate, independent RNG stream for the funding-approval draw so
+    # that turning this feature on/off (or changing its probability)
+    # never perturbs the main resampling RNG's draw sequence -- otherwise
+    # every other number in this function would shift too, just from
+    # changing an unrelated config value.
+    approval_rng = np.random.default_rng((cfg.random_seed or 0) + 999_983)
 
     for _ in range(n):
         sim_pnls = _resample_pnls(rng, base_pnls, _ResampleCfg(cfg.method, cfg.block_size))
@@ -305,6 +373,13 @@ def _run_single_attempt_survival(
 
         reached_target_flags.append(bool(np.any(day_end >= target_balance)))
         passed_eval_flags.append(result.passed_evaluation)
+        # Funding-approval attrition (see PropSurvivalConfig.funding_approval_probability):
+        # a passed evaluation only becomes a live funded account if this
+        # independent draw also clears -- at the default 100% it always
+        # does, so reached_funded == passed_evaluation exactly (unchanged
+        # behavior for every existing caller).
+        funded_this_sim = bool(result.passed_evaluation) and (approval_p >= 1.0 or approval_rng.random() < approval_p)
+        reached_funded_flags.append(funded_this_sim)
         hit_daily_loss_flags.append(bool(result.failed and result.failure_reason == "daily_loss_limit"))
         hit_max_dd_flags.append(bool(
             result.failed and result.failure_reason is not None
@@ -324,11 +399,17 @@ def _run_single_attempt_survival(
             never_recovered_flags.append(False)
             recovery_days.append(recovery)
 
-        payout_counts.append(len(result.payouts))
-        total_payout_amounts.append(result.total_payout_amount)
-        individual_payout_amounts.extend(p.amount for p in result.payouts)
-        if result.first_payout_day_index is not None:
-            days_to_first_payout.append(result.first_payout_day_index)
+        # Payouts require a live funded account -- if the funding-approval
+        # draw above failed, this attempt's payouts (if simulate_account
+        # produced any, since it doesn't know about that extra step) never
+        # actually happen.
+        n_payouts_this_sim = len(result.payouts) if funded_this_sim else 0
+        payout_counts.append(n_payouts_this_sim)
+        if funded_this_sim:
+            total_payout_amounts.append(result.total_payout_amount)
+            individual_payout_amounts.extend(p.amount for p in result.payouts)
+            if result.first_payout_day_index is not None:
+                days_to_first_payout.append(result.first_payout_day_index)
 
     payout_arr = np.array(payout_counts)
     reached_target_pct = _pct(reached_target_flags)
@@ -363,7 +444,17 @@ def _run_single_attempt_survival(
         median_days_to_first_payout=_median(days_to_first_payout),
         median_single_attempt_lifetime_days=float(np.median(lifetime_days)) if lifetime_days else 0.0,
     )
-    return evaluation, funded
+
+    funnel = PayoutFunnelStats(
+        n_accounts=n,
+        passed_evaluation_count=int(np.sum(passed_eval_flags)),
+        passed_evaluation_pct=passed_eval_pct,
+        reached_funded_count=int(np.sum(reached_funded_flags)),
+        reached_funded_pct=_pct(reached_funded_flags),
+        payout_counts=[int(np.sum(payout_arr >= k)) for k in range(1, cfg.max_payouts_tracked + 1)],
+        payout_probabilities=[_pct((payout_arr >= k).tolist()) for k in range(1, cfg.max_payouts_tracked + 1)],
+    )
+    return evaluation, funded, funnel
 
 
 # Small stand-in so this module never has to import MonteCarloConfig just
@@ -580,7 +671,7 @@ def run_prop_survival_analysis(
     base_dates = [pd.Timestamp(t.entry_time).normalize() for t in trades]
     day_structure = precompute_day_structure(base_dates)
 
-    evaluation, funded = _run_single_attempt_survival(base_pnls, base_dates, rules, cfg, day_structure, rng)
+    evaluation, funded, funnel = _run_single_attempt_survival(base_pnls, base_dates, rules, cfg, day_structure, rng)
     reset_econ = _run_reset_economics(base_pnls, base_dates, rules, cfg, day_structure, rng)
     score, breakdown = _compute_survival_score(evaluation, funded, reset_econ)
 
@@ -610,6 +701,7 @@ def run_prop_survival_analysis(
         evaluation=evaluation,
         funded=funded,
         reset_economics=reset_econ,
+        funnel=funnel,
         prop_survival_score=score,
         score_breakdown=breakdown,
         n_simulations=cfg.n_simulations,

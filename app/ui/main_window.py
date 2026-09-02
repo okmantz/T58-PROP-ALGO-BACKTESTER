@@ -888,6 +888,15 @@ class MainWindow:
             elif getattr(event, "num", None) == 5:
                 delta = 1
             self._sidebar_canvas.yview_scroll(delta, "units")
+            # Without "break", this event still propagates from the
+            # widget bindtag up through "all" to the global content-area
+            # dispatcher bound in _scrollable() (self.root.bind_all), so
+            # scrolling the sidebar ALSO scrolled whatever page happened
+            # to be active underneath it at the same time -- the sidebar
+            # "kind of" scrolled but felt tied to the current page because
+            # both scrolled together. Returning "break" here stops the
+            # event once the sidebar has handled it.
+            return "break"
 
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self._sidebar_canvas.bind(seq, _sidebar_wheel)
@@ -1038,6 +1047,7 @@ class MainWindow:
             elif getattr(event, "num", None) == 5:
                 delta = 1
             self._sidebar_canvas.yview_scroll(delta, "units")
+            return "break"  # see the matching note on _sidebar_wheel above
 
         first_section = True
         for key, _icon, label, frame, color in self._nav_items:
@@ -2975,8 +2985,14 @@ class MainWindow:
         )
         lib_scrollbar.pack(side="right", fill="y")
         self.strategy_library_listbox.config(yscrollcommand=lib_scrollbar.set)
+        # Double-click now opens the same kind of stats+code detail popup
+        # the Evolution Lab leaderboard already has (VIEW DETAILS there),
+        # instead of immediately loading the strategy into the active
+        # slot -- that's the "same capability the leaderboard has" for
+        # every saved strategy Owen asked for. LOAD SELECTED (button
+        # below) still does the load.
         self.strategy_library_listbox.bind(
-            "<Double-Button-1>", lambda _e: self._load_selected_library_strategy()
+            "<Double-Button-1>", lambda _e: self._view_selected_strategy_detail()
         )
         self.strategy_library_listbox.bind(
             "<<ListboxSelect>>", lambda _e: self._on_library_selection_changed()
@@ -2988,6 +3004,9 @@ class MainWindow:
         self._button(
             lib_btn_row, "LOAD SELECTED", self._load_selected_library_strategy, primary=True
         ).pack(side="left")
+        self._button(
+            lib_btn_row, "VIEW DETAILS", self._view_selected_strategy_detail
+        ).pack(side="left", padx=8)
         self._button(
             lib_btn_row, "RENAME SELECTED", self._rename_selected_library_strategy
         ).pack(side="left", padx=8)
@@ -3716,9 +3735,79 @@ class MainWindow:
         self._button(btn_row, "COPY TO CLIPBOARD", _copy, primary=True).pack(side="left")
         self._button(btn_row, "CLOSE", win.destroy).pack(side="left", padx=8)
 
+    def _view_selected_strategy_detail(self) -> None:
+        """The Strategy Library equivalent of the Evolution Lab
+        leaderboard's VIEW DETAILS / double-click popup: everything this
+        saved strategy's own metadata sidecar already knows (last
+        backtest, lookahead check, last search result) plus its full
+        code/config in one read-only window, for ANY saved strategy
+        (Python, PineScript, MQL5, or Manual) -- not just Evolution Lab
+        leaders. Metadata comes from the same .meta.json sidecar
+        _on_library_selection_changed() already reads for the inline
+        panel; this just also pulls in the source/config text so there's
+        one place to see both without leaving the library list.
+        """
+        mode = self.strategy_mode.get()
+        item = self._selected_library_item()
+        if item is None:
+            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            return
+
+        def fmt_kv(d: dict) -> str:
+            return "  •  ".join(f"{k}: {v}" for k, v in d.items()) if d else "n/a"
+
+        lines = [
+            f"Strategy: {item.name}",
+            f"Type: {mode}",
+            f"Status: {item.status_display}",
+            f"Description: {item.metadata.get('description') or 'n/a'}",
+            f"Market: {item.metadata.get('market') or 'n/a'}",
+            f"Tags: {', '.join(item.tags) if item.tags else 'n/a'}",
+            "",
+            "-- Last backtest / batch / Full Pipeline result --",
+        ]
+        last_run = item.metadata.get("last_run")
+        lines.append(f"  {fmt_kv(last_run)}" if last_run else "  Not tested yet.")
+        lines.append("")
+        lines.append("-- Lookahead check --")
+        lookahead = item.metadata.get("lookahead")
+        if lookahead:
+            lines.append(f"  {'CLEAN' if lookahead.get('clean') else 'FAILED'}: {lookahead.get('summary', '')}")
+        else:
+            lines.append("  Not run yet.")
+        lines.append("")
+        lines.append("-- Last Search Lab / Optimize result --")
+        last_search = item.metadata.get("last_search")
+        lines.append(f"  {fmt_kv(last_search)}" if last_search else "  Not run yet.")
+        lines.append("")
+        lines.append("-- Code / config --")
+        try:
+            source_text = load_strategy_text(mode, item.name)
+        except Exception as exc:
+            source_text = f"(could not load source: {exc})"
+        lines.append(source_text)
+
+        self._show_text_viewer(f"Strategy detail -- {item.name}  ({mode})", "\n".join(lines))
+
     def _view_selected_strategy_code(self):
         mode = self.strategy_mode.get()
         if mode == "manual":
+            # A saved manual strategy selected in the library (e.g. one
+            # promoted from the Evolution Lab leaderboard) takes priority
+            # over the live in-progress builder form -- otherwise this
+            # always showed whatever happened to be typed into Step 2's
+            # form right now, never the actually-selected library entry,
+            # which meant a promoted manual strategy's config could never
+            # be viewed here at all.
+            item = self._selected_library_item()
+            if item is not None:
+                try:
+                    text = load_strategy_text(mode, item.name)
+                except Exception as exc:
+                    messagebox.showerror("Could not load", str(exc))
+                    return
+                self._show_text_viewer(f"{item.name}  (manual)", text)
+                return
             try:
                 strategy = self._build_strategy()
             except Exception as exc:
@@ -4269,6 +4358,27 @@ class MainWindow:
         mode = self.strategy_mode.get()
 
         if mode == "manual":
+            # A manual strategy LOADED FROM THE LIBRARY (via LOAD SELECTED /
+            # the Batch queue / a promoted Evolution Lab leader) must run
+            # AS SAVED, not get silently replaced by whatever is currently
+            # sitting in the interactive builder form below -- before this
+            # check, _load_library_item_into_active_slot() only ever set
+            # strategy_py_path/_active_library_strategy and switched the
+            # mode; every actual strategy build still read the live form
+            # fields, so loading a library item did nothing for manual
+            # mode and Full Pipeline / Refinement / etc. always tested
+            # whatever was left in the form instead of the loaded config.
+            active = getattr(self, "_active_library_strategy", None)
+            if (
+                active is not None and active[0] == "manual"
+                and self.strategy_py_path and Path(self.strategy_py_path).name == active[1]
+            ):
+                try:
+                    cfg = json.loads(Path(self.strategy_py_path).read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise StrategyError(f"Could not load manual strategy '{active[1]}': {exc}") from exc
+                return ManualStrategy(cfg)
+
             long_entry, long_entry_conn = self.long_entry_conditions.to_condition_list()
             short_entry, short_entry_conn = self.short_entry_conditions.to_condition_list()
             long_exit, long_exit_conn = self.long_exit_conditions.to_condition_list()
@@ -5519,6 +5629,15 @@ class MainWindow:
             return PineScriptStrategy(path)
         if suffix in (".mq5", ".mqh"):
             return MQL5Strategy(path)
+        if suffix == ".json":
+            # Manual Strategy Builder configs saved to the library (or
+            # promoted from the Evolution Lab leaderboard) are JSON, not
+            # code -- this is what lets a manual strategy sit in the
+            # Batch test queue / OPTIMIZE SELECTED / the bulk multi-
+            # strategy list alongside Python/PineScript/MQL5 files instead
+            # of being the one type those features silently couldn't load.
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            return ManualStrategy(cfg)
         if suffix == ".txt":
             # Ambiguous extension -- sniff for PineScript's declaration
             # syntax before falling back to treating it as one.
@@ -7072,7 +7191,12 @@ class MainWindow:
             "automatically as grounding.",
             emphasize=True,
         )
-        self.genstrat_language = LabeledCombo(idea_section, "Language", list(STRATEGY_TYPES), "python")
+        # Deliberately NOT list(STRATEGY_TYPES): the AI strategy generator
+        # (app.ai.strategy_generator.LANGUAGE_EXTENSIONS) only ever emits
+        # source code in these three languages -- "manual" configs aren't
+        # code text it generates, so it must not appear as a choice here
+        # even though "manual" is now a real Strategy Library type.
+        self.genstrat_language = LabeledCombo(idea_section, "Language", ["python", "pinescript", "mql5"], "python")
         self.genstrat_idea = Text(
             idea_section, height=6, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
             relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
@@ -7344,10 +7468,21 @@ class MainWindow:
             "PROMOTE it straight into the Strategy Library to run it through 15 Full Pipeline.",
         )
         lb_frame = Frame(lb_section, bg=PANEL)
-        lb_frame.pack(fill="x", padx=18, pady=(2, 6))
+        # fill="both", expand=True (not the old fill="x") so this frame --
+        # and the listbox inside it -- actually grows to use the space the
+        # window gives it instead of clipping at a fixed pixel height.
+        lb_frame.pack(fill="both", expand=True, padx=18, pady=(2, 6))
         lb_frame.columnconfigure(0, weight=1)
+        lb_frame.rowconfigure(0, weight=1)
         self.evo_leaderboard_listbox = Listbox(
-            lb_frame, height=16, exportselection=False, bg=PANEL_3, fg=TEXT,
+            # height=16 -> 30: with population_size defaulting to 60 and
+            # elite_keep=10 (but the all-time leaderboard can hold more
+            # than one generation's elites), 16 visible rows was cramped
+            # enough that Owen couldn't work with it without scrolling
+            # constantly. This is still just the *starting* height --
+            # rowconfigure(weight=1) above plus fill="both" means it also
+            # grows further if the window itself is resized taller.
+            lb_frame, height=30, exportselection=False, bg=PANEL_3, fg=TEXT,
             activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
             font=(MONO, 9),
         )
@@ -7407,10 +7542,30 @@ class MainWindow:
         except Exception:
             pass
 
+    # An Evolution Lab run is meant to be left going overnight across many
+    # generations, and every log line from every stage (PRE-FILTER,
+    # ROBUSTNESS, MONTE CARLO, ...) for every candidate went into this one
+    # Tk Text widget with nothing ever removed. A Text widget's own insert
+    # cost and memory footprint both grow with how much it's already
+    # holding, so a genuinely long run (the kind Owen described leaving
+    # running "for a while") could accumulate tens of thousands of lines
+    # and get progressively slower/heavier until something -- this
+    # widget's own redraw, or just system memory pressure -- gave out.
+    # 4000 lines is generous scrollback for actually reading recent
+    # activity while keeping the widget's size bounded for the life of a
+    # long run.
+    _EVO_LOG_MAX_LINES = 4000
+
     def _evo_log(self, msg: str) -> None:
         def _do():
             try:
                 self.evo_log_text.insert(END, msg + "\n")
+                # int(...) on the Text index's line component; cheap
+                # relative to the insert itself.
+                n_lines = int(self.evo_log_text.index("end-1c").split(".")[0])
+                if n_lines > self._EVO_LOG_MAX_LINES:
+                    excess = n_lines - self._EVO_LOG_MAX_LINES
+                    self.evo_log_text.delete("1.0", f"{excess + 1}.0")
                 self.evo_log_text.see(END)
             except Exception:
                 pass
@@ -7602,7 +7757,19 @@ class MainWindow:
         walk_forward = record.get("walk_forward") or {}
 
         def pct(v):
+            # Fractions (0..1), e.g. PropFitnessBreakdown.pass_probability.
             return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "n/a"
+
+        def pct_already(v):
+            # Already-a-percentage values (0..100), e.g.
+            # MonteCarloResult.evaluation_pass_probability /
+            # first_payout_probability. Passing these through pct() above
+            # multiplied an already-0..100 number by 100 again -- a real
+            # 5.5% pass probability rendered as "550.0%", which is where
+            # Evolution Lab leaderboard details showing >100% (and the
+            # impossible-looking "550% pass / 0% payout" combination)
+            # came from. These two Monte Carlo fields never get *100.
+            return f"{v:.1f}%" if isinstance(v, (int, float)) else "n/a"
 
         def num(v, fmt="{:.2f}"):
             return fmt.format(v) if isinstance(v, (int, float)) else "n/a"
@@ -7629,8 +7796,8 @@ class MainWindow:
             f"  Expectancy:           {num(stats.get('expectancy'))}",
             "",
             "-- Monte Carlo / eval simulation --",
-            f"  Evaluation pass probability:  {pct(mc.get('evaluation_pass_probability'))}",
-            f"  First payout probability:     {pct(mc.get('first_payout_probability'))}",
+            f"  Evaluation pass probability:  {pct_already(mc.get('evaluation_pass_probability'))}",
+            f"  First payout probability:     {pct_already(mc.get('first_payout_probability'))}",
             "",
             "-- Robustness / walk-forward --",
             f"  Parameter-neighborhood stable:  {robustness.get('is_stable', 'n/a')}  "
@@ -7719,13 +7886,24 @@ class MainWindow:
                 ):
                     return
                 save_strategy_text(text, filename, "manual", overwrite=True)
-            set_strategy_status("manual", filename, "promoted")
+            # "promoted" is not one of STRATEGY_STATUSES (draft /
+            # tested_failed / tested_passed / validated / ready_for_demo /
+            # ready_for_live) -- that call used to raise "Unknown status
+            # 'promoted'" immediately after the "manual" type fix above,
+            # a second promote-flow bug behind the first. "validated" is
+            # the correct existing status here, not a new one invented
+            # for this: an Evolution Lab leaderboard candidate has
+            # already cleared walk-forward AND CPCV/PBO (see engine.py's
+            # pipeline) before it can appear on the leaderboard at all,
+            # which is exactly what STRATEGY_STATUSES documents
+            # "validated" as meaning.
+            set_strategy_status("manual", filename, "validated")
         except Exception as exc:
             messagebox.showerror("Could not promote", str(exc))
             return
         messagebox.showinfo(
             "Promoted",
-            f"Saved to Strategy Library as '{filename}' (manual, status: promoted). "
+            f"Saved to Strategy Library as '{filename}' (manual, status: validated). "
             "Find it in 06 Strategy Library / 15 Full Pipeline's batch queue to run it through "
             "the full validation pipeline.",
         )

@@ -197,7 +197,17 @@ class WalkForwardResult:
     stability_threshold: float
 
 
-def _metric_value(stats: dict, metric: str) -> float:
+def _metric_value(stats: dict, metric: str, trades: list | None = None, prop_rules=None, mc_cfg=None) -> float:
+    """Reads a fold's score off its backtest stats dict, EXCEPT for
+    "eval_pass_probability": that one isn't in the stats dict at all (it
+    only exists after a Monte Carlo run), so when prop_rules is supplied
+    this runs a small per-fold Monte Carlo instead. This is what lets
+    walk-forward/CPCV fold scoring actually answer "probability of
+    reaching the profit target before hitting a limit" per fold, rather
+    than silently falling back to 0.0 for a key that was never there."""
+    if metric == "eval_pass_probability" and prop_rules is not None:
+        from app.monte_carlo.engine import eval_pass_probability_for_trades
+        return eval_pass_probability_for_trades(trades or [], prop_rules, mc_cfg)
     v = stats.get(metric, 0.0)
     if v == float("inf"):
         return 10.0
@@ -211,8 +221,10 @@ def run_walk_forward(
     strategy_builder,
     risk,
     n_folds: int = 4,
-    metric: str = "profit_factor",
+    metric: str = "eval_pass_probability",
     stability_threshold: float = 0.4,
+    prop_rules=None,
+    mc_cfg=None,
 ):
     """
     strategy_builder: a zero-argument callable returning a FRESH Strategy
@@ -236,6 +248,12 @@ def run_walk_forward(
     """
     from app.backtest.engine import run_backtest
 
+    if metric == "eval_pass_probability" and prop_rules is None:
+        # Can't run a per-fold Monte Carlo without prop rules -- fall
+        # back to a reported metric rather than silently scoring every
+        # fold 0.0. Callers doing prop-firm work should pass prop_rules.
+        metric = "profit_factor"
+
     n = len(df)
     if n_folds < 2 or n < n_folds * 20:
         return None
@@ -258,8 +276,8 @@ def run_walk_forward(
         test_result = run_backtest(test_df, strategy_builder(), risk)
         train_stats = train_result.statistics.to_dict()
         test_stats = test_result.statistics.to_dict()
-        train_val = _metric_value(train_stats, metric)
-        test_val = _metric_value(test_stats, metric)
+        train_val = _metric_value(train_stats, metric, train_result.trades, prop_rules, mc_cfg)
+        test_val = _metric_value(test_stats, metric, test_result.trades, prop_rules, mc_cfg)
         train_metrics.append(train_val)
         test_metrics.append(test_val)
 
@@ -312,7 +330,7 @@ def parameter_neighborhood_robustness(
     risk,
     prop_rules,
     mc_config,
-    fitness_metric: str = "composite_prop_score",
+    fitness_metric: str = "eval_pass_probability",
     perturbation_frac: float = 0.15,
     n_neighbors: int = 6,
     seed: int = 42,

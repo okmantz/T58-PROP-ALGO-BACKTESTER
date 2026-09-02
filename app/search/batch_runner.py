@@ -168,13 +168,13 @@ class SearchStageConfig:
     # Stage 3 -- validation gate
     full_mc_sims: int = 3000
     walk_forward_folds: int = 4
-    walk_forward_metric: str = "profit_factor"
+    walk_forward_metric: str = "eval_pass_probability"
     walk_forward_min_efficiency: float = 0.4
     robustness_neighbors: int = 6
     robustness_perturbation_frac: float = 0.15
     robustness_min_stability: float = 0.4
 
-    fitness_metric: str = "composite_prop_score"
+    fitness_metric: str = "eval_pass_probability"
     workers: int | None = None                # None = os.cpu_count()
     random_seed: int = 42
 
@@ -399,6 +399,7 @@ def _stage3_task(candidate_id: str, spec: dict, cfg: dict) -> dict:
             df, lambda: build_strategy_from_spec(spec, tmp_dir), risk,
             n_folds=cfg["walk_forward_folds"], metric=cfg["walk_forward_metric"],
             stability_threshold=cfg["walk_forward_min_efficiency"],
+            prop_rules=prop_rules, mc_cfg=mc_cfg,
         )
         if wf_result is not None:
             wf_dict = {

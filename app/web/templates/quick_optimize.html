@@ -169,7 +169,7 @@
       <div><label>Fitness metric</label>
         <select name="fitness_metric">
           {% for key, label in fitness_metrics.items() %}
-          <option value="{{ key }}" {{ 'selected' if key == 'composite_prop_score' else '' }}>{{ label }}</option>
+          <option value="{{ key }}" {{ 'selected' if key == 'eval_pass_probability' else '' }}>{{ label }}</option>
           {% endfor %}
         </select>
       </div>

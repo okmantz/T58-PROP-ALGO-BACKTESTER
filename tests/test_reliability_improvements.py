@@ -242,3 +242,64 @@ def test_matched_pip_size_produces_no_mismatch_warning():
     )
     result = run_backtest(df, strategy, risk)
     assert not any("pip_size" in w and "doesn't match" in w for w in result.warnings)
+
+
+def _volatile_index_scale_df(n=400, seed=4):
+    """Price data on a ~17,000-per-unit scale with a genuinely large
+    per-bar range (like a stock index), used to confirm the ATR-relative
+    mismatch check below -- a case the plain price-ratio check misses
+    because the stop LOOKS like an ordinary fraction of price while still
+    being tiny next to how much this instrument actually moves per bar."""
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2024-01-01", periods=n, freq="15min")
+    price = 17_000.0
+    rows = []
+    for i in range(n):
+        drift = rng.normal(0, 12.0)
+        o = price
+        c = o + drift
+        h = max(o, c) + abs(rng.normal(0, 20.0))
+        l = min(o, c) - abs(rng.normal(0, 20.0))
+        rows.append((ts[i], o, h, l, c, 100.0))
+        price = c
+    return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+
+def test_atr_scale_mismatch_produces_a_clear_warning_even_when_price_ratio_looks_fine():
+    """A fixed-pips stop can pass the price-ratio pip_scale_mismatch check
+    (it looks like an ordinary fraction of price) while still being far
+    tighter than this instrument's own actual bar-to-bar range -- an
+    index priced in the thousands but with a large point-based ATR is
+    exactly that case. This must surface its own warning rather than
+    silently letting every stop distance get taken out by normal noise."""
+    df = _volatile_index_scale_df()
+    strategy = _sma_strategy()
+    strategy.config["stop_loss_pips"] = 5
+    strategy.config["take_profit_pips"] = 10
+    risk = RiskConfig(
+        initial_balance=50_000.0, risk_mode="percent", risk_value=2.0,
+        pip_size=1.0,  # a "pip" is one index point here
+        spread_pips=1.0, slippage_pips=0.5, commission_per_trade=5.0,
+    )
+    result = run_backtest(df, strategy, risk)
+    # The plain price-ratio check should NOT be the one firing here --
+    # 5 points on a ~17,000 price is a perfectly ordinary-looking ratio.
+    assert not any("pip_size" in w and "doesn't match" in w for w in result.warnings)
+    # The new ATR-relative check should be the one that catches it.
+    assert any("own recent ATR" in w for w in result.warnings)
+
+
+def test_atr_scale_mismatch_does_not_fire_for_a_properly_sized_stop():
+    """Sanity check: a stop that's a reasonable fraction of this same
+    volatile instrument's own ATR should not trip the new warning."""
+    df = _volatile_index_scale_df()
+    strategy = _sma_strategy()
+    strategy.config["stop_loss_pips"] = 60
+    strategy.config["take_profit_pips"] = 120
+    risk = RiskConfig(
+        initial_balance=50_000.0, risk_mode="percent", risk_value=2.0,
+        pip_size=1.0,
+        spread_pips=1.0, slippage_pips=0.5, commission_per_trade=5.0,
+    )
+    result = run_backtest(df, strategy, risk)
+    assert not any("own recent ATR" in w for w in result.warnings)

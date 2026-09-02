@@ -4168,7 +4168,7 @@ class MainWindow:
             # built, which happens unconditionally at startup, so this
             # should always be available in practice).
             try:
-                metric_key = self._fp_metric_label_to_key.get(self.fp_metric.get_str(), "composite_prop_score")
+                metric_key = self._fp_metric_label_to_key.get(self.fp_metric.get_str(), "eval_pass_probability")
                 cfg = FullPipelineConfig(
                     n_folds=self.fp_folds.get_int(4),
                     window_mode=self.fp_window_mode.get_str(),
@@ -4722,7 +4722,7 @@ class MainWindow:
 
     def _build_refine_config(self) -> RefinementConfig:
         metric_label = self.refine_metric.get_str()
-        metric_key = self._refine_metric_label_to_key.get(metric_label, "composite_prop_score")
+        metric_key = self._refine_metric_label_to_key.get(metric_label, "eval_pass_probability")
         return RefinementConfig(
             fitness_metric=metric_key,
             population_size=self.refine_population.get_int(10),
@@ -4824,7 +4824,7 @@ class MainWindow:
         self._refine_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
         self.refine_metric = LabeledCombo(
             settings, "Fitness metric (what \u201cbest\u201d means)", self._refine_metric_labels,
-            FITNESS_METRICS["composite_prop_score"],
+            FITNESS_METRICS["eval_pass_probability"],
         )
         self.refine_population = LabeledEntry(settings, "Population size (configs per generation)", 10)
         self.refine_generations = LabeledEntry(settings, "Generations (rounds)", 5)
@@ -5535,7 +5535,7 @@ class MainWindow:
         self._search_metric_labels = list(FITNESS_METRICS.values())
         self.search_metric = LabeledCombo(
             stage3_section, "Fitness metric (what \u201cbest\u201d means)", self._search_metric_labels,
-            FITNESS_METRICS["composite_prop_score"],
+            FITNESS_METRICS["eval_pass_probability"],
         )
 
         button_row = Frame(f, bg=BG)
@@ -5679,7 +5679,7 @@ class MainWindow:
 
     def _build_search_stage_config(self) -> SearchStageConfig:
         metric_label = self.search_metric.get_str()
-        metric_key = self._refine_metric_label_to_key.get(metric_label, "composite_prop_score")
+        metric_key = self._refine_metric_label_to_key.get(metric_label, "eval_pass_probability")
         workers_raw = self.search_workers.get_str().strip()
         workers = int(workers_raw) if workers_raw else None
         return SearchStageConfig(
@@ -6103,7 +6103,7 @@ class MainWindow:
         self._wfo_metric_labels = list(FITNESS_METRICS.values())
         self._wfo_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
         self.wfo_metric = LabeledCombo(
-            ga_settings, "Fitness metric", self._wfo_metric_labels, FITNESS_METRICS["composite_prop_score"],
+            ga_settings, "Fitness metric", self._wfo_metric_labels, FITNESS_METRICS["eval_pass_probability"],
         )
         self.wfo_population = LabeledEntry(ga_settings, "Population size per fold", 8)
         self.wfo_generations = LabeledEntry(ga_settings, "Generations per fold", 3)
@@ -6156,7 +6156,7 @@ class MainWindow:
             rules = self._build_prop_rules()
             mc_cfg = self._validation_mc_config()
 
-            metric_key = self._wfo_metric_label_to_key.get(self.wfo_metric.get_str(), "composite_prop_score")
+            metric_key = self._wfo_metric_label_to_key.get(self.wfo_metric.get_str(), "eval_pass_probability")
             refine_cfg = RefinementConfig(
                 population_size=self.wfo_population.get_int(8),
                 generations=self.wfo_generations.get_int(3),
@@ -6216,7 +6216,7 @@ class MainWindow:
         )
         self.cpcv_n_groups = LabeledEntry(cpcv_settings, "Number of groups (N)", 6)
         self.cpcv_n_test_groups = LabeledEntry(cpcv_settings, "Test groups per path (k)", 2)
-        self.cpcv_metric = LabeledEntry(cpcv_settings, "Metric (e.g. profit_factor, sharpe_ratio, net_profit)", "profit_factor")
+        self.cpcv_metric = LabeledEntry(cpcv_settings, "Metric (eval_pass_probability recommended; or profit_factor, sharpe_ratio, net_profit)", "eval_pass_probability")
         self.cpcv_max_paths = LabeledEntry(cpcv_settings, "Max combinatorial paths to evaluate", 30)
 
         cpcv_btn_row = Frame(f, bg=BG)
@@ -6292,6 +6292,7 @@ class MainWindow:
             if df is None:
                 return
             risk = self._build_risk_config()
+            prop_rules = self._build_prop_rules()
             # A fresh Strategy instance per call, since some strategy sources
             # cache state keyed to the data they last saw.
             strategy_builder = self._build_strategy
@@ -6301,8 +6302,9 @@ class MainWindow:
                 df, strategy_builder, risk,
                 n_groups=self.cpcv_n_groups.get_int(6),
                 n_test_groups=self.cpcv_n_test_groups.get_int(2),
-                metric=self.cpcv_metric.get_str().strip() or "profit_factor",
+                metric=self.cpcv_metric.get_str().strip() or "eval_pass_probability",
                 max_paths=self.cpcv_max_paths.get_int(30),
+                prop_rules=prop_rules,
             )
             paths = generate_cpcv_report(OUTPUT_DIR / "cpcv", result)
             self._last_cpcv_html_path = paths["html"]
@@ -6831,7 +6833,7 @@ class MainWindow:
         self._wfga_metric_labels = list(FITNESS_METRICS.values())
         self._wfga_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
         self.wfga_metric = LabeledCombo(
-            settings, "Fitness metric", self._wfga_metric_labels, FITNESS_METRICS["composite_prop_score"],
+            settings, "Fitness metric", self._wfga_metric_labels, FITNESS_METRICS["eval_pass_probability"],
         )
         self.wfga_population = LabeledEntry(settings, "Population size", 12)
         self.wfga_generations = LabeledEntry(settings, "Generations", 6)
@@ -6884,7 +6886,7 @@ class MainWindow:
             rules = self._build_prop_rules()
             mc_cfg = self._validation_mc_config()
 
-            metric_key = self._wfga_metric_label_to_key.get(self.wfga_metric.get_str(), "composite_prop_score")
+            metric_key = self._wfga_metric_label_to_key.get(self.wfga_metric.get_str(), "eval_pass_probability")
             refine_cfg = RefinementConfig(
                 population_size=self.wfga_population.get_int(12),
                 generations=self.wfga_generations.get_int(6),
@@ -7967,7 +7969,7 @@ class MainWindow:
         self._fp_metric_labels = list(FITNESS_METRICS.values())
         self._fp_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
         self.fp_metric = LabeledCombo(
-            settings, "Fitness metric", self._fp_metric_labels, FITNESS_METRICS["composite_prop_score"],
+            settings, "Fitness metric", self._fp_metric_labels, FITNESS_METRICS["eval_pass_probability"],
         )
         self.fp_population = LabeledEntry(settings, "GA population size", 12)
         self.fp_generations = LabeledEntry(settings, "GA generations", 6)
@@ -8136,7 +8138,7 @@ class MainWindow:
             risk = self._build_risk_config()
             rules = self._build_prop_rules()
 
-            metric_key = self._fp_metric_label_to_key.get(self.fp_metric.get_str(), "composite_prop_score")
+            metric_key = self._fp_metric_label_to_key.get(self.fp_metric.get_str(), "eval_pass_probability")
             cfg = FullPipelineConfig(
                 n_folds=self.fp_folds.get_int(4),
                 window_mode=self.fp_window_mode.get_str(),

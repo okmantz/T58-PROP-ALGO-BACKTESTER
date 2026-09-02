@@ -71,6 +71,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from app.backtest.adaptive_risk import build_limit_aware_preset
 from app.backtest.engine import run_backtest
 from app.backtest.risk import RiskConfig
 from app.evolution import checkpoint as evo_checkpoint
@@ -81,7 +82,12 @@ from app.optimize.parameter_space import apply_genome, extract_genome
 from app.optimize.refinement import _mutate, _stressed_risk_config
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
 from app.search.robustness import parameter_neighborhood_robustness, run_walk_forward
-from app.search.strategy_space import build_strategy_from_spec, generate_search_space
+from app.search.strategy_space import (
+    StrategySpaceError,
+    build_strategy_from_spec,
+    generate_search_space,
+    list_families,
+)
 from app.strategy.library import StrategyAlreadyExists, save_strategy_text, set_strategy_status
 from app.validation.cpcv import CPCVError, compute_pbo, run_cpcv
 
@@ -97,11 +103,12 @@ ProgressCallback = "Callable[[str], None]"
 _EVO_WORKER: dict = {}
 
 
-def _evo_init_worker(df_pickle_path: str, risk_kwargs: dict, prop_kwargs: dict) -> None:
+def _evo_init_worker(df_pickle_path: str, risk_kwargs: dict, prop_kwargs: dict, adaptive_risk=None) -> None:
     global _EVO_WORKER
     _EVO_WORKER["df"] = pd.read_pickle(df_pickle_path)
     _EVO_WORKER["risk"] = RiskConfig(**risk_kwargs)
     _EVO_WORKER["prop_rules"] = PropRules(**prop_kwargs)
+    _EVO_WORKER["adaptive_risk"] = adaptive_risk
 
 
 def _evo_prefilter_task(
@@ -119,7 +126,7 @@ def _evo_prefilter_task(
     df, risk = _EVO_WORKER["df"], _EVO_WORKER["risk"]
     try:
         strategy = build_strategy_from_spec(spec)
-        bt = run_backtest(df, strategy, risk)
+        bt = run_backtest(df, strategy, risk, adaptive_risk=_EVO_WORKER.get("adaptive_risk"))
     except Exception as exc:  # noqa: BLE001 -- a bad generated config must not kill the pool
         return (cid, spec, meta, None, ["build_or_backtest_error"], str(exc)[:300], None)
     if not bt.trades:
@@ -157,6 +164,15 @@ def _evo_full_eval_task(
     EvolutionRunner._full_eval_one's body exactly (same one-source-of-
     truth reasoning as _evo_prefilter_task above)."""
     df, risk, prop_rules = _EVO_WORKER["df"], _EVO_WORKER["risk"], _EVO_WORKER["prop_rules"]
+    adaptive_risk = _EVO_WORKER.get("adaptive_risk")
+    if adaptive_risk is not None:
+        # Re-run at THIS stage under the limit-aware throttle -- the
+        # pre-filter's `bt` (passed in) was deliberately run at plain
+        # nominal sizing for pre-filter speed/consistency; the full
+        # eval's own Monte Carlo/fitness must reflect the throttled
+        # sizing that would actually be deployed.
+        strategy = build_strategy_from_spec(spec)
+        bt = run_backtest(df, strategy, risk, adaptive_risk=adaptive_risk)
     stats = bt.statistics.to_dict()
     trade_pnls = [t.pnl for t in bt.trades]
     trade_dates = [t.entry_time for t in bt.trades]
@@ -248,10 +264,32 @@ class EvolutionConfig:
     mutation_rate: float = 0.35
     mutation_strength: float = 0.25
     random_immigrant_frac: float = 0.3
+    # Family diversity: without these two, a GA that finds one working
+    # family early (e.g. mtf_pullback) starves every other family of
+    # both fresh candidates AND elite/breeding slots within a handful of
+    # generations -- not because the other families don't work, but
+    # because uniform-random immigrant sampling over the pooled grid is
+    # size-biased toward whichever family happens to have the biggest
+    # grid, and unconstrained elite selection lets one high-scoring
+    # family's descendants fill every breeding slot. Both floors below
+    # exist specifically so "seed the GA with structurally different
+    # edges" stays true for the whole run, not just generation 0.
+    min_immigrants_per_family: int = 2   # every family gets at least this many fresh candidates, every generation
+    max_elite_frac_per_family: float = 0.5   # no single family may hold more than this share of the elite/breeding pool
 
     min_trades_target_for_fitness: int = 30
     max_generations: int | None = None          # None = run until stop() is called
     random_seed: int = 42
+
+    # Same limit-aware risk-throttle preset as Full Pipeline / Quick
+    # Optimize (see app.backtest.adaptive_risk.build_limit_aware_preset)
+    # -- off by default. When enabled, every candidate's pre-filter
+    # backtest, full-eval backtest, and stress test all run under the
+    # SAME throttled sizing that would actually be deployed, so a
+    # candidate's fitness reflects survivability under throttling rather
+    # than nominal unthrottled sizing.
+    adaptive_risk_enabled: bool = False
+    adaptive_risk_daily_profit_lock_pct: float | None = 80.0
 
     # Parallelism for PRE-FILTER and the ROBUSTNESS/OOS/MONTE CARLO/PROP
     # SIMULATION stage -- the two stages that run once per candidate and
@@ -371,6 +409,9 @@ class EvolutionRunner:
         self.risk = risk
         self.prop_rules = prop_rules
         self.cfg = cfg or EvolutionConfig()
+        self.adaptive_risk = build_limit_aware_preset(
+            prop_rules, daily_profit_lock_pct=self.cfg.adaptive_risk_daily_profit_lock_pct,
+        ) if self.cfg.adaptive_risk_enabled else None
         self.progress_cb = progress_cb
         self.knowledge_graph = KnowledgeGraph(Path(self.cfg.knowledge_graph_path))
 
@@ -411,7 +452,7 @@ class EvolutionRunner:
             self.df.to_pickle(df_path)
             self._pool = ProcessPoolExecutor(
                 max_workers=workers, initializer=_evo_init_worker,
-                initargs=(str(df_path), asdict(self.risk), asdict(self.prop_rules)),
+                initargs=(str(df_path), asdict(self.risk), asdict(self.prop_rules), self.adaptive_risk),
                 # spawn, not the platform default fork: this runner always
                 # lives inside a background thread (see start()), and
                 # forking a multi-threaded process is unsafe/deprecated --
@@ -586,7 +627,7 @@ class EvolutionRunner:
                 self._log(f"CLUSTER: {len(clustered)} distinct candidates remain.")
 
                 clustered.sort(key=lambda r: r.fitness.final_score, reverse=True)
-                new_elites = clustered[: self.cfg.elite_keep]
+                new_elites = self._diversify_elites(clustered)
 
                 self._record_generation_to_knowledge_graph(evaluated, {r.candidate_id for r in new_elites})
                 self._append_tested_log_full_eval(evaluated, gen)
@@ -644,16 +685,40 @@ class EvolutionRunner:
         pure random family sampling. Later generations mix mutated
         children of the previous top N with a fresh slice of random
         immigrants for diversity (same random-immigrant idea the
-        walk-forward GA already uses, applied at the population level)."""
+        walk-forward GA already uses, applied at the population level).
+
+        Immigrants are sampled PER FAMILY (stratified), not as one pooled
+        draw across every family's combined grid -- a pooled draw is
+        size-biased toward whichever family happens to have the largest
+        parameter grid, and once the immigrant budget shrinks after
+        generation 0 (see min_immigrants_per_family's docstring on
+        EvolutionConfig), a size-biased pooled draw can go whole
+        generations without a single candidate from a smaller family.
+        Stratifying, with a floor of min_immigrants_per_family per
+        family, is what keeps "mean reversion" / "volatility breakout" /
+        "session timing" / "stat pairs" etc. genuinely in contention for
+        the entire run instead of only at generation 0.
+        """
         seed = self.cfg.random_seed + gen
         n_immigrants = self.cfg.population_size if not elites else max(1, int(self.cfg.population_size * self.cfg.random_immigrant_frac))
-        space = generate_search_space(
-            mode="family", family=(None if not self.cfg.families else "all"),
-            max_candidates=n_immigrants, seed=seed, grid_points_per_gene=self.cfg.grid_points_per_gene,
-        )
-        out = [(cid, spec, space.meta[cid]) for cid, spec in space.candidates.items()]
-        if self.cfg.families:
-            out = [row for row in out if row[2]["family"] in self.cfg.families] or out
+
+        active_families = list(self.cfg.families) if self.cfg.families else list(list_families().keys())
+        n_fam = max(1, len(active_families))
+        per_family = max(self.cfg.min_immigrants_per_family, n_immigrants // n_fam)
+
+        out: list[tuple[str, dict, dict]] = []
+        for i, fam in enumerate(active_families):
+            try:
+                fam_space = generate_search_space(
+                    mode="family", family=fam,
+                    max_candidates=per_family, seed=seed + i * 7919,  # distinct seed per family, still reproducible
+                    grid_points_per_gene=self.cfg.grid_points_per_gene,
+                )
+            except StrategySpaceError:
+                # e.g. stat_pairs requested with no pair data merged in --
+                # skip that one family rather than failing the whole generation.
+                continue
+            out.extend((cid, spec, fam_space.meta[cid]) for cid, spec in fam_space.candidates.items())
 
         if elites:
             rng = random.Random(seed)
@@ -674,6 +739,41 @@ class EvolutionRunner:
                     cid = f"{meta.get('family', 'mutant')}-gen{gen}-{rng.randrange(10**8):08x}"
                     out.append((cid, child_spec, {"family": meta.get("family", "mutant"), "params": {}, "mutated_from": meta.get("family")}))
         return out[: max(self.cfg.population_size, len(out))]
+
+    def _diversify_elites(self, clustered: list[EvolutionCandidateRecord]) -> list[EvolutionCandidateRecord]:
+        """Picks the elite/breeding pool for the next generation off
+        `clustered` (already fitness-ranked, best first), capping any one
+        family's share at max_elite_frac_per_family instead of just
+        taking the top elite_keep outright.
+
+        Without this cap, one family scoring even slightly better early
+        can fill every elite slot for the rest of the run -- since
+        elites are what _generate_population mutates into next
+        generation's children, an all-one-family elite pool means every
+        "new" candidate after generation 0 is really just a variation on
+        that one family's entry logic, no matter how diverse the fresh
+        immigrants are. Backfills with the next-best candidates from
+        OTHER families first; only falls back to filling remaining slots
+        regardless of family once every other family's candidates are
+        exhausted (so a genuinely one-family-survives generation still
+        fills its elite_keep quota rather than wasting slots).
+        """
+        cap = max(1, int(self.cfg.elite_keep * self.cfg.max_elite_frac_per_family))
+        family_counts: dict[str, int] = {}
+        picked: list[EvolutionCandidateRecord] = []
+        deferred: list[EvolutionCandidateRecord] = []
+        for r in clustered:
+            fam = r.meta.get("family", "?")
+            if family_counts.get(fam, 0) < cap:
+                picked.append(r)
+                family_counts[fam] = family_counts.get(fam, 0) + 1
+            else:
+                deferred.append(r)
+            if len(picked) >= self.cfg.elite_keep:
+                break
+        if len(picked) < self.cfg.elite_keep:
+            picked.extend(deferred[: self.cfg.elite_keep - len(picked)])
+        return picked
 
     # -- PRE-FILTER + BACKTEST --------------------------------------------
     def _prefilter(self, population: list[tuple[str, dict, dict]], gen: int):
@@ -728,6 +828,7 @@ class EvolutionRunner:
             # populated once per worker process by _evo_init_worker) needs
             # seeding here too.
             _EVO_WORKER["df"], _EVO_WORKER["risk"] = self.df, self.risk
+            _EVO_WORKER["adaptive_risk"] = self.adaptive_risk
             for cid, spec, meta in population:
                 if self._stop_flag.is_set():
                     break
@@ -821,6 +922,7 @@ class EvolutionRunner:
         eval_pool = self._ensure_pool()
         if eval_pool is None:
             _EVO_WORKER["df"], _EVO_WORKER["risk"], _EVO_WORKER["prop_rules"] = self.df, self.risk, self.prop_rules
+            _EVO_WORKER["adaptive_risk"] = self.adaptive_risk
             for cid, spec, meta, bt in stage1_survivors:
                 if self._stop_flag.is_set():
                     break
@@ -895,7 +997,7 @@ class EvolutionRunner:
                 break
             try:
                 strategy = build_strategy_from_spec(r.spec)
-                bt = run_backtest(self.df, strategy, stressed_risk)
+                bt = run_backtest(self.df, strategy, stressed_risk, adaptive_risk=self.adaptive_risk)
                 r.stressed_ok = bool(bt.trades) and bt.statistics.net_profit > 0
             except Exception:
                 r.stressed_ok = False

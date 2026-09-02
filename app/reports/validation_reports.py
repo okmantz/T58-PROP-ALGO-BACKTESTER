@@ -285,9 +285,28 @@ def generate_portfolio_report(output_dir: str | Path, result, basename: str = "p
     ]
     warnings_html = "".join(f'<div class="warn">{w}</div>' for w in result.warnings)
 
+    mc_card = ""
+    if getattr(result, "mc_result", None) is not None:
+        mc = result.mc_result
+        mc_rows = [
+            ("Combined portfolio pass probability", f"{mc.evaluation_pass_probability:.1f}%"),
+            ("Combined portfolio first-payout probability", f"{mc.first_payout_probability:.1f}%"),
+            ("Combined portfolio risk of ruin", f"{mc.risk_of_ruin_pct:.1f}%"),
+            ("Combined portfolio median drawdown", f"{mc.median_drawdown_pct:.1f}%"),
+        ]
+        mc_card = (
+            '<div class="card"><h2>Combined Portfolio Pass Probability</h2>'
+            '<p style="font-size:11px;color:#9aa0aa">This is the number that actually answers whether '
+            "diversifying across these legs helped: the probability of THIS shared account (trading every "
+            "leg together) reaching the profit target before hitting a daily-loss, max-drawdown, or "
+            "consistency limit -- as opposed to any one leg's own individual pass probability.</p>"
+            f"{_table(mc_rows)}</div>"
+        )
+
     body = f"""
 {warnings_html}
 <div class="card"><h2>Portfolio Summary</h2>{_table(summary_rows)}</div>
+{mc_card}
 <div class="card"><h2>Combined Equity Curve</h2><div class="svgwrap">{equity_svg}</div></div>
 <div class="card"><h2>Legs (correlation-adjusted risk weight)</h2>{_table(leg_rows, ("Instrument", "Detail"))}</div>
 <div class="card"><h2>Correlation Matrix</h2>{_table(corr_rows, ("Instrument", "Correlation with others"))}</div>

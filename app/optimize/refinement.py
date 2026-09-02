@@ -70,9 +70,9 @@ CODE_EXTENSIONS = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}
 # Human-readable labels for the fitness-metric dropdown in the UI. Keys
 # here are the exact strings accepted by RefinementConfig.fitness_metric.
 FITNESS_METRICS: dict[str, str] = {
-    "prop_guide_score": "Prop-Oriented Guide Score (recommended)",
+    "eval_pass_probability": "Eval Pass Probability -- reach target before hitting a limit (recommended)",
+    "prop_guide_score": "Prop-Oriented Guide Score",
     "composite_prop_score": "Composite Prop Score",
-    "eval_pass_probability": "Evaluation Pass Probability",
     "first_payout_probability": "First Payout Probability",
     "expected_payout": "Expected Payout ($)",
     "net_profit": "Net Profit ($)",
@@ -84,7 +84,7 @@ FITNESS_METRICS: dict[str, str] = {
 @dataclass
 class RefinementConfig:
     enabled: bool = False
-    fitness_metric: str = "composite_prop_score"
+    fitness_metric: str = "eval_pass_probability"
     population_size: int = 10
     generations: int = 5
     elite_count: int = 2

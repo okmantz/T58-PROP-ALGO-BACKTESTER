@@ -4,7 +4,7 @@ once (e.g. Sharpe Ratio, Max Drawdown, Evaluation Pass Probability),
 instead of Iterative Refinement's single scalar fitness.
 
 app.optimize.refinement's GA collapses everything into one number
-(composite_prop_score by default) before it ever compares two
+(eval_pass_probability by default) before it ever compares two
 candidates. That's the right tool when you already know how you want to
 trade those objectives off against each other. It's the wrong tool when
 you don't -- collapsing "high Sharpe, low drawdown, high eval-pass
@@ -74,7 +74,7 @@ OBJECTIVE_DIRECTIONS: dict[str, str] = {
     "expected_payout": "max",
 }
 
-DEFAULT_OBJECTIVES = ["sharpe_ratio", "max_drawdown_pct", "eval_pass_probability"]
+DEFAULT_OBJECTIVES = ["eval_pass_probability", "max_drawdown_pct", "risk_of_ruin_pct"]
 
 
 def _raw_objective_value(objective: str, stats: dict, prop_summary: dict | None, mc: MonteCarloResult | None) -> float:

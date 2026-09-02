@@ -106,6 +106,7 @@ from app.strategy.pinescript import PineScriptStrategy
 from app.strategy.python import PythonStrategy
 from app.ui.condition_builder import ConditionList
 from app.validation.cpcv import CPCVError, compute_pbo, run_cpcv
+from app.validation.regime_matrix import run_regime_matrix
 from app.validation.sensitivity import compute_1d_sensitivity, compute_2d_heatmap, list_tunable_parameters
 from app.validation.walk_forward_opt import run_walk_forward_optimization
 from app.web import live_market
@@ -934,6 +935,8 @@ class MainWindow:
         self.tab_genstrat = Frame(self.content, bg=BG)
         self.tab_evolution = Frame(self.content, bg=BG)
         self.tab_researchagent = Frame(self.content, bg=BG)
+        self.tab_regime_matrix = Frame(self.content, bg=BG)
+        self.tab_family_diversity = Frame(self.content, bg=BG)
 
         for f in (
             self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
@@ -941,7 +944,7 @@ class MainWindow:
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
             self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket, self.tab_genstrat,
-            self.tab_evolution, self.tab_researchagent,
+            self.tab_evolution, self.tab_researchagent, self.tab_regime_matrix, self.tab_family_diversity,
         ):
             f.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
 
@@ -977,11 +980,13 @@ class MainWindow:
             ("portfolio", "", "11  Portfolio", self.tab_portfolio, BLUE),
             ("multiobj", "", "12  Multi-Objective", self.tab_multiobj, BLUE),
             ("wfga", "", "13  Walk-Forward GA", self.tab_wfga, BLUE),
+            ("regimematrix", "", "Regime Survival Matrix", self.tab_regime_matrix, BLUE),
 
             (None, None, "FINDING AN EDGE", None, None),
             ("ensemble", "", "14  Ensemble", self.tab_ensemble, NEON_MAGENTA),
             ("genstrat", "", "Generate Strategies (AI)", self.tab_genstrat, NEON_MAGENTA),
             ("evolution", "", "Evolution Lab", self.tab_evolution, NEON_MAGENTA),
+            ("familydiversity", "", "Family Diversity", self.tab_family_diversity, NEON_MAGENTA),
 
             (None, None, "ALL-IN-ONE", None, None),
             ("fullpipeline", "", "15  Full Pipeline", self.tab_fullpipeline, NEON_AMBER),
@@ -1017,6 +1022,8 @@ class MainWindow:
             ("Multi-objective", self._build_multiobj_tab),
             ("Walk-forward GA", self._build_wfga_tab),
             ("Ensemble", self._build_ensemble_tab),
+            ("Regime Survival Matrix", self._build_regime_matrix_tab),
+            ("Family Diversity", self._build_family_diversity_tab),
             ("Strategy generator", self._build_generate_strategies_tab),
             ("Evolution Lab", self._build_evolution_lab_tab),
             ("Full Pipeline", self._build_full_pipeline_tab),
@@ -6318,6 +6325,155 @@ class MainWindow:
         n_sims = n_simulations if n_simulations is not None else self.mc_sims.get_int(10000)
         method = self.mc_method.get_str().strip() or "bootstrap"
         return MonteCarloConfig(n_simulations=n_sims, method=method)
+
+    # -----------------------------------------------------------------------
+    # Regime Survival Matrix -- classifies every bar on trend/volatility/
+    # session/environment and attributes the current strategy's own trades
+    # to whichever regime was active at entry (see
+    # app.validation.regime_matrix). Reuses the SAME data/strategy/risk this
+    # strategy would run with on the Run & Report tab, via the Validation
+    # Lab's shared _load_df_for_page/_build_strategy/_build_risk_config.
+    # -----------------------------------------------------------------------
+
+    def _build_regime_matrix_tab(self):
+        f = self._scrollable(self.tab_regime_matrix)
+
+        self._page_header(
+            f,
+            "Regime Survival Matrix",
+            "Regime Survival Matrix",
+            "Classifies every bar on trend, volatility, session, and market environment, "
+            "then attributes THIS strategy's own trades to whichever regime was active at "
+            "entry -- so you can see exactly which market conditions to gate the strategy "
+            "off in, not just one aggregate backtest number. Uses the market data and "
+            "strategy currently configured on Steps 01/02.",
+        )
+
+        section = self._section(
+            f, "Matrix dimensions to cross",
+            "Trend, volatility, session, and environment are all classified either way -- "
+            "the other two always show up as single-dimension breakdowns below the main table.",
+            emphasize=True,
+        )
+        self.rm_dimension_a = LabeledCombo(
+            section, "Dimension A", ["volatility", "trend", "session", "environment"], default="volatility",
+        )
+        self.rm_dimension_b = LabeledCombo(
+            section, "Dimension B", ["environment", "trend", "volatility", "session"], default="environment",
+        )
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN REGIME SURVIVAL MATRIX", self._regime_matrix_clicked, primary=True).pack(side="left")
+
+        output_section = self._section(f, "Result", "Plain-text matrix, single-dimension breakdowns, and any recommended OFF regimes.")
+        self.rm_output = Text(
+            output_section, height=26, wrap="word", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.rm_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+    def _regime_matrix_clicked(self):
+        self.rm_output.delete("1.0", END)
+        threading.Thread(target=self._run_regime_matrix_pipeline, daemon=True).start()
+
+    def _run_regime_matrix_pipeline(self):
+        def log(msg):
+            self.rm_output.insert(END, msg + "\n")
+            self.rm_output.see(END)
+            self.root.update_idletasks()
+
+        try:
+            dim_a = self.rm_dimension_a.get_str()
+            dim_b = self.rm_dimension_b.get_str()
+            if dim_a == dim_b:
+                log("Pick two DIFFERENT dimensions to cross for the primary matrix.")
+                return
+
+            df = self._load_df_for_page(log)
+            if df is None:
+                return
+
+            log("Building strategy...")
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+
+            log(f"Classifying regimes and attributing trades ({dim_a} x {dim_b})...")
+            result = run_regime_matrix(df, strategy, risk, dimensions=(dim_a, dim_b))
+            if result is None:
+                log("Not enough bars in this dataset to classify regimes reliably -- try a longer history.")
+                return
+
+            log("")
+            log(result.render_table())
+            for dim_name, cells in result.single_dimension.items():
+                log("")
+                log(f"-- {dim_name.title()} breakdown (single dimension) --")
+                for c in cells:
+                    log(f"  {c.label:<20} trades={c.n_trades:<6} win%={c.win_rate:>5.1f} pf={c.profit_factor:>5.2f}")
+            for n in result.notes:
+                log("")
+                log(f"Note: {n}")
+        except StrategyError as exc:
+            log(f"Strategy error: {exc}")
+        except Exception:
+            log("Unexpected error:\n" + traceback.format_exc())
+
+    # -----------------------------------------------------------------------
+    # Strategy Family Diversity -- reads the most recently completed Search
+    # Lab run (this session) and ranks its candidates' hypothesis FAMILIES,
+    # not just individual candidates, per app.search.family_diversity.
+    # -----------------------------------------------------------------------
+
+    def _build_family_diversity_tab(self):
+        f = self._scrollable(self.tab_family_diversity)
+
+        self._page_header(
+            f,
+            "Strategy Family Diversity",
+            "Strategy Family Diversity",
+            "Groups the most recent Search Lab run's candidates by hypothesis family "
+            "(trend following, breakout, mean reversion, liquidity sweep, momentum, VWAP, "
+            "opening range, market structure, volatility expansion/contraction, pullback, "
+            "statistical arbitrage, relative strength, regime switching) and ranks the "
+            "FAMILIES themselves -- run a search on the Search Lab tab first.",
+        )
+
+        section = self._section(f, "Which stage to summarize", "", emphasize=True)
+        self.fd_stage = LabeledCombo(section, "Stage", ["stage1", "stage2", "stage3"], default="stage1")
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "SHOW FAMILY BREAKDOWN", self._family_diversity_clicked, primary=True).pack(side="left")
+
+        output_section = self._section(f, "Result", "")
+        self.fd_output = Text(
+            output_section, height=22, wrap="word", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.fd_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+    def _family_diversity_clicked(self):
+        self.fd_output.delete("1.0", END)
+        summary = getattr(self, "_last_search_summary", None)
+        db_path = getattr(self, "_last_search_db_path", None)
+        if not summary or not db_path:
+            self.fd_output.insert(END, "Run a search on the Search Lab tab first -- there's no completed run to summarize yet.\n")
+            return
+        try:
+            from app.search.family_diversity import render_family_report, summarize_family_performance
+            from app.search.results_db import ResultsDB
+
+            stage = self.fd_stage.get_str()
+            with ResultsDB(db_path) as db:
+                records = db.leaderboard(summary.run_id, stage=stage, top_n=5000)
+            if not records:
+                self.fd_output.insert(END, f"No '{stage}' candidates found for the most recent run -- try a different stage.\n")
+                return
+            summaries = summarize_family_performance(records)
+            self.fd_output.insert(END, render_family_report(summaries))
+        except Exception:
+            self.fd_output.insert(END, "Unexpected error:\n" + traceback.format_exc())
 
     # -----------------------------------------------------------------------
     # Tab 8 — Walk-Forward Optimization

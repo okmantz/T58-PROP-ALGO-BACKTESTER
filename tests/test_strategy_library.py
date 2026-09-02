@@ -651,3 +651,53 @@ def test_list_misplaced_files_ignores_metadata_sidecars():
     library.save_strategy_text("print('hi')\n", "real_one.py", "python")
     library.save_strategy_metadata("python", "real_one.py", {"description": "test"})
     assert library.list_misplaced_files("python") == []
+
+
+def test_manual_is_a_supported_strategy_type_with_json_extension():
+    """Regression test for the promote-from-Evolution-Lab-leaderboard bug:
+    save_strategy_text(text, filename, "manual", ...) used to raise
+    "Unknown strategy type 'manual'" because STRATEGY_TYPES only ever
+    listed ("python", "pinescript", "mql5"). "manual" must be a real,
+    first-class type -- same as the other three -- with a .json
+    extension (Manual Strategy Builder configs, and Evolution Lab
+    leaderboard candidates promoted from it, are JSON, not source code).
+    """
+    assert "manual" in library.STRATEGY_TYPES
+    saved = library.save_strategy_text('{"name": "Test Manual"}', "evolab_promoted_test.json", "manual")
+    assert saved.name == "evolab_promoted_test.json"
+    assert saved.parent.name == "manual"
+    names = [s.name for s in library.list_saved_strategies("manual")]
+    assert names == ["evolab_promoted_test.json"]
+
+
+def test_manual_strategy_round_trips_like_any_other_type():
+    """Manual strategies must support the same full lifecycle (save, tag,
+    set status, rename, delete) as python/pinescript/mql5 -- not a
+    second-class type that only save_strategy_text happens to accept."""
+    library.save_strategy_text('{"name": "X"}', "leader.json", "manual")
+    library.set_strategy_status("manual", "leader.json", "validated")
+    library.set_strategy_tags("manual", "leader.json", ["evolab"])
+    items = library.list_saved_strategies("manual")
+    assert len(items) == 1
+    assert items[0].status == "validated"
+    assert items[0].tags == ["evolab"]
+    deleted, failed = library.delete_many([("manual", "leader.json")])
+    assert not failed
+    assert library.list_saved_strategies("manual") == []
+
+
+def test_manual_metadata_sidecar_is_not_listed_as_its_own_strategy():
+    """Third bug found while fixing the promote flow: manual's own
+    extension (.json) is also a suffix of every type's metadata sidecar
+    name (<file>.meta.json) -- e.g. 'leader.json.meta.json' ends in
+    '.json'. list_saved_strategies("manual") globbed for "*.json" with
+    no sidecar exclusion, so tagging/statusing a manual strategy (which
+    creates its .meta.json sidecar) made it show up TWICE: once as
+    itself, once as its own metadata file misidentified as a second
+    strategy. python/pinescript/mql5 never hit this because their
+    sidecars (foo.py.meta.json) don't end in .py/.pine/.mq5.
+    """
+    library.save_strategy_text('{"name": "X"}', "leader.json", "manual")
+    library.set_strategy_tags("manual", "leader.json", ["evolab"])  # creates leader.json.meta.json
+    names = sorted(s.name for s in library.list_saved_strategies("manual"))
+    assert names == ["leader.json"]

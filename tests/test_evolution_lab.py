@@ -169,3 +169,68 @@ def test_evolution_runner_refuses_to_resume_against_different_data(tmp_path):
     runner2 = EvolutionRunner(different_df, RiskConfig(), PropRules(), cfg2, progress_cb=None)
     assert not runner2.resumed
     assert runner2.generation == 0
+
+
+def test_promoting_a_leaderboard_candidate_to_the_library_does_not_raise(tmp_path, monkeypatch):
+    """Regression test for the two real bugs behind PROMOTE TO STRATEGY
+    LIBRARY always failing on every Evolution Lab leader:
+
+    1. app.strategy.library.save_strategy_text(..., "manual", ...) used
+       to raise ValueError("Unknown strategy type 'manual'") because
+       STRATEGY_TYPES only listed the three code types. Every Evolution
+       Lab candidate IS a manual-builder config (see engine.py's
+       documented scope limit), so this made promotion fail 100% of the
+       time, not just on some strategies.
+    2. Even after fixing #1, set_strategy_status(..., "promoted") raised
+       ValueError("Unknown status 'promoted'") because "promoted" was
+       never a member of STRATEGY_STATUSES -- a second, later failure
+       in the exact same user-facing action.
+
+    This exercises the real promote code path end to end: run one
+    generation for real, take whatever landed on the leaderboard (or
+    build an equivalent record if nothing survived this synthetic run),
+    and save+status it exactly the way
+    MainWindow._promote_evolution_leader_record / the web
+    /evolution/promote route do.
+    """
+    from app.strategy import library
+
+    monkeypatch.setattr(library, "get_app_base_dir", lambda: tmp_path / "app_base")
+
+    df = _trending_df()
+    cfg = EvolutionConfig(
+        population_size=10, elite_keep=2, max_generations=1,
+        min_trades=3, min_profit_factor=0.0, max_drawdown_buffer_mult=20.0,
+        mc_sims=50, robustness_neighbors=1, walk_forward_folds=2,
+        cpcv_top_n=2, cpcv_max_paths=3, cpcv_n_groups=3,
+        save_to_library=False, knowledge_graph_path=str(tmp_path / "kg.jsonl"),
+        checkpoint_path=str(tmp_path / "checkpoint.json"),
+        tested_log_path=str(tmp_path / "tested_candidates.jsonl"),
+    )
+    runner = EvolutionRunner(df, RiskConfig(), PropRules(), cfg, progress_cb=None)
+    runner._run_loop()
+
+    if runner.leaderboard:
+        record = runner.leaderboard[0].to_checkpoint_dict()
+        config = record["spec"]["config"]
+        candidate_id = record["candidate_id"]
+    else:
+        # This synthetic dataset/tiny population isn't guaranteed to
+        # produce a survivor -- the promote code path itself (not
+        # whether THIS run happened to find a winner) is what's under
+        # test, so fall back to a minimal but realistic manual config.
+        config = {"name": "Test Candidate", "market": {"instrument": "XAUUSD"}}
+        candidate_id = "synthetic-test-0001"
+
+    filename = f"evolab_promoted_test_{candidate_id[-8:]}.json"
+    text = __import__("json").dumps(config, indent=2)
+
+    # This is the exact two-call sequence
+    # MainWindow._promote_evolution_leader_record and the web
+    # /evolution/promote route both run -- neither call should raise.
+    saved_path = library.save_strategy_text(text, filename, "manual", overwrite=True)
+    library.set_strategy_status("manual", filename, "validated")
+
+    assert saved_path.parent.name == "manual"
+    items = library.list_saved_strategies("manual")
+    assert any(i.name == filename and i.status == "validated" for i in items)

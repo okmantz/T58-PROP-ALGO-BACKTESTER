@@ -174,7 +174,7 @@ def _evo_full_eval_task(
     try:
         robustness = parameter_neighborhood_robustness(
             spec, df, risk, prop_rules, mc_cfg,
-            fitness_metric="composite_prop_score",
+            fitness_metric="eval_pass_probability",
             perturbation_frac=robustness_perturbation_frac,
             n_neighbors=robustness_neighbors,
             seed=random_seed,
@@ -190,6 +190,7 @@ def _evo_full_eval_task(
         wf = run_walk_forward(
             df, lambda spec=spec: build_strategy_from_spec(spec), risk,
             n_folds=walk_forward_folds, metric=walk_forward_metric,
+            prop_rules=prop_rules, mc_cfg=mc_cfg,
         )
         if wf is not None:
             wf_dict = {"walk_forward_efficiency": wf.walk_forward_efficiency, "is_stable": wf.is_stable}
@@ -224,7 +225,7 @@ class EvolutionConfig:
     robustness_perturbation_frac: float = 0.15
     robustness_min_stability: float = 0.4
     walk_forward_folds: int = 4
-    walk_forward_metric: str = "profit_factor"
+    walk_forward_metric: str = "eval_pass_probability"
 
     # Monte Carlo
     mc_sims: int = 1000
@@ -235,7 +236,7 @@ class EvolutionConfig:
     cpcv_n_groups: int = 6
     cpcv_n_test_groups: int = 2
     cpcv_max_paths: int = 10
-    cpcv_metric: str = "profit_factor"
+    cpcv_metric: str = "eval_pass_probability"
 
     # Stress test
     stress_cost_multiplier: float = 2.0
@@ -854,6 +855,7 @@ class EvolutionRunner:
                 self.df, [r.spec for r in pool], self.risk,
                 n_groups=self.cfg.cpcv_n_groups, n_test_groups=self.cfg.cpcv_n_test_groups,
                 metric=self.cfg.cpcv_metric, max_paths=self.cfg.cpcv_max_paths,
+                prop_rules=self.prop_rules,
             )
             pbo_value = pbo_result.pbo
         except Exception:
@@ -868,6 +870,7 @@ class EvolutionRunner:
                     self.df, lambda spec=r.spec: build_strategy_from_spec(spec), self.risk,
                     n_groups=self.cfg.cpcv_n_groups, n_test_groups=self.cfg.cpcv_n_test_groups,
                     metric=self.cfg.cpcv_metric, max_paths=self.cfg.cpcv_max_paths,
+                    prop_rules=self.prop_rules,
                 )
                 cpcv_degradation = cpcv_result.degradation
             except CPCVError:

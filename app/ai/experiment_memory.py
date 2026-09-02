@@ -236,6 +236,110 @@ def get_recent_experiments(limit: int = 20, origin: str | None = None) -> list[E
         return []
 
 
+def get_experiment_by_id(experiment_id: str) -> Experiment | None:
+    try:
+        conn = _connect()
+        row = conn.execute("SELECT * FROM experiments WHERE id = ?", (experiment_id,)).fetchone()
+        conn.close()
+        return _row_to_experiment(row) if row is not None else None
+    except Exception:
+        return None
+
+
+_LEADERBOARD_SORT_COLUMNS = {
+    "eval_pass_probability", "first_payout_probability", "net_profit",
+    "profit_factor", "win_rate", "created_at",
+}
+
+
+def get_leaderboard(
+    limit: int = 20, origin: str | None = None, sort_by: str = "eval_pass_probability",
+    verdict: str | None = None,
+) -> list[Experiment]:
+    """The "every experiment permanently recorded, ranked" view: every
+    recorded experiment (optionally filtered to one `origin`, e.g.
+    'research_loop', or one `verdict`, e.g. 'KEEP'), ranked by `sort_by`
+    (must be one of _LEADERBOARD_SORT_COLUMNS -- an unrecognized value
+    falls back to eval_pass_probability rather than risking a SQL
+    injection via a caller-supplied column name). Highest first.
+    """
+    col = sort_by if sort_by in _LEADERBOARD_SORT_COLUMNS else "eval_pass_probability"
+    try:
+        conn = _connect()
+        clauses, params = [], []
+        if origin:
+            clauses.append("origin = ?")
+            params.append(origin)
+        if verdict:
+            clauses.append("verdict = ?")
+            params.append(verdict)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = conn.execute(
+            f"SELECT * FROM experiments {where} ORDER BY {col} DESC LIMIT ?", (*params, limit),
+        ).fetchall()
+        conn.close()
+        return [_row_to_experiment(r) for r in rows]
+    except Exception:
+        return []
+
+
+def find_similar_discarded_dna(active_tags: list[str], origin: str | None = None, min_jaccard: float = 0.99) -> bool:
+    """Thin convenience wrapper over is_dna_tagset_previously_discarded
+    for callers that just want a yes/no answer at (near-)exact match --
+    prefer calling is_dna_tagset_previously_discarded directly when a
+    looser similarity threshold or the actual similarity score is
+    useful (e.g. app.ai.research_loop's cross-session dedup check)."""
+    is_repeat, _similarity = is_dna_tagset_previously_discarded(active_tags, origin=origin, min_jaccard=min_jaccard)
+    return is_repeat
+
+
+def render_leaderboard_card(exp: Experiment, parent: Experiment | None = None) -> str:
+    """Plain-text experiment card in the 'Experiment #N / Strategy /
+    Changes / Results / Compared with parent / Verdict' shape -- the
+    format a research log actually reads in. `parent` (if given) must be
+    the Experiment referenced by exp.config.get("parent_experiment");
+    passing the wrong one produces a misleading diff, so callers should
+    resolve it via get_experiment_by_id(exp.config.get("parent_experiment"))
+    themselves rather than guessing.
+
+    Reads Strategy DNA tags from config["dna"] as a plain list of tag
+    strings (the same shape app.ai.research_loop records and
+    get_dna_tagsets_by_verdict/is_dna_tagset_previously_discarded read),
+    not the full app.strategy.dna.StrategyDNA.to_dict() shape.
+    """
+    lines = [f"Experiment  {exp.id[:8]}", "", "Strategy:", f"  {exp.strategy_name}"]
+
+    exp_tags = set(exp.config.get("dna") or []) if isinstance(exp.config, dict) else set()
+    parent_tags = set(parent.config.get("dna") or []) if (parent and isinstance(parent.config, dict)) else set()
+    if exp_tags and parent_tags:
+        added = sorted(exp_tags - parent_tags)
+        removed = sorted(parent_tags - exp_tags)
+        if added or removed:
+            lines += ["", "Changes:"]
+            lines += [f"  + {t.split('.', 1)[-1].replace('_', ' ')}" for t in added]
+            lines += [f"  - {t.split('.', 1)[-1].replace('_', ' ')}" for t in removed]
+
+    lines += [
+        "", "Results:",
+        f"  Pass: {exp.eval_pass_probability:.1f}%",
+        f"  Payout: {exp.first_payout_probability:.1f}%",
+        f"  DD: {exp.max_drawdown_pct:.1f}%",
+    ]
+
+    if parent is not None:
+        lines += [
+            "", "Compared with parent:",
+            f"  Pass: {exp.eval_pass_probability - parent.eval_pass_probability:+.1f}%",
+            f"  Payout: {exp.first_payout_probability - parent.first_payout_probability:+.1f}%",
+            f"  DD: {exp.max_drawdown_pct - parent.max_drawdown_pct:+.1f}%",
+        ]
+
+    lines += ["", "Verdict:", f"  {exp.verdict}"]
+    if exp.lesson:
+        lines += ["", "Lesson:", f"  {exp.lesson}"]
+    return "\n".join(lines)
+
+
 def get_summary_counts() -> dict:
     """Returns the "T58 Research Memory" dashboard numbers: total
     experiments tested, and a breakdown by verdict. Never raises --
@@ -327,3 +431,67 @@ def search_similar_experiments(
     for r in results:
         r.similarity = 1.0
     return results
+
+
+def get_dna_tagsets_by_verdict(
+    origin: str | None = None, verdict: str = "DISCARD", limit: int = 200,
+) -> list[list[str]]:
+    """Every recorded experiment's Strategy DNA active-tag set (see
+    app.strategy.dna) for a given verdict, newest first -- the piece the
+    Ollama Research Loop uses to avoid re-testing a structurally
+    identical strategy it (or a prior run) already tried and discarded.
+    Only returns experiments whose config_json actually contains a "dna"
+    list (older experiments recorded before Strategy DNA existed simply
+    don't contribute -- never raises or requires a migration).
+    """
+    try:
+        conn = _connect()
+        if origin:
+            rows = conn.execute(
+                "SELECT config_json FROM experiments WHERE verdict = ? AND origin = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (verdict, origin, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT config_json FROM experiments WHERE verdict = ? ORDER BY created_at DESC LIMIT ?",
+                (verdict, limit),
+            ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    tagsets = []
+    for row in rows:
+        try:
+            config = json.loads(row["config_json"] or "{}")
+            dna_tags = config.get("dna")
+            if dna_tags:
+                tagsets.append(list(dna_tags))
+        except Exception:
+            continue
+    return tagsets
+
+
+def is_dna_tagset_previously_discarded(
+    tags: list[str], origin: str | None = None, min_jaccard: float = 0.85, limit: int = 200,
+) -> tuple[bool, float]:
+    """Whether `tags` (a strategy's active DNA tags) is close enough to a
+    PAST DISCARD-verdict experiment's tag set to count as a repeat --
+    measured by Jaccard similarity (intersection / union) rather than
+    exact equality, since two strategies with the same core idea rarely
+    produce byte-identical tag sets. Returns (is_repeat, best_similarity)
+    -- best_similarity is 0.0 if there's nothing to compare against yet.
+    """
+    if not tags:
+        return False, 0.0
+    tag_set = set(tags)
+    best = 0.0
+    for past_tags in get_dna_tagsets_by_verdict(origin=origin, verdict="DISCARD", limit=limit):
+        past_set = set(past_tags)
+        union = tag_set | past_set
+        if not union:
+            continue
+        jaccard = len(tag_set & past_set) / len(union)
+        best = max(best, jaccard)
+    return best >= min_jaccard, best

@@ -41,12 +41,12 @@ from itertools import combinations
 # keywords appears anywhere in the text.
 _ENTRY_KEYWORDS: dict[str, list[str]] = {
     "market_structure": [
-        "market structure", "order block", "break of structure", "bos", "choch",
-        "change of character", "swing high", "swing low", "supply zone", "demand zone",
+        "market structure", "order block", "break of structure", "break_of_structure", "bos", "choch",
+        "change of character", "change_of_character", "swing high", "swing low", "supply zone", "demand zone",
         "structure_break", "higher_high", "lower_low",
     ],
     "liquidity": [
-        "liquidity", "liquidity sweep", "stop hunt", "equal highs", "equal lows",
+        "liquidity", "liquidity sweep", "liquidity_sweep", "stop hunt", "equal highs", "equal lows",
         "fair value gap", "fvg", "inducement", "sweep_high", "sweep_low",
     ],
     "momentum": [

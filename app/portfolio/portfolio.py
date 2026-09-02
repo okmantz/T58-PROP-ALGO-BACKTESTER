@@ -49,6 +49,8 @@ from app.backtest.engine import run_backtest
 from app.backtest.execution import Trade
 from app.backtest.risk import RiskConfig
 from app.backtest.statistics import BacktestStatistics, compute_statistics
+from app.monte_carlo.engine import MonteCarloConfig, MonteCarloResult, run_monte_carlo
+from app.prop.simulator import PropRules, simulate_account, summarize_single_run
 from app.strategy.base import Strategy
 
 
@@ -71,6 +73,20 @@ class PortfolioConfig:
     correlation_penalty_strength: float = 0.6   # 0 = ignore correlation, 1 = full inverse-correlation re-weighting
     max_instrument_weight_frac: float = 0.5      # cap on any one leg's share of total portfolio risk budget
     min_weight_frac: float = 0.15                # floor on any one leg's share of its OWN nominal weight
+    # Optional: when both are supplied, run_portfolio_backtest also runs a
+    # Monte Carlo simulation on the COMBINED (shared-account) trade
+    # sequence and reports the portfolio's own eval_pass_probability --
+    # answering "if I fund ONE account trading this whole book of
+    # strategies, what's the probability of passing?" directly, rather
+    # than only ever reporting that number per individual strategy.
+    # Running several genuinely uncorrelated modest-edge strategies as one
+    # portfolio raises this number more reliably than pushing any single
+    # strategy's own pass probability higher, because it smooths out the
+    # daily-loss/drawdown spikes any one strategy's losing streak would
+    # otherwise cause alone. None (either) = skip the Monte Carlo step
+    # entirely (old behavior, unchanged).
+    prop_rules: PropRules | None = None
+    mc_config: MonteCarloConfig | None = None
 
 
 @dataclass
@@ -94,15 +110,25 @@ class PortfolioResult:
     combined_statistics: BacktestStatistics
     diversification_ratio: float | None  # weighted-avg individual vol / portfolio vol; >1 means diversification helped
     warnings: list = field(default_factory=list)
+    # Populated only when PortfolioConfig.prop_rules + mc_config were both
+    # supplied -- the portfolio's OWN aggregate probability of clearing
+    # the eval, as one shared account trading every leg together. None
+    # otherwise (Monte Carlo wasn't requested).
+    mc_result: object | None = None          # MonteCarloResult | None
+    single_run_summary: dict | None = None   # summarize_single_run() on the one real combined trade sequence
 
     def to_summary_dict(self) -> dict:
-        return {
+        d = {
             "legs": [l.__dict__ for l in self.legs],
             "correlation_matrix": self.correlation_matrix,
             "combined_statistics": self.combined_statistics.to_dict(),
             "diversification_ratio": self.diversification_ratio,
             "warnings": self.warnings,
         }
+        if self.mc_result is not None:
+            d["mc_result"] = self.mc_result.to_dict()
+            d["single_run_summary"] = self.single_run_summary
+        return d
 
 
 def _daily_returns(equity_curve: pd.DataFrame) -> pd.Series:
@@ -242,4 +268,22 @@ def run_portfolio_backtest(
         combined_statistics=combined_stats,
         diversification_ratio=diversification_ratio,
         warnings=warnings,
+        **_combined_mc_fields(all_final_trades, cfg),
     )
+
+
+def _combined_mc_fields(all_final_trades: list[Trade], cfg: PortfolioConfig) -> dict:
+    """Runs Monte Carlo on the portfolio's combined trade sequence against
+    ONE shared prop account, when both prop_rules and mc_config were
+    supplied -- see PortfolioConfig.prop_rules's docstring for why this
+    is the number that actually answers "does diversifying across
+    several strategies raise my probability of passing". Returns an
+    empty dict (mc_result/single_run_summary both stay None) if either
+    config piece is missing or there are no combined trades to score."""
+    if cfg.prop_rules is None or cfg.mc_config is None or not all_final_trades:
+        return {}
+    pnls = [t.pnl for t in all_final_trades]
+    dates = [t.entry_time for t in all_final_trades]
+    single_run = simulate_account(pnls, dates, cfg.prop_rules)
+    mc = run_monte_carlo(all_final_trades, cfg.prop_rules, cfg.mc_config)
+    return {"mc_result": mc, "single_run_summary": summarize_single_run(single_run)}

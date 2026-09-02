@@ -1086,7 +1086,7 @@ def refine_start():
 
         cfg = RefinementConfig(
             enabled=True,
-            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
             population_size=int(form.get("population_size", 10) or 10),
             generations=int(form.get("generations", 5) or 5),
             elite_count=int(form.get("elite_count", 2) or 2),
@@ -1268,7 +1268,7 @@ def full_pipeline_start():
             ga_population=int(form.get("ga_population", 12) or 12),
             ga_generations=int(form.get("ga_generations", 6) or 6),
             ga_search_mc_sims=int(form.get("ga_search_mc_sims", 200) or 200),
-            fitness_metric=form.get("fitness_metric", "prop_guide_score"),
+            fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
             final_mc_sims=int(form.get("final_mc_sims", 10000) or 10000),
             baseline_mc_sims=int(form.get("baseline_mc_sims", 2000) or 2000),
             holdout_frac=float(form.get("holdout_frac", 0.2) or 0.2),
@@ -1454,7 +1454,7 @@ def wfo_start():
             population_size=int(form.get("population_size", 8) or 8),
             generations=int(form.get("generations", 3) or 3),
             search_monte_carlo_sims=int(form.get("search_mc_sims", 200) or 200),
-            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
         )
 
         job_id = uuid.uuid4().hex[:12]
@@ -1730,7 +1730,7 @@ def wfga_start():
             population_size=int(form.get("population_size", 10) or 10),
             generations=int(form.get("generations", 5) or 5),
             search_monte_carlo_sims=int(form.get("search_mc_sims", 200) or 200),
-            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
         )
 
         job_id = uuid.uuid4().hex[:12]
@@ -2025,12 +2025,13 @@ def _cpcv_job_log(job_id: str, msg: str) -> None:
             job["log"].append(msg)
 
 
-def _run_cpcv_job(job_id: str, df, strategy, risk: RiskConfig, n_groups: int, n_test_groups: int, embargo_frac: float, metric: str, robustness_threshold: float, max_paths: int) -> None:
+def _run_cpcv_job(job_id: str, df, strategy, risk: RiskConfig, n_groups: int, n_test_groups: int, embargo_frac: float, metric: str, robustness_threshold: float, max_paths: int, prop_rules=None) -> None:
     try:
         _cpcv_job_log(job_id, f"Running CPCV: {n_groups} groups, {n_test_groups} held out per path, metric={metric}...")
         result = run_cpcv(
             df, lambda: strategy, risk, n_groups=n_groups, n_test_groups=n_test_groups,
             embargo_frac=embargo_frac, metric=metric, robustness_threshold=robustness_threshold, max_paths=max_paths,
+            prop_rules=prop_rules,
         )
         _cpcv_job_log(job_id, f"Done: {result.n_paths} paths evaluated.")
         paths = generate_cpcv_report(CPCV_DIR, result, basename=f"cpcv_{job_id}")
@@ -2070,6 +2071,7 @@ def cpcv_start():
             risk_value=float(form.get("risk_value", 1.0)),
             pip_size=float(form.get("pip_size", 0.0001)),
         )
+        prop_rules = PropRules(account_size=float(form.get("initial_balance", 100000)))
         job_id = uuid.uuid4().hex[:12]
         initial_log = [f"Loaded {len(df)} bars from {active_label}."]
         if import_note:
@@ -2081,8 +2083,9 @@ def cpcv_start():
             args=(
                 job_id, df, strategy, risk,
                 int(form.get("n_groups", 6) or 6), int(form.get("n_test_groups", 2) or 2),
-                float(form.get("embargo_frac", 0.01) or 0.01), form.get("metric", "profit_factor"),
+                float(form.get("embargo_frac", 0.01) or 0.01), form.get("metric", "eval_pass_probability"),
                 float(form.get("robustness_threshold", 0.5) or 0.5), int(form.get("max_paths", 30) or 30),
+                prop_rules,
             ),
             daemon=True,
         )
@@ -2291,7 +2294,7 @@ def quickopt_start():
         cfg = QuickOptimizeConfig(
             ga_population=int(form.get("ga_population", 16) or 16),
             ga_generations=int(form.get("ga_generations", 8) or 8),
-            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
             n_folds=int(form.get("n_folds", 4) or 4),
             save_to_library=form.get("save_to_library", "on") == "on",
         )
@@ -2673,7 +2676,7 @@ def search_start():
             full_mc_sims=int(form.get("full_mc_sims", 3000) or 3000),
             walk_forward_folds=int(form.get("walk_forward_folds", 4) or 4),
             robustness_neighbors=int(form.get("robustness_neighbors", 6) or 6),
-            fitness_metric=form.get("fitness_metric", "composite_prop_score"),
+            fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
             workers=int(workers_raw) if workers_raw else None,
             random_seed=seed,
         )

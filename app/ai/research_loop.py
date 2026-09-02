@@ -66,6 +66,7 @@ from app.prop.simulator import PropRules
 from app.prop.survival_engine import PropSurvivalConfig, run_prop_survival_analysis
 from app.strategy.dna import extract_dna
 from app.strategy.python import PythonStrategy
+from app.validation.regime_matrix import label_session
 
 ProgressCallback = Callable[[str], None]
 
@@ -76,32 +77,100 @@ DEFAULT_KEEP_SCORE_THRESHOLD = 40.0
 # Failure analysis -- a real, computed diagnostic (never an AI guess)
 # ---------------------------------------------------------------------------
 
+def _session_loss_concentration(df: pd.DataFrame, losers: list, min_pct: float = 65.0) -> tuple[dict | None, str | None]:
+    """The session-time companion to the ATR-volatility check below --
+    exactly the 'natural next addition' flagged in this module's own
+    prior notes. Answers 'what fraction of losing P&L came from each
+    fixed session window' using app.validation.regime_matrix's session
+    classifier (no fitting needed -- session boundaries are fixed clock
+    windows, unlike the ATR check's percentile threshold). Returns
+    (pct_by_session, concentrated_session) -- concentrated_session is
+    None unless one single session accounts for >= min_pct of total
+    losing P&L, same 'don't over-claim from a coin flip' bar the
+    volatility check uses."""
+    if not losers or df is None or len(df) < 20 or "timestamp" not in df.columns:
+        return None, None
+    try:
+        session_series = label_session(df)
+    except Exception:
+        return None, None
+
+    ts = pd.to_datetime(df["timestamp"])
+    session_by_time = pd.Series(session_series.astype(object).values, index=ts)
+
+    def _session_at(entry_time):
+        idx = session_by_time.index.searchsorted(pd.Timestamp(entry_time), side="right") - 1
+        if idx < 0 or idx >= len(session_by_time):
+            return None
+        val = session_by_time.iloc[idx]
+        return val if pd.notna(val) else None
+
+    total_loss = sum(-t.pnl for t in losers)
+    if total_loss <= 0:
+        return None, None
+
+    loss_by_session: dict[str, float] = {}
+    for t in losers:
+        s = _session_at(t.entry_time)
+        if s is None:
+            continue
+        loss_by_session[s] = loss_by_session.get(s, 0.0) + (-t.pnl)
+    if not loss_by_session:
+        return None, None
+
+    pct_by_session = {k: v / total_loss * 100.0 for k, v in loss_by_session.items()}
+    worst_session, worst_pct = max(pct_by_session.items(), key=lambda kv: kv[1])
+    return pct_by_session, (worst_session if worst_pct >= min_pct else None)
+
+
 def diagnose_failure(df: pd.DataFrame, trades: list, low_vol_percentile: float = 50.0) -> dict:
-    """Answers 'why did this strategy actually lose money' with one
-    concrete, checkable number: what fraction of its total LOSING P&L
-    came from trades opened while a simple ATR-based volatility proxy
-    was below the given percentile ('a low-volatility regime') versus
-    at/above it. This is exactly the diagnostic the research-loop plan
-    describes ('73% of drawdown occurred during low-volatility
-    regimes') -- computed directly from the strategy's own trades and
-    the underlying price series, not asked of the AI.
+    """Answers 'why did this strategy actually lose money' with two
+    concrete, checkable numbers, computed directly from the strategy's
+    own trades and the underlying price series -- never asked of the AI:
+
+    1. (original check) what fraction of total LOSING P&L came from
+       trades opened while a simple ATR-based volatility proxy was below
+       the given percentile ('a low-volatility regime') versus at/above
+       it -- exactly the diagnostic the research-loop plan describes
+       ('73% of drawdown occurred during low-volatility regimes').
+    2. (session-concentration check) what fraction of that same losing
+       P&L is concentrated in one fixed session window (Asia/London/NY
+       Open/NY/Power Hour) -- see _session_loss_concentration above.
 
     Returns {"low_vol_loss_pct": float, "high_vol_loss_pct": float,
-    "regime": "low_vol"|"high_vol"|"mixed", "suggestion": str|None}.
-    `suggestion` is a plain-language, ready-to-hand-to-Ollama sentence
-    describing the concrete change the numbers point to -- None if
-    there isn't enough signal (too few losing trades, or losses split
-    roughly evenly across regimes) to justify one.
+    "regime": "low_vol"|"high_vol"|"mixed", "suggestion": str|None,
+    "session_loss_pct": dict|None, "concentrated_session": str|None,
+    "session_suggestion": str|None}. Every key is present on every
+    return path (defaulted None where there isn't enough signal), so
+    callers never need to guard with .get() against a missing key.
+    `suggestion` and `session_suggestion` are independent, plain-
+    language, ready-to-hand-to-Ollama sentences -- either, both, or
+    neither may be non-None depending on what the numbers actually show.
     """
     losers = [t for t in trades if t.pnl < 0]
+    session_loss_pct, concentrated_session = _session_loss_concentration(df, losers)
+    session_suggestion = None
+    if concentrated_session:
+        session_suggestion = (
+            f"{session_loss_pct[concentrated_session]:.0f}% of this strategy's losing P&L came from trades "
+            f"opened during the {concentrated_session.replace('_', ' ').title()} session window. Test adding "
+            f"a session-time filter that skips (or tightens risk during) that window."
+        )
+    session_fields = {
+        "session_loss_pct": session_loss_pct, "concentrated_session": concentrated_session,
+        "session_suggestion": session_suggestion,
+    }
+
     if len(losers) < 5 or df is None or len(df) < 20 or "high" not in df.columns:
-        return {"low_vol_loss_pct": None, "high_vol_loss_pct": None, "regime": "unknown", "suggestion": None}
+        return {"low_vol_loss_pct": None, "high_vol_loss_pct": None, "regime": "unknown", "suggestion": None,
+                **session_fields}
 
     true_range = (df["high"] - df["low"]).abs()
     atr = true_range.rolling(14, min_periods=5).mean()
     atr_valid = atr.dropna()
     if atr_valid.empty:
-        return {"low_vol_loss_pct": None, "high_vol_loss_pct": None, "regime": "unknown", "suggestion": None}
+        return {"low_vol_loss_pct": None, "high_vol_loss_pct": None, "regime": "unknown", "suggestion": None,
+                **session_fields}
     atr_threshold = float(np.nanpercentile(atr_valid, low_vol_percentile))
 
     ts = pd.to_datetime(df["timestamp"])
@@ -127,7 +196,8 @@ def diagnose_failure(df: pd.DataFrame, trades: list, low_vol_percentile: float =
             high_vol_loss += -t.pnl
 
     if total_loss <= 0:
-        return {"low_vol_loss_pct": None, "high_vol_loss_pct": None, "regime": "unknown", "suggestion": None}
+        return {"low_vol_loss_pct": None, "high_vol_loss_pct": None, "regime": "unknown", "suggestion": None,
+                **session_fields}
 
     low_pct = low_vol_loss / total_loss * 100.0
     high_pct = high_vol_loss / total_loss * 100.0
@@ -150,7 +220,8 @@ def diagnose_failure(df: pd.DataFrame, trades: list, low_vol_percentile: float =
             f"specifically for those regimes."
         )
 
-    return {"low_vol_loss_pct": low_pct, "high_vol_loss_pct": high_pct, "regime": regime, "suggestion": suggestion}
+    return {"low_vol_loss_pct": low_pct, "high_vol_loss_pct": high_pct, "regime": regime, "suggestion": suggestion,
+            **session_fields}
 
 
 # ---------------------------------------------------------------------------

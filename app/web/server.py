@@ -51,8 +51,8 @@ from app.ensemble.ensemble import EnsembleError, EnsembleVoteConfig, run_ensembl
 from app.evolution import checkpoint as evo_checkpoint
 from app.evolution.engine import EvolutionConfig, EvolutionRunner
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
-from app.optimize.multi_objective import (
-    DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement,
+from app.optimize.risk_sweep import DEFAULT_RISK_VALUES, run_risk_sweep
+from app.optimize.multi_objective import (    DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement,
 )
 from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, RefinementError, run_iterative_refinement
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
@@ -70,13 +70,17 @@ from app.reports.validation_reports import (
     generate_sensitivity_report, generate_walk_forward_report, generate_walkforward_ga_report,
 )
 from app.reports import run_history
+from app.scoring.t58_scorecard import score_from_results
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
+from app.search.family_diversity import render_family_report, summarize_family_performance
 from app.search.search_report import generate_search_report
 from app.search.strategy_space import (
     StrategySpaceError, family_description, generate_search_space, list_families,
 )
+from app.search.results_db import ResultsDB
 from app.strategy.base import StrategyError
 from app.validation.cpcv import CPCVError, run_cpcv
+from app.validation.regime_matrix import run_regime_matrix
 from app.validation.sensitivity import compute_1d_sensitivity
 from app.validation.walk_forward_opt import run_walk_forward_optimization
 from app.strategy.library import (
@@ -127,6 +131,8 @@ QUICK_OPT_DIR = BASE_DIR / "reports" / "quick_optimize"
 QUICK_OPT_DIR.mkdir(parents=True, exist_ok=True)
 PAYOUT_DIR = BASE_DIR / "reports" / "payout_probability"
 PAYOUT_DIR.mkdir(parents=True, exist_ok=True)
+REGIME_DIR = BASE_DIR / "reports" / "regime_matrix"
+REGIME_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -1932,6 +1938,120 @@ def portfolio_run():
 @app.route("/portfolio_reports/<path:filename>")
 def serve_portfolio_report(filename):
     return send_from_directory(PORTFOLIO_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Regime Survival Matrix
+# ---------------------------------------------------------------------------
+
+_REGIME_DIMENSIONS = ("trend", "volatility", "session", "environment")
+
+
+@app.route("/regime-matrix")
+def regime_matrix_form():
+    return render_template(
+        "regime_matrix.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+    )
+
+
+@app.route("/regime-matrix/run", methods=["POST"])
+def regime_matrix_run():
+    form = request.form
+    ctx = lambda **kw: dict(stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **kw)
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            return render_template("regime_matrix.html", **ctx(error=dataset_error)), 400
+
+        strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+
+        dim_a = form.get("dimension_a", "volatility")
+        dim_b = form.get("dimension_b", "environment")
+        if dim_a == dim_b:
+            return render_template("regime_matrix.html", **ctx(
+                error="Pick two DIFFERENT dimensions to cross for the primary matrix.",
+            )), 400
+
+        result = run_regime_matrix(df, strategy, risk, dimensions=(dim_a, dim_b))
+        if result is None:
+            return render_template("regime_matrix.html", **ctx(
+                error="Not enough bars in this dataset to classify regimes reliably -- try a longer history.",
+            )), 400
+
+        return render_template("regime_matrix.html", **ctx(result={
+            "dataset": active_label,
+            "dimensions": list(result.primary_dimensions),
+            "cells": sorted([c.to_dict() for c in result.cells], key=lambda c: c["net_profit"], reverse=True),
+            "single_dimension": {k: [c.to_dict() for c in v] for k, v in result.single_dimension.items()},
+            "disable_regimes": [c.to_dict() for c in result.disable_regimes()],
+            "notes": result.notes,
+            "table_text": result.render_table(),
+        }))
+    except StrategyError as exc:
+        return render_template("regime_matrix.html", **ctx(error=str(exc))), 400
+    except Exception as exc:  # noqa: BLE001
+        return render_template("regime_matrix.html", **ctx(error=f"Unexpected error: {exc}")), 500
+
+
+# ---------------------------------------------------------------------------
+# Strategy Family Diversity -- reads an already-completed Search Lab run
+# (any search_*.db under SEARCH_DIR) and reports per-family performance.
+# ---------------------------------------------------------------------------
+
+def _available_search_runs() -> list[dict]:
+    """Scans every search_*.db under SEARCH_DIR (one per Search Lab job --
+    see run_search's db_path convention) and lists their runs, most
+    recent first, for the family-diversity page's run picker."""
+    runs = []
+    for db_file in sorted(SEARCH_DIR.glob("search_*.db"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with ResultsDB(db_file) as db:
+                for row in db.list_runs(limit=10):
+                    runs.append({
+                        "db_path": str(db_file), "run_id": row.get("run_id"),
+                        "mode": row.get("mode"), "family": row.get("family"),
+                        "instrument": row.get("instrument"), "created_at": row.get("created_at"),
+                    })
+        except Exception:  # noqa: BLE001 -- a corrupt/partial db file must not break the whole picker
+            continue
+    return runs
+
+
+@app.route("/family-diversity")
+def family_diversity_form():
+    db_path = request.args.get("db_path", "")
+    run_id = request.args.get("run_id", "")
+    stage = request.args.get("stage", "stage1")
+    runs = _available_search_runs()
+
+    result_ctx = None
+    error = None
+    if db_path and run_id:
+        try:
+            with ResultsDB(Path(db_path)) as db:
+                records = db.leaderboard(run_id, stage=stage, top_n=5000)
+            if not records:
+                error = f"No '{stage}' candidates found for that run -- try a different stage."
+            else:
+                summaries = summarize_family_performance(records)
+                result_ctx = {
+                    "run_id": run_id, "stage": stage, "n_records": len(records),
+                    "summaries": [s.to_dict() for s in summaries],
+                    "report_text": render_family_report(summaries),
+                }
+        except Exception as exc:  # noqa: BLE001
+            error = f"Could not load that run: {exc}"
+
+    return render_template(
+        "family_diversity.html", runs=runs, selected_db_path=db_path, selected_run_id=run_id,
+        selected_stage=stage, result=result_ctx, error=error,
+    )
 
 
 @app.route("/payout-probability")

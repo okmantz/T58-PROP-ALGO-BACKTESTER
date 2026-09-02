@@ -38,6 +38,7 @@ import app.ai.strategy_generator as strategy_generator_module
 import app.ai.research_library as research_library_module
 import app.ai.experiment_memory as experiment_memory_module
 from app.ai.research_agent import ResearchAgentContext, ResearchAgent
+from app.ai.research_loop import ResearchLoopConfig, run_research_loop
 from app.data import alpaca_credentials
 from app.data.alpaca_source import (
     ASSET_CLASSES, ADJUSTMENT_CHOICES, FEED_CHOICES, TIMEFRAME_LABELS,
@@ -66,9 +67,11 @@ from app.orchestration.full_pipeline import (
 )
 from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
+from app.prop.survival_engine import PropSurvivalConfig, ResetEconomics, run_prop_survival_analysis
 from app.reports.generator import generate_full_report
 from app.reports import run_history
 from app.reports.refinement_report import generate_refinement_report
+from app.reports.survival_report import generate_survival_report
 from app.reports.validation_reports import (
     generate_cpcv_report, generate_multi_objective_report, generate_pbo_report,
     generate_portfolio_report, generate_sensitivity_report, generate_walk_forward_report,
@@ -78,6 +81,7 @@ from app.search.batch_runner import SearchStageConfig, promote_champion, run_sea
 from app.search.search_report import generate_search_report
 from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
 from app.strategy.base import StrategyError
+from app.strategy.dna import extract_dna, find_common_patterns
 from app.strategy.library import (
     STRATEGY_STATUSES, STRATEGY_TYPES, StrategyAlreadyExists, delete_many,
     delete_saved_strategy, export_library_zip, get_strategy_library_dir,
@@ -913,6 +917,7 @@ class MainWindow:
         self.tab_prop = Frame(self.content, bg=BG)
         self.tab_risk = Frame(self.content, bg=BG)
         self.tab_run = Frame(self.content, bg=BG)
+        self.tab_payout = Frame(self.content, bg=BG)
         self.tab_refine = Frame(self.content, bg=BG)
         self.tab_search = Frame(self.content, bg=BG)
         self.tab_wfo = Frame(self.content, bg=BG)
@@ -932,7 +937,7 @@ class MainWindow:
 
         for f in (
             self.tab_dashboard, self.tab_manual, self.tab_data, self.tab_strategy, self.tab_prop,
-            self.tab_risk, self.tab_run, self.tab_refine, self.tab_search,
+            self.tab_risk, self.tab_run, self.tab_payout, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
             self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket, self.tab_genstrat,
@@ -961,6 +966,7 @@ class MainWindow:
             ("prop", "", "03  Prop Rules", self.tab_prop, NEON_CYAN),
             ("risk", "", "04  Risk", self.tab_risk, NEON_CYAN),
             ("run", "", "05  Run & Report", self.tab_run, NEON_CYAN),
+            ("payout", "", "Payout Probability", self.tab_payout, NEON_CYAN),
             ("refine", "", "06  Refinement", self.tab_refine, NEON_CYAN),
             ("search", "", "07  Search Lab", self.tab_search, NEON_CYAN),
 
@@ -1001,6 +1007,7 @@ class MainWindow:
             ("Prop rules", self._build_prop_tab),
             ("Risk", self._build_risk_tab),
             ("Run", self._build_run_tab),
+            ("Payout Probability", self._build_payout_probability_tab),
             ("Refinement", self._build_refine_tab),
             ("Search Lab", self._build_search_tab),
             ("Walk-forward", self._build_wfo_tab),
@@ -3018,6 +3025,13 @@ class MainWindow:
             lib_btn_row, "REFRESH LIBRARY", self._refresh_strategy_library
         ).pack(side="left", padx=8)
 
+        self.lib_optimize_adaptive_risk = LabeledCheckbox(
+            library_section,
+            "OPTIMIZE SELECTED: enable adaptive, limit-aware position sizing on the search "
+            "(same engine as 05 Run & Report's Adaptive Risk section)",
+            False,
+        )
+
         lib_btn_row_3 = Frame(library_section, bg=PANEL)
         lib_btn_row_3.pack(anchor="w", padx=18, pady=(0, 6))
 
@@ -3030,6 +3044,28 @@ class MainWindow:
         self._button(
             lib_btn_row_3, "OPTIMIZE SELECTED", self._optimize_selected_library_strategies
         ).pack(side="left", padx=8)
+
+        lib_btn_row_4 = Frame(library_section, bg=PANEL)
+        lib_btn_row_4.pack(anchor="w", padx=18, pady=(0, 6))
+
+        self._button(
+            lib_btn_row_4, "VIEW DNA", self._view_selected_strategy_dna
+        ).pack(side="left")
+        self._button(
+            lib_btn_row_4, "FIND COMMON PATTERNS (ALL)", self._find_common_dna_patterns_library, primary=True
+        ).pack(side="left", padx=8)
+
+        Label(
+            library_section,
+            text="VIEW DNA breaks the selected strategy down into ENTRY / EXIT / RISK genes (market "
+            "structure, liquidity, momentum, volatility, time filter / fixed RR, ATR, structure, time "
+            "exit / fixed %, adaptive, daily governor) -- see app.strategy.dna. FIND COMMON PATTERNS "
+            "(ALL) compares every saved strategy's DNA against its own recorded last-run result and "
+            "reports which gene combinations are disproportionately common among the ones that passed "
+            "their evaluation versus the ones that didn't -- the 'what do the winners actually have in "
+            "common' answer, not just which single strategy scored highest.",
+            bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
 
         Label(
             library_section,
@@ -3831,6 +3867,80 @@ class MainWindow:
             return
         self._show_text_viewer(f"{item.name}  ({mode})", text)
 
+    def _view_selected_strategy_dna(self):
+        mode = self.strategy_mode.get()
+        if mode not in STRATEGY_TYPES:
+            messagebox.showinfo("No strategy type selected", "Choose Python, PineScript, MQL5, or Manual above first.")
+            return
+        item = self._selected_library_item()
+        if item is None:
+            messagebox.showinfo("No selection", "Select a saved strategy from the list first.")
+            return
+        try:
+            text = load_strategy_text(mode, item.name)
+        except Exception as exc:
+            messagebox.showerror("Could not load", str(exc))
+            return
+        dna = extract_dna(mode, text)
+        tree = dna.render_tree(item.name)
+        matched_lines = "\n".join(
+            f"  {tag}: {', '.join(terms)}" for tag, terms in sorted(dna.matched_terms.items())
+        )
+        body = tree + ("\n\nMatched on:\n" + matched_lines if matched_lines else "\n\nNo genes matched -- this strategy doesn't contain any of the keywords app.strategy.dna looks for.")
+        self._show_text_viewer(f"Strategy DNA -- {item.name}", body)
+
+    def _find_common_dna_patterns_library(self):
+        """Walks every saved Python/PineScript/MQL5/Manual strategy,
+        extracts its DNA, and defines 'top performer' as any strategy
+        whose recorded last_run.passed_evaluation is True (the same
+        signal the Dashboard and Strategy Library badges already use) --
+        then runs app.strategy.dna.find_common_patterns to report which
+        gene combinations are disproportionately common among the
+        strategies that actually passed versus the ones that didn't."""
+        entries = []
+        for stype in STRATEGY_TYPES:
+            for item in list_saved_strategies(stype):
+                try:
+                    text = load_strategy_text(stype, item.name)
+                except Exception:
+                    continue
+                dna = extract_dna(stype, text)
+                last_run = item.metadata.get("last_run") or {}
+                is_top = bool(last_run.get("passed_evaluation"))
+                entries.append((f"{item.name} ({stype})", dna, is_top))
+
+        n_top = sum(1 for _, _, is_top in entries if is_top)
+        if len(entries) < 3:
+            messagebox.showinfo(
+                "Not enough strategies",
+                "Save and run at least a few strategies first (05 Run & Report, Full Pipeline, "
+                "Quick Optimize, or a Batch Test all record a last_run result) so there's "
+                "something to compare.",
+            )
+            return
+        if n_top < 2:
+            messagebox.showinfo(
+                "Not enough passing strategies yet",
+                f"{len(entries)} strategies are in the library, but only {n_top} have a recorded "
+                "evaluation PASS -- run more of them (or run the ones you have) through 05 Run & "
+                "Report, Full Pipeline, or a Batch Test first so there are at least 2 winners to "
+                "compare against the rest.",
+            )
+            return
+
+        patterns = find_common_patterns(entries, min_combo_size=2, max_combo_size=4, min_support_top=2, min_lift=1.2)
+        n_rest = len(entries) - n_top
+        header = (
+            f"{len(entries)} strategies compared -- {n_top} passed their evaluation (top performers), "
+            f"{n_rest} did not or haven't been run.\n\n"
+        )
+        if not patterns:
+            body = header + "No gene combination was both common enough among the winners and rare enough among the rest to call a pattern -- try again once more strategies have been tested."
+        else:
+            body = header + "Patterns disproportionately common among the winners (highest lift first):\n\n" + \
+                "\n".join(f"{i+1}. {p.render_line()}" for i, p in enumerate(patterns))
+        self._show_text_viewer("Strategy DNA -- Common Patterns Across the Library", body)
+
     def _open_progress_window(self, title: str):
         """A small Toplevel with a scrolling log -- used for TEST SELECTED
         (BATCH) so a multi-strategy run has somewhere to show progress
@@ -4065,7 +4175,7 @@ class MainWindow:
 
             risk = self._build_risk_config()
             rules = self._build_prop_rules()
-            cfg = QuickOptimizeConfig()
+            cfg = QuickOptimizeConfig(adaptive_risk_enabled=self.lib_optimize_adaptive_risk.var.get())
             results = []
             for i, item in enumerate(items, start=1):
                 log(f"===== [{i}/{len(items)}] Optimizing: {item.name} =====")
@@ -4183,6 +4293,7 @@ class MainWindow:
                     random_seed=self.fp_seed.get_int(42),
                     save_to_library=self.fp_save_to_library.var.get(),
                     library_status=self._fp_status_label_to_key.get(self.fp_library_status.get_str()),
+                    adaptive_risk_enabled=self.fp_adaptive_risk_enabled.var.get(),
                 )
                 ollama_settings = self._build_ollama_settings()
             except Exception:
@@ -5377,6 +5488,149 @@ class MainWindow:
 
         finally:
             self.progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Tab -- Payout Probability (full-lifecycle prop survival simulator)
+    # -----------------------------------------------------------------------
+
+    def _build_payout_probability_tab(self):
+        f = self._scrollable(self.tab_payout)
+
+        self._page_header(
+            f,
+            "Payout Probability",
+            "Full-Lifecycle Survival Simulator",
+            "Goes beyond a single pass-probability number: simulates thousands of complete account "
+            "lifecycles (Start -> Evaluation -> Funded -> Payout #1 -> Payout #2 -> ... -> "
+            "Reset/Continue) and reports the actual funnel -- how many of those simulated accounts "
+            "made it through EACH stage, not just whether they passed the eval. Uses the strategy, "
+            "data, prop rules, and risk settings already configured in Steps 01-04. Backed entirely "
+            "by app.prop.survival_engine -- the same resampling machinery as 05 Run & Report's own "
+            "Monte Carlo simulation, just reshaped into the lifecycle view a trader actually thinks in.",
+        )
+
+        settings = self._section(
+            f, "Simulation settings",
+            "Reset/retry economics model what it actually costs, out of pocket, to keep re-attempting "
+            "the evaluation after a failure -- and what you actually keep after the firm's profit split.",
+            emphasize=True,
+        )
+        self.payout_n_sims = LabeledEntry(settings, "Number of simulated account lifetimes", 5000)
+        self.payout_max_tracked = LabeledEntry(settings, "Payout milestones to track (e.g. 5 = through Payout #5)", 5)
+        self.payout_funding_approval_pct = LabeledEntry(
+            settings, "Funding approval probability (%) -- 100 = every eval pass becomes funded immediately", 100,
+        )
+        self.payout_eval_fee = LabeledEntry(settings, "Evaluation fee ($)", 0)
+        self.payout_reset_fee = LabeledEntry(settings, "Reset fee ($, blank = same as evaluation fee)", 0)
+        self.payout_profit_split = LabeledEntry(settings, "Trader's profit split (%)", 80)
+        self.payout_max_attempts = LabeledEntry(settings, "Max lifetime attempts to fund", 3)
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "RUN PAYOUT PROBABILITY SIMULATION", self._payout_run_clicked, primary=True).pack(side="left")
+        self.open_payout_report_btn = self._button(button_row, "OPEN REPORT", self._open_payout_report)
+        self.open_payout_report_btn.config(state="disabled")
+        self.open_payout_report_btn.pack(side="left", padx=8)
+
+        self.payout_progress = NeuralProgress(f)
+        self.payout_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        output_section = self._section(f, "Payout Probability output", "Live progress + the funnel table.")
+        self.payout_output = Text(
+            output_section, height=24, wrap="word", bg=LOG_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.payout_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+        self._last_payout_html_path = None
+
+    def _log_payout(self, msg: str):
+        self.payout_output.insert(END, msg + "\n")
+        self.payout_output.see(END)
+
+    def _open_payout_report(self):
+        if self._last_payout_html_path:
+            webbrowser.open(f"file://{self._last_payout_html_path.resolve()}")
+
+    def _payout_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.payout_output.delete("1.0", END)
+        self.payout_progress.start(10)
+        threading.Thread(target=self._payout_run_pipeline, daemon=True).start()
+
+    def _payout_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_payout)
+            if df is None:
+                return
+            strategy = self._build_strategy()
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            adaptive_risk = self._build_adaptive_risk_config()
+
+            self._log_payout("Running historical backtest to obtain a real trade sequence...")
+            bt_result = run_backtest(df, strategy, risk, adaptive_risk=adaptive_risk)
+            if not bt_result.trades:
+                self._log_payout(
+                    "\nNo trades were generated by this strategy over the given data -- there is "
+                    "nothing to run a lifecycle simulation on."
+                )
+                return
+            self._log_payout(f"  {len(bt_result.trades)} trades.")
+
+            reset_fee_raw = self.payout_reset_fee.get_float(0)
+            econ = ResetEconomics(
+                evaluation_fee=self.payout_eval_fee.get_float(0),
+                reset_fee=(reset_fee_raw if reset_fee_raw > 0 else None),
+                profit_split_pct=self.payout_profit_split.get_float(80),
+                max_attempts=self.payout_max_attempts.get_int(3),
+            )
+            cfg = PropSurvivalConfig(
+                n_simulations=self.payout_n_sims.get_int(5000),
+                max_payouts_tracked=self.payout_max_tracked.get_int(5),
+                funding_approval_probability=self.payout_funding_approval_pct.get_float(100),
+                reset_economics=econ,
+            )
+
+            self._log_payout(
+                f"Simulating {cfg.n_simulations:,} account lifetimes "
+                f"(tracking payouts #1-#{cfg.max_payouts_tracked})..."
+            )
+            result = run_prop_survival_analysis(bt_result.trades, rules, cfg)
+
+            self._log_payout("")
+            self._log_payout(result.funnel.render_table(_strategy_display_name(strategy)))
+            self._log_payout("")
+            self._log_payout(f"Prop Survival Score: {result.prop_survival_score:.0f} / 100")
+            self._log_payout(
+                f"Net positive after resets: {result.reset_economics.probability_net_positive_after_resets:.1f}% "
+                f"(expected: ${result.reset_economics.expected_net_profit_after_resets:,.2f})"
+            )
+            for note in result.notes:
+                self._log_payout(f"\nNOTE: {note}")
+
+            instrument = (
+                os.path.basename(self.csv_paths[0]) if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+            paths = generate_survival_report(
+                OUTPUT_DIR / "payout_probability", result,
+                _strategy_display_name(strategy), instrument, rules, cfg,
+            )
+            self._last_payout_html_path = paths["html"]
+            self.open_payout_report_btn.config(state="normal")
+            self._log_payout("\nDone. Report written to:")
+            for k, p in paths.items():
+                self._log_payout(f"  {k}: {p}")
+        except StrategyError as exc:
+            self._log_payout(f"\nStrategy error: {exc}")
+        except Exception:
+            self._log_payout("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.payout_progress.stop()
 
     # -----------------------------------------------------------------------
     # Tab 7 — Search Lab (Stages 1-5: cheap filter -> GA refinement ->
@@ -7500,6 +7754,12 @@ class MainWindow:
         self.evo_mc_sims = LabeledEntry(cfg_section, "Monte Carlo sims per candidate", "1000")
         self.evo_cpcv_top_n = LabeledEntry(cfg_section, "CPCV / PBO pool size (most expensive stage)", "8")
         self.evo_stress_mult = LabeledEntry(cfg_section, "Stress test cost multiplier", "2.0")
+        self.evo_adaptive_risk_enabled = LabeledCheckbox(
+            cfg_section,
+            "Enable adaptive, limit-aware position sizing for every candidate this run "
+            "evaluates (same engine as 05 Run & Report's Adaptive Risk section)",
+            False,
+        )
 
         families_frame = Frame(cfg_section, bg=PANEL)
         families_frame.pack(fill="x", padx=18, pady=(4, 4))
@@ -7700,6 +7960,7 @@ class MainWindow:
             cpcv_top_n=self.evo_cpcv_top_n.get_int(8),
             stress_cost_multiplier=self.evo_stress_mult.get_float(2.0),
             max_generations=max_generations,
+            adaptive_risk_enabled=self.evo_adaptive_risk_enabled.var.get(),
         )
         self.evo_log_text.delete("1.0", END)
         self._evolution_runner = EvolutionRunner(df, risk, rules, cfg, progress_cb=self._evo_log)
@@ -8056,6 +8317,13 @@ class MainWindow:
         self.fp_final_mc_sims = LabeledEntry(settings, "Monte Carlo sims for final report", 10000)
         self.fp_holdout_frac = LabeledEntry(settings, "Final holdout fraction", 0.2)
         self.fp_seed = LabeledEntry(settings, "Random seed", 42)
+        self.fp_adaptive_risk_enabled = LabeledCheckbox(
+            settings,
+            "Enable adaptive, limit-aware position sizing (throttles risk as the account "
+            "nears its daily-loss/max-drawdown limits; same engine as 05 Run & Report's "
+            "Adaptive Risk section, applied automatically to every backtest this pipeline runs)",
+            False,
+        )
 
         library_section = self._section(
             f, "Strategy Library",
@@ -8231,6 +8499,7 @@ class MainWindow:
                 random_seed=self.fp_seed.get_int(42),
                 save_to_library=self.fp_save_to_library.var.get(),
                 library_status=self._fp_status_label_to_key.get(self.fp_library_status.get_str()),
+                adaptive_risk_enabled=self.fp_adaptive_risk_enabled.var.get(),
             )
 
             self._log_fullpipeline(f"Starting Full Pipeline for '{_strategy_display_name(strategy)}'...\n")
@@ -8356,6 +8625,7 @@ class MainWindow:
         btn_row.pack(anchor="w", padx=18, pady=(2, 6))
         self._button(btn_row, "EMBED RESEARCH LIBRARY", self._ra_embed_library_clicked, primary=True).pack(side="left")
         self._button(btn_row, "REFRESH MEMORY SUMMARY", self._ra_refresh_memory_clicked).pack(side="left", padx=8)
+        self._button(btn_row, "VIEW LEADERBOARD", self._ra_view_leaderboard_clicked).pack(side="left", padx=8)
         self.ra_memory_status = Label(
             memory_section, text="Click REFRESH MEMORY SUMMARY to see how many experiments T58 has recorded.",
             bg=PANEL, fg=TEXT_DIM, font=_safe_font(8), wraplength=900, justify="left",
@@ -8385,7 +8655,112 @@ class MainWindow:
         )
         self.ra_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
 
-    def _log_research_agent(self, msg: str):
+        loop_section = self._section(
+            f, "Closed Research Loop (Ollama)",
+            "The full 'Research Papers -> Ollama -> hypothesis -> generated strategy -> backtest -> "
+            "Monte Carlo -> prop-firm survival simulation -> analyze WHY it failed -> Ollama proposes "
+            "an improved hypothesis -> repeat' loop from the AI Research Engine plan -- see "
+            "app.ai.research_loop. Every KEEP/DISCARD verdict comes from the real Prop Survival Score "
+            "(app.prop.survival_engine), never Ollama's own judgment; the failure diagnosis each round "
+            "is a computed number (e.g. '73% of losses happened in low-volatility regimes'), not a "
+            "guess. Every round is recorded into T58 Research Memory below, and this loop refuses to "
+            "re-run a strategy whose Strategy DNA exactly matches a pattern that already failed earlier "
+            "in the SAME run.",
+        )
+        self.loop_initial_idea = Text(
+            loop_section, height=3, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
+        )
+        Label(loop_section, text="Starting hypothesis", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9)).pack(
+            anchor="w", padx=18, pady=(2, 0),
+        )
+        self.loop_initial_idea.insert(
+            "1.0", "A trend-following strategy using a higher-timeframe bias filter and a volatility-based stop.",
+        )
+        self.loop_initial_idea.pack(fill="x", padx=18, pady=(2, 10))
+        self.loop_iterations = LabeledEntry(loop_section, "Iterations", 5)
+        self.loop_keep_threshold = LabeledEntry(loop_section, "Prop Survival Score needed to KEEP", 40)
+        self.loop_mc_sims = LabeledEntry(loop_section, "Monte Carlo sims per iteration", 500)
+        self.loop_survival_sims = LabeledEntry(loop_section, "Survival-simulation sims per iteration", 1000)
+
+        loop_btn_row = Frame(f, bg=BG)
+        loop_btn_row.pack(fill="x", padx=24, pady=10)
+        self._button(loop_btn_row, "RUN RESEARCH LOOP", self._research_loop_run_clicked, primary=True).pack(side="left")
+
+        self.loop_progress = NeuralProgress(f)
+        self.loop_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        loop_summary_section = self._section(f, "Best Iteration", "Filled in once the loop finishes.")
+        self.loop_summary_label = Label(
+            loop_summary_section, text="No run yet.", bg=PANEL, fg=TEXT_DIM,
+            font=_safe_font(11, "bold"), justify="left", wraplength=900, anchor="w",
+        )
+        self.loop_summary_label.pack(anchor="w", fill="x", padx=18, pady=(2, 12))
+
+        loop_output_section = self._section(f, "Research Loop log", "Iteration-by-iteration progress.")
+        self.loop_output = Text(
+            loop_output_section, height=22, wrap="word", bg=LOG_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        self.loop_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+
+    def _log_research_loop(self, msg: str):
+        self.loop_output.insert(END, msg + "\n")
+        self.loop_output.see(END)
+        self.root.update_idletasks()
+
+    def _research_loop_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.loop_output.delete("1.0", END)
+        self.loop_summary_label.config(text="Running...", fg=TEXT_DIM)
+        self.loop_progress.start(10)
+        threading.Thread(target=self._research_loop_run_pipeline, daemon=True).start()
+
+    def _research_loop_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_research_loop)
+            if df is None:
+                return
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+            settings = self._build_ollama_settings(prefix="ra_ai")
+            if not settings.is_usable:
+                self._log_research_loop(
+                    "Ollama isn't enabled -- turn on AI Assist above (in this tab) with a valid host/model first."
+                )
+                return
+
+            cfg = ResearchLoopConfig(
+                n_iterations=self.loop_iterations.get_int(5),
+                initial_idea=self.loop_initial_idea.get("1.0", END).strip(),
+                mc_sims=self.loop_mc_sims.get_int(500),
+                survival_sims=self.loop_survival_sims.get_int(1000),
+                keep_score_threshold=self.loop_keep_threshold.get_float(40),
+            )
+            result = run_research_loop(df, risk, rules, settings, cfg, progress_cb=self._log_research_loop)
+
+            self._log_research_loop(f"\nStopped: {result.stopped_reason} ({len(result.iterations)} iteration(s) ran)")
+            if result.best_iteration:
+                b = result.best_iteration
+                self.loop_summary_label.config(
+                    text=(
+                        f"Best: iteration {b.iteration} ({b.strategy_name}) -- "
+                        f"Prop Survival Score {b.prop_survival_score:.1f}/100, verdict {b.verdict}, "
+                        f"{b.trades} trades, net profit ${b.net_profit:,.2f}"
+                    ),
+                    fg=NEON_LIME if b.verdict == "KEEP" else TEXT_DIM,
+                )
+            else:
+                self.loop_summary_label.config(text="No iteration produced a usable result.", fg=TEXT_DIM)
+        except Exception:
+            self._log_research_loop("\nUnexpected error:\n" + traceback.format_exc())
+        finally:
+            self.loop_progress.stop()
+
+
         self.ra_output.insert(END, msg + "\n")
         self.ra_output.see(END)
         self.root.update_idletasks()
@@ -8438,6 +8813,35 @@ class MainWindow:
             breakdown = ", ".join(f"{v}: {n}" for v, n in counts["by_verdict"].items())
             text = f"T58 Research Memory: {counts['total']} experiments recorded. By verdict -- {breakdown}."
         self.ra_memory_status.config(text=text, fg=TEXT_DIM)
+
+    def _ra_view_leaderboard_clicked(self):
+        """Shows every recorded experiment (across Full Pipeline, Quick
+        Optimize, Batch Test, and the Research Loop), ranked by
+        evaluation-pass probability, each as a KEEP/DISCARD card with a
+        DNA diff against its parent where one is recorded -- the
+        'Experiment #1842 / Changes / Results / Compared with parent /
+        Verdict' leaderboard from the AI Research Engine plan."""
+        try:
+            board = experiment_memory_module.get_leaderboard(limit=25)
+        except Exception as exc:
+            messagebox.showerror("Could not read Research Memory", str(exc))
+            return
+        if not board:
+            messagebox.showinfo(
+                "No experiments recorded yet",
+                "Run 15 Full Pipeline, Quick Optimize, a Batch Test, or the Research Loop below first.",
+            )
+            return
+        cards = []
+        for exp in board:
+            parent = None
+            parent_id = exp.config.get("parent_experiment") if isinstance(exp.config, dict) else None
+            if parent_id:
+                parent = experiment_memory_module.get_experiment_by_id(parent_id)
+            cards.append(experiment_memory_module.render_leaderboard_card(exp, parent=parent))
+        body = f"Top {len(board)} experiments by evaluation-pass probability:\n\n" + \
+            ("\n\n" + "-" * 60 + "\n\n").join(cards)
+        self._show_text_viewer("T58 Research Memory -- Leaderboard", body)
 
     def _ra_run_clicked(self):
         question = self.ra_question.get("1.0", END).strip()

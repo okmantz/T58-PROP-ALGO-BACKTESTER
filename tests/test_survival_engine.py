@@ -111,3 +111,65 @@ def test_simulate_reset_chain_costs_at_least_one_fee():
     assert life["fees_paid"] >= reset.evaluation_fee
     assert life["attempts_used"] >= 1
     assert math.isfinite(life["net_profit"])
+
+
+# ---------------------------------------------------------------------------
+# Payout funnel (PayoutFunnelStats)
+# ---------------------------------------------------------------------------
+
+def test_funnel_counts_are_consistent_and_monotonic():
+    trades = _mock_trades(300)
+    cfg = PropSurvivalConfig(n_simulations=500, life_simulations=100, random_seed=2, max_payouts_tracked=5)
+    result = run_prop_survival_analysis(trades, _rules(), cfg)
+    funnel = result.funnel
+
+    assert funnel.n_accounts == cfg.n_simulations
+    assert funnel.reached_funded_count <= funnel.passed_evaluation_count
+    assert len(funnel.payout_counts) == 5
+    assert len(funnel.payout_probabilities) == 5
+    # each stage can only ever have fewer (or equal) accounts than the one before it
+    counts = [funnel.reached_funded_count] + funnel.payout_counts
+    for earlier, later in zip(counts, counts[1:]):
+        assert later <= earlier
+    for pct in funnel.payout_probabilities:
+        assert 0.0 <= pct <= 100.0
+    # payout_probabilities[0] must match the existing first-payout number
+    assert funnel.payout_probabilities[0] == pytest.approx(result.funded.probability_first_payout)
+
+
+def test_funding_approval_probability_default_matches_passed_evaluation():
+    """At the default 100% funding-approval rate, reached-funded must be
+    IDENTICAL to passed-evaluation -- this is the backward-compatible
+    behavior every existing caller (Full Pipeline, Quick Optimize, the
+    Monte Carlo tab, etc.) has always implicitly assumed."""
+    trades = _mock_trades(250)
+    cfg = PropSurvivalConfig(n_simulations=300, life_simulations=100, random_seed=4)
+    result = run_prop_survival_analysis(trades, _rules(), cfg)
+    assert result.funnel.reached_funded_count == result.funnel.passed_evaluation_count
+    assert result.funnel.reached_funded_pct == pytest.approx(result.funnel.passed_evaluation_pct)
+
+
+def test_lower_funding_approval_probability_only_ever_reduces_funded_count():
+    trades = _mock_trades(250)
+    cfg_full = PropSurvivalConfig(n_simulations=400, life_simulations=100, random_seed=9, funding_approval_probability=100.0)
+    cfg_partial = PropSurvivalConfig(n_simulations=400, life_simulations=100, random_seed=9, funding_approval_probability=60.0)
+    result_full = run_prop_survival_analysis(trades, _rules(), cfg_full)
+    result_partial = run_prop_survival_analysis(trades, _rules(), cfg_partial)
+
+    assert result_partial.funnel.reached_funded_count <= result_full.funnel.reached_funded_count
+    # evaluation-pass itself is untouched by the funding-approval step
+    assert result_partial.funnel.passed_evaluation_count == result_full.funnel.passed_evaluation_count
+
+
+def test_render_table_contains_expected_labels():
+    trades = _mock_trades(200)
+    cfg = PropSurvivalConfig(n_simulations=150, life_simulations=80, random_seed=6, max_payouts_tracked=3)
+    result = run_prop_survival_analysis(trades, _rules(), cfg)
+    table = result.funnel.render_table("My Strategy")
+    assert "My Strategy" in table
+    assert "simulated accounts" in table
+    assert "Passed Evaluation" in table
+    assert "Reached Funded" in table
+    assert "Reached Payout #1" in table
+    assert "Reached Payout #3" in table
+    assert "Payout #1 probability" in table

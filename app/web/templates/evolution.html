@@ -34,7 +34,11 @@
   table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
   th, td { padding: 6px 4px; border-bottom: 1px solid var(--border-light); text-align: left; }
   th { color: #888; font-weight: 600; text-transform: uppercase; font-size: 10px; }
-  .table-scroll { overflow-x: auto; max-height: 360px; overflow-y: auto; }
+  .table-scroll { overflow-x: auto; max-height: 640px; overflow-y: auto; }
+  .lb-detail-btn, .lb-promote-btn { font-size: 11px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border-light); background: var(--panel-3); color: #ccc; }
+  .lb-promote-btn { border-color: var(--teal); color: var(--teal); }
+  .lb-promote-btn[disabled] { opacity: .5; }
+  .lb-detail-row td { background: #0d0d0d; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #ccc; }
   .journal-entry { font-size: 12px; color: #ccc; border-left: 2px solid var(--border-light); padding-left: 8px; margin-bottom: 8px; white-space: pre-wrap; }
   .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
   .checkbox-row input { width: auto; }
@@ -72,7 +76,7 @@
   <h2>Leaderboard (generation <span id="gen-num">0</span>)</h2>
   <div class="table-scroll">
     <table>
-      <thead><tr><th>#</th><th>Candidate</th><th>Net profit</th><th>PF</th><th>Eval pass %</th></tr></thead>
+      <thead><tr><th>#</th><th>Candidate</th><th>Net profit</th><th>PF</th><th>Eval pass %</th><th>Payout %</th><th></th></tr></thead>
       <tbody id="leaderboard-body"></tbody>
     </table>
   </div>
@@ -130,7 +134,15 @@
   const fmt = (v, d) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Number(v).toFixed(d === undefined ? 2 : d);
   const money = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : '$' + Number(v).toLocaleString(undefined, {maximumFractionDigits: 0});
 
+  // Both fields below are already 0..100 percentages straight from
+  // MonteCarloResult -- do not multiply by 100 again here (that exact
+  // mistake, in the desktop app's own detail popup, is what made a real
+  // 5.5% pass probability show up as "550%"; fmt()/money() above are
+  // fine as-is, this note is just so nobody "fixes" this back to *100).
+  let _lbCache = [];
+
   function renderLeaderboard(rows) {
+    _lbCache = rows;
     const tbody = document.getElementById('leaderboard-body');
     tbody.innerHTML = '';
     rows.forEach((c, i) => {
@@ -138,10 +150,78 @@
       const mc = c.mc_summary || {};
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>${i + 1}</td><td>${c.candidate_id}</td><td>${money(stats.net_profit)}</td>` +
-        `<td>${fmt(stats.profit_factor)}</td><td>${fmt(mc.evaluation_pass_probability, 1)}%</td>`;
+        `<td>${fmt(stats.profit_factor)}</td><td>${fmt(mc.evaluation_pass_probability, 1)}%</td>` +
+        `<td>${fmt(mc.first_payout_probability, 1)}%</td><td></td>`;
+      const actionCell = tr.lastElementChild;
+      const detailBtn = document.createElement('button');
+      detailBtn.type = 'button';
+      detailBtn.className = 'lb-detail-btn';
+      detailBtn.textContent = 'Details';
+      detailBtn.onclick = () => toggleDetail(i, c);
+      const promoteBtn = document.createElement('button');
+      promoteBtn.type = 'button';
+      promoteBtn.className = 'lb-promote-btn';
+      promoteBtn.textContent = 'Promote';
+      promoteBtn.style.marginLeft = '6px';
+      promoteBtn.onclick = () => promoteCandidate(c.candidate_id, promoteBtn);
+      actionCell.appendChild(detailBtn);
+      actionCell.appendChild(promoteBtn);
       tbody.appendChild(tr);
     });
     document.getElementById('leaderboard-card').style.display = rows.length ? 'block' : 'none';
+  }
+
+  function toggleDetail(i, c) {
+    const tbody = document.getElementById('leaderboard-body');
+    const existing = document.getElementById('lb-detail-' + i);
+    if (existing) { existing.remove(); return; }
+    // Close any other open detail row first, same one-at-a-time feel as
+    // the desktop app's single detail popup.
+    tbody.querySelectorAll('.lb-detail-row').forEach(r => r.remove());
+    const stats = c.stats || {};
+    const mc = c.mc_summary || {};
+    const fitness = c.fitness || {};
+    const lines = [
+      `Family: ${(c.meta || {}).family || '?'}`,
+      `Final PROP FITNESS score: ${fmt(fitness.final_score)}`,
+      `Pass probability (fitness): ${fmt((fitness.pass_probability || 0) * 100, 1)}%`,
+      `Payout probability (fitness): ${fmt((fitness.payout_probability || 0) * 100, 1)}%`,
+      `Robustness: ${fmt(fitness.robustness)}   OOS consistency: ${fmt(fitness.oos_consistency)}`,
+      '',
+      `Total trades: ${stats.total_trades ?? 'n/a'}   Win rate: ${fmt(stats.win_rate, 1)}%`,
+      `Net profit: ${money(stats.net_profit)}   Profit factor: ${fmt(stats.profit_factor)}`,
+      `Sharpe: ${fmt(stats.sharpe_ratio)}   Max drawdown: ${fmt(stats.max_drawdown_pct, 1)}%`,
+      '',
+      `Monte Carlo eval pass probability: ${fmt(mc.evaluation_pass_probability, 1)}%`,
+      `Monte Carlo first payout probability: ${fmt(mc.first_payout_probability, 1)}%`,
+      '',
+      'Config:',
+      JSON.stringify((c.spec || {}).config || {}, null, 2),
+    ];
+    const tr = document.createElement('tr');
+    tr.className = 'lb-detail-row';
+    tr.id = 'lb-detail-' + i;
+    const td = document.createElement('td');
+    td.colSpan = 7;
+    td.textContent = lines.join('\n');
+    tr.appendChild(td);
+    const rows = tbody.querySelectorAll('tr');
+    rows[i].insertAdjacentElement('afterend', tr);
+  }
+
+  function promoteCandidate(candidateId, btn) {
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = '...';
+    const body = new URLSearchParams({ candidate_id: candidateId });
+    fetch('/evolution/promote', { method: 'POST', body })
+      .then(r => r.json())
+      .then(data => {
+        btn.disabled = false;
+        btn.textContent = data.ok ? 'Promoted' : 'Failed';
+        if (!data.ok) { alert('Could not promote: ' + (data.error || 'unknown error')); btn.textContent = original; }
+      })
+      .catch(() => { btn.disabled = false; btn.textContent = original; alert('Could not reach the server.'); });
   }
 
   function renderJournal(entries) {

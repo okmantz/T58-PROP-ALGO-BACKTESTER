@@ -130,6 +130,30 @@ def test_run_search_empty_stage1_survivors_is_handled_gracefully(tmp_path, small
     assert summary.leaderboard == []
 
 
+def test_run_search_family_diversity_cap_limits_stage2_to_one_per_family(tmp_path):
+    """max_per_family_stage1=1 across an 'all families' search must never
+    let two candidates classified into the SAME app.strategy.
+    family_taxonomy group both reach Stage 2 -- the actual point of the
+    feature: no single family's grid size can crowd out the others."""
+    from app.strategy.family_taxonomy import classify_record
+
+    df = _trending_df()
+    space = generate_search_space(mode="family", family="all", max_candidates=60, seed=1)
+    cfg = _fast_stage_cfg(
+        min_trades=1, min_profit_factor=0.0, max_drawdown_buffer_mult=10.0,
+        stage1_top_n=20, max_per_family_stage1=1,
+    )
+    db_path = tmp_path / "search.db"
+    summary = run_search(
+        df, RiskConfig(), PropRules(), space, cfg,
+        db_path=str(db_path), instrument="TEST", timeframe="5m",
+    )
+    with ResultsDB(db_path) as db:
+        stage2_rows = db.leaderboard(summary.run_id, stage="stage2", top_n=1000)
+    groups = [classify_record(r) for r in stage2_rows]
+    assert len(groups) == len(set(groups)), f"more than one Stage 2 survivor shares a family group: {groups}"
+
+
 def test_run_search_auto_relaxes_stage1_filters_instead_of_giving_up(tmp_path, small_family_space):
     """A strict-but-not-impossible filter (more trades than this small,
     short-lived candidate pool will realistically produce) should trigger

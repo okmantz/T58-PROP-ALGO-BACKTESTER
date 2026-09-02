@@ -110,6 +110,32 @@ def test_diagnose_failure_handles_no_losers_gracefully():
     assert diag["suggestion"] is None
 
 
+def test_diagnose_failure_always_returns_session_keys():
+    """Every return path -- including the too-little-data early exits --
+    must carry the session fields so callers never need to .get() them."""
+    df = _df(200)
+    trades = [_FakeTrade(df["timestamp"].iloc[10], -50.0)]  # too few losers for the ATR check
+    diag = rl.diagnose_failure(df, trades)
+    assert set(diag.keys()) >= {"session_loss_pct", "concentrated_session", "session_suggestion"}
+    # With a single loser its loss is trivially 100% in whichever session
+    # it fell in -- the ATR-based `suggestion` still correctly stays None
+    # since that check has its own, separate 5-loser minimum.
+    assert diag["suggestion"] is None
+
+
+def test_diagnose_failure_flags_session_concentration():
+    df = _df(500, trending=False)
+    ts = pd.to_datetime(df["timestamp"])
+    # Concentrate every losing trade's entry inside the fixed 00:00-07:00
+    # "asia" window (see app.validation.regime_matrix._SESSION_WINDOWS).
+    asia_times = ts[ts.dt.hour < 7]
+    trades = [_FakeTrade(t, -50.0) for t in asia_times[:20]]
+    diag = rl.diagnose_failure(df, trades)
+    assert diag["concentrated_session"] == "asia"
+    assert diag["session_loss_pct"]["asia"] >= 65.0
+    assert "asia" in diag["session_suggestion"].lower()
+
+
 # ---------------------------------------------------------------------------
 # _ask_ollama_next_hypothesis (fallback path -- no network)
 # ---------------------------------------------------------------------------

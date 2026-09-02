@@ -106,6 +106,47 @@ def _apply_slippage_stress(pnls: np.ndarray, stress_pct: float) -> np.ndarray:
     return stressed
 
 
+def eval_pass_probability_for_trades(
+    trades: list[Trade],
+    rules: PropRules,
+    mc_cfg: MonteCarloConfig | None = None,
+) -> float:
+    """
+    Convenience wrapper around run_monte_carlo() that returns just the
+    single number nearly every fold-level / candidate-level scoring path
+    in the app actually wants: the probability of reaching the prop
+    firm's profit target BEFORE hitting the daily-loss limit, the
+    max-drawdown limit, or the consistency rule -- i.e.
+    MonteCarloResult.evaluation_pass_probability.
+
+    This is the shared primitive behind making "probability of passing"
+    (rather than raw backtest profit, win rate, or R:R) the one thing
+    every test in the app -- Iterative Refinement, Walk-Forward
+    Optimization, the walk-forward-aware GA, CPCV, the Evolution Lab, and
+    Quick Optimize/Full Pipeline -- actually optimizes and validates
+    against, including at the per-fold / per-path level where those
+    modules previously fell back to a plain backtest-stats metric like
+    profit_factor because no Monte Carlo had been run yet for that slice
+    of data.
+
+    Uses a smaller default simulation count than a final-report Monte
+    Carlo run (this is called once per fold/path/generation, often many
+    times per search) -- callers that care about that tradeoff should
+    pass their own mc_cfg. Returns 0.0 (not an exception) for an
+    empty/too-small trade list, since "this slice produced nothing worth
+    passing" is itself a valid, low, fold score rather than a hard
+    failure.
+    """
+    if not trades:
+        return 0.0
+    cfg = mc_cfg or MonteCarloConfig(n_simulations=500)
+    try:
+        result = run_monte_carlo(trades, rules, cfg)
+    except ValueError:
+        return 0.0
+    return result.evaluation_pass_probability
+
+
 def run_monte_carlo(
     trades: list[Trade],
     rules: PropRules,

@@ -694,13 +694,14 @@ class RingProgress(Canvas):
 
 
 _ADAPTIVE_RISK_TRIGGERS = [
-    "consecutive_losses", "daily_loss_pct", "daily_profit_pct", "progress_to_target_pct",
+    "consecutive_losses", "daily_loss_pct", "daily_profit_pct", "progress_to_target_pct", "drawdown_pct",
 ]
 _ADAPTIVE_RISK_TRIGGER_HELP = {
     "consecutive_losses": "threshold = number of losing trades in a row (today)",
     "daily_loss_pct": "threshold = % of initial balance realized-lost so far today",
     "daily_profit_pct": "threshold = % of initial balance realized-gained so far today",
     "progress_to_target_pct": "threshold = % of the way from 0 to the profit target, all-time",
+    "drawdown_pct": "threshold = % of initial balance down from the account's own realized-equity peak, all-time",
 }
 
 
@@ -6552,8 +6553,12 @@ class MainWindow:
 
         legs_section = self._section(
             f, "Instrument legs (at least 2 required)",
-            "Each leg uses the SAME strategy configuration from Step 2 and the SAME "
-            "base risk settings from Step 4, applied to that instrument's own data.",
+            "Each leg can use a DIFFERENT strategy -- select one or more saved strategies in the "
+            "Strategy Library (Step 7) first, then ADD LEG FROM LIBRARY, or ADD LEG (CSV) to use "
+            "whatever strategy is currently configured on Step 2 for that leg instead. Running several "
+            "genuinely different, uncorrelated strategies together as one portfolio raises the combined "
+            "account's own probability of passing more reliably than pushing any single strategy's pass "
+            "probability higher alone -- see PORTFOLIO PASS PROBABILITY below once you run it.",
             emphasize=True,
         )
         legs_frame = Frame(legs_section, bg=PANEL)
@@ -6573,6 +6578,7 @@ class MainWindow:
         leg_btn_row = Frame(legs_section, bg=PANEL)
         leg_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
         self._button(leg_btn_row, "ADD LEG (CSV)", self._portfolio_add_leg, primary=True).pack(side="left")
+        self._button(leg_btn_row, "ADD LEG FROM LIBRARY", self._portfolio_add_leg_from_library, primary=True).pack(side="left", padx=8)
         self._button(leg_btn_row, "REMOVE SELECTED LEG", self._portfolio_remove_leg).pack(side="left", padx=8)
 
         self._portfolio_legs: list[dict] = []
@@ -6581,6 +6587,9 @@ class MainWindow:
         self.portfolio_balance = LabeledEntry(settings, "Shared initial account balance ($)", 100000)
         self.portfolio_corr_strength = LabeledEntry(
             settings, "Correlation penalty strength (0=ignore, 1=full re-weighting)", 0.6,
+        )
+        self.portfolio_compute_pass_prob = LabeledCheckbox(
+            settings, "Also compute the COMBINED portfolio's own probability of passing (uses Step 3's Prop Rules + Step 6's Monte Carlo sims)", True,
         )
 
         button_row = Frame(f, bg=BG)
@@ -6626,8 +6635,42 @@ class MainWindow:
         )
         if weight is None:
             return
-        self._portfolio_legs.append({"path": path, "weight": weight})
-        self.portfolio_leg_listbox.insert(END, f"{os.path.basename(path)}  (weight={weight:g})")
+        self._portfolio_legs.append({"path": path, "weight": weight, "library_item": None})
+        self.portfolio_leg_listbox.insert(END, f"{os.path.basename(path)}  (weight={weight:g}, strategy=Step 2 current)")
+
+    def _portfolio_add_leg_from_library(self):
+        """Adds one leg per currently-selected Strategy Library row (Step 7),
+        each paired with a market-data file the user picks right after --
+        this is what lets a portfolio combine genuinely DIFFERENT strategies
+        (e.g. a trend-follower and a mean-reversion strategy) into one
+        shared-account book, instead of every leg being forced to reuse
+        whatever strategy happens to be configured on Step 2."""
+        items = self._selected_library_items()
+        if not items:
+            messagebox.showinfo(
+                "No selection",
+                "Select one or more saved strategies in the Strategy Library (Step 7) first, "
+                "then click ADD LEG FROM LIBRARY.",
+            )
+            return
+        for item in items:
+            path = filedialog.askopenfilename(
+                title=f"Select market data CSV for '{item.name}'",
+                filetypes=[("Market data", "*.csv *.tsv *.txt *.parquet *.zip *.7z"), ("All files", "*.*")],
+            )
+            if not path:
+                continue
+            weight = simpledialog.askfloat(
+                "Instrument weight",
+                f"Nominal (pre-correlation) risk weight for '{item.name}' on {os.path.basename(path)}:",
+                initialvalue=1.0, minvalue=0.01, maxvalue=10.0,
+            )
+            if weight is None:
+                continue
+            self._portfolio_legs.append({"path": path, "weight": weight, "library_item": item})
+            self.portfolio_leg_listbox.insert(
+                END, f"{os.path.basename(path)}  (weight={weight:g}, strategy={item.name})",
+            )
 
     def _portfolio_remove_leg(self):
         sel = self.portfolio_leg_listbox.curselection()
@@ -6641,7 +6684,8 @@ class MainWindow:
         if len(self._portfolio_legs) < 2:
             messagebox.showwarning(
                 "Not enough legs",
-                "Portfolio backtesting requires at least 2 instrument legs -- use ADD LEG (CSV) above.",
+                "Portfolio backtesting requires at least 2 instrument legs -- use ADD LEG (CSV) "
+                "or ADD LEG FROM LIBRARY above.",
             )
             return
         self.portfolio_output.delete("1.0", END)
@@ -6658,22 +6702,57 @@ class MainWindow:
                     self._log_portfolio(f"Import errors ({os.path.basename(stored_path)}):\n" + "\n".join(result.errors))
                     return
                 self._log_portfolio(f"Loaded {len(result.dataframe)} bars from {os.path.basename(stored_path)}")
+
+                library_item = leg_spec.get("library_item")
+                if library_item is not None:
+                    try:
+                        leg_strategy = self._load_bulk_strategy(library_item.path)
+                    except Exception as exc:
+                        self._log_portfolio(f"  Could not load strategy '{library_item.name}': {exc}")
+                        return
+                    leg_name = library_item.name
+                else:
+                    leg_strategy = self._build_strategy()
+                    leg_name = Path(stored_path).stem
+
                 legs.append(InstrumentLeg(
-                    name=Path(stored_path).stem, df=result.dataframe,
-                    strategy=self._build_strategy(), risk=self._build_risk_config(),
+                    name=leg_name, df=result.dataframe,
+                    strategy=leg_strategy, risk=self._build_risk_config(),
                     weight=leg_spec["weight"],
                 ))
 
-            self._log_portfolio(f"Running portfolio backtest across {len(legs)} instrument(s)...")
+            self._log_portfolio(f"Running portfolio backtest across {len(legs)} leg(s)...")
+            initial_balance = self.portfolio_balance.get_float(100000)
+            prop_rules = None
+            mc_cfg = None
+            if self.portfolio_compute_pass_prob.get():
+                try:
+                    prop_rules = self._build_prop_rules()
+                    if abs(prop_rules.account_size - initial_balance) > 0.01:
+                        self._log_portfolio(
+                            f"  NOTE: Step 3's Prop Rules account size (${prop_rules.account_size:,.0f}) differs "
+                            f"from this portfolio's shared initial balance (${initial_balance:,.0f}) -- "
+                            f"the pass-probability check below uses Step 3's account size."
+                        )
+                    mc_cfg = self._validation_mc_config()
+                except Exception as exc:
+                    self._log_portfolio(f"  Could not build Prop Rules for the combined pass-probability check ({exc}) -- skipping that step.")
             config = PortfolioConfig(
-                initial_balance=self.portfolio_balance.get_float(100000),
+                initial_balance=initial_balance,
                 correlation_penalty_strength=self.portfolio_corr_strength.get_float(0.6),
+                prop_rules=prop_rules, mc_config=mc_cfg,
             )
             result = run_portfolio_backtest(legs, config)
             paths = generate_portfolio_report(OUTPUT_DIR / "portfolio", result)
             self._last_portfolio_html_path = paths["html"]
             self.open_portfolio_report_btn.config(state="normal")
             self._log_portfolio(f"  Combined net profit: ${result.combined_statistics.net_profit:,.2f}")
+            if result.mc_result is not None:
+                self._log_portfolio(
+                    f"  COMBINED PORTFOLIO pass probability: {result.mc_result.evaluation_pass_probability:.1f}%  "
+                    f"(first payout: {result.mc_result.first_payout_probability:.1f}%) -- this is the number "
+                    f"that answers whether diversifying actually helped."
+                )
             for w in result.warnings:
                 self._log_portfolio(f"  WARNING: {w}")
             self._log_portfolio("\nDone. Portfolio report written to:")

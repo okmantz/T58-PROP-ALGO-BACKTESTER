@@ -55,6 +55,11 @@ def test_classify_record_handles_code_based_candidates():
     assert classify_record(record) == "vwap"
 
 
+def test_classify_record_recognizes_regime_router_as_regime_switching():
+    record = {"family": None, "source_type": "regime_router"}
+    assert classify_record(record) == "regime_switching"
+
+
 def test_family_label_is_title_case():
     assert family_label("liquidity_sweep") == "Liquidity Sweep"
     assert family_label("vwap") == "Vwap"

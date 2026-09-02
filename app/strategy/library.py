@@ -52,12 +52,24 @@ from typing import Any, Iterable
 
 from app.data.storage import get_app_base_dir
 
-STRATEGY_TYPES = ("python", "pinescript", "mql5")
+# "manual" was added alongside the three code types so a Manual Strategy
+# Builder config (the same JSON shape app.strategy.manual.ManualStrategy
+# consumes, and the same shape the Evolution Lab's leaderboard PROMOTE
+# button produces) is a first-class library citizen -- listed, viewable,
+# loadable, batch-queueable, and deletable exactly like a saved .py/.pine/
+# .mq5 file, just stored as .json. Before this, PROMOTE TO STRATEGY
+# LIBRARY called save_strategy_text(..., "manual", ...) against a type
+# _normalize_type() didn't recognize, which always raised
+# "Unknown strategy type 'manual'" -- promoting any Evolution Lab leader
+# (every leader IS a manual-builder config; see engine.py's documented
+# scope limit) failed every time.
+STRATEGY_TYPES = ("python", "pinescript", "mql5", "manual")
 
 _EXTENSIONS = {
     "python": ".py",
     "pinescript": ".pine",
     "mql5": ".mq5",
+    "manual": ".json",
 }
 
 _META_SUFFIX = ".meta.json"
@@ -293,6 +305,15 @@ def list_saved_strategies(
         d = get_strategy_library_dir(t)
         for f in sorted(d.glob(f"*{_EXTENSIONS[t]}")):
             if not f.is_file():
+                continue
+            # "manual"'s own extension (.json) is a suffix of every
+            # metadata sidecar's name (<file>.meta.json), so for manual
+            # strategies (and only manual -- .py/.pine/.mq5 sidecars
+            # never collide with their own type's glob) the glob above
+            # also matches sidecars themselves. Without this check every
+            # manual strategy appeared twice: once as the real strategy,
+            # once as its own metadata file misidentified as a strategy.
+            if f.name.endswith(_META_SUFFIX):
                 continue
             stat = f.stat()
             meta = _read_metadata_file(_metadata_path(d, f.name))

@@ -132,11 +132,12 @@ From your phone's browser:
   app** prompt (Android Chrome) to install it as a standalone PWA with its
   own icon (`app/web/static/manifest.json` + `sw.js`) — it opens without
   browser chrome, like a native app.
-- To access it from outside your home Wi-Fi (not just locally), deploy
-  `app/web/server.py` to any small host that runs a Python/Flask app
-  (Render, Railway, Fly.io, a VPS, etc.) and open that host's URL on your
-  phone instead. Running the Python server process directly *on* the phone
-  itself is out of scope for this MVP.
+- This is designed to run entirely on your own home/office Wi-Fi, for
+  free, with nothing to sign up for and nothing to pay for: your PC does
+  the actual work and your phone is just a screen for it, the same way
+  the `T58-Web-App.exe` flow above works. There's no hosted/cloud version
+  of this app and no plan to add one — accessing it from outside your own
+  Wi-Fi (e.g. over cellular data) isn't supported.
 
 ## Workflow (Steps 1-5 — the core loop)
 
@@ -919,8 +920,6 @@ T58-Prop-Algo-Backtester/
 ├── run_app.py                  # PyInstaller entry point (must stay at repo root — see .exe section)
 ├── run_web.py                  # PyInstaller entry point, web/phone edition (must stay at repo root)
 ├── config/                     # pyproject.toml, requirements.txt
-├── docker/                     # Dockerfile, .dockerignore (Cloud Run image)
-├── firebase/                   # firebase.json, .firebaserc, FIREBASE_DEPLOY.md
 ├── docs/                       # WEB_PARITY_ROADMAP.md
 ├── app/
 │   ├── main.py                 # entry point (GUI, or --cli headless run — see CLI reference)

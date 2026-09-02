@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import multiprocessing
 
-from app.web.launcher import main
+from app.web.launcher import run
 
 if __name__ == "__main__":
     # See run_app.py for why this is required in a packaged .exe: Search
@@ -25,4 +25,4 @@ if __name__ == "__main__":
     # and without freeze_support() each re-launch falls through to main()
     # again instead of running as a worker.
     multiprocessing.freeze_support()
-    main()
+    run()

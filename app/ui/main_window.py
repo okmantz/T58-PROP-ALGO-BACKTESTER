@@ -10495,8 +10495,59 @@ class _SplashScreen(Toplevel):
             pass  # splash already destroyed
 
 
+def _make_dpi_aware() -> None:
+    """Tell Windows this process handles its own DPI scaling.
+
+    Without this, a Tkinter app is "DPI-unaware" as far as Windows is
+    concerned: it always lays itself out assuming a 96-DPI screen, and
+    Windows then bitmap-stretches the *entire already-rendered window* up
+    to match the display's actual scaling factor (125%/150%/175%/200%,
+    all extremely common on laptops and 4K monitors). That stretch is
+    what shows up as "everything is extremely zoomed in" -- and blurry,
+    since it's a raw pixel upscale, not a re-render. This must run
+    *before* the first Tk() window is created; it's a no-op (silently
+    caught) on macOS/Linux and on any Windows build where it's already
+    been declared some other way.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # PROCESS_SYSTEM_DPI_AWARE = 1. Preferred on Windows 8.1+: renders
+        # at the system's actual DPI instead of being upscaled by the OS.
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            import ctypes
+            # Fallback for older Windows without shcore.dll.
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass  # never let this block the app from launching
+
+
+def _apply_tk_scaling(root: Tk) -> None:
+    """Make Tk's own font/widget scaling match the real screen DPI.
+
+    _make_dpi_aware() stops Windows from stretching the window bitmap,
+    but Tk separately needs to be told the true pixels-per-inch so its
+    "point"-sized fonts and padding come out the right *physical* size
+    on a high-DPI screen instead of tiny. Tk's scaling factor is
+    (DPI / 72); 96 DPI (100% scaling) is Tk's own built-in default of
+    1.333, so this is a no-op there and only corrects higher-DPI
+    displays.
+    """
+    try:
+        dpi = root.winfo_fpixels("1i")
+        if dpi > 0:
+            root.tk.call("tk", "scaling", dpi / 72.0)
+    except Exception:
+        pass
+
+
 def launch():
+    _make_dpi_aware()
     root = Tk()
+    _apply_tk_scaling(root)
     root.withdraw()  # hidden while the real window builds, splash covers that gap
     splash = None
     try:

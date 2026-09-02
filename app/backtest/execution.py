@@ -93,12 +93,37 @@ def run_execution(
     trades: list[Trade] = []
     adaptive_state = AdaptiveRiskState(initial_balance=risk.initial_balance)
 
+    # Rolling ATR (14-bar, simple True Range mean) purely as a volatility
+    # yardstick for the fixed-pips-vs-instrument sanity check below -- this
+    # is intentionally independent of anything a strategy itself computes.
+    # See the pip_scale_mismatch check for why a price-ratio band alone
+    # isn't enough: a fixed-pips stop can land just inside that ratio band
+    # (e.g. ~0.03% of price) yet still be a small fraction of a genuinely
+    # volatile instrument's typical bar-to-bar range -- an index at
+    # several thousand points per share with a triple-digit-point ATR is
+    # the textbook case. Comparing the stop distance to the instrument's
+    # own recent ATR catches that; comparing it only to price does not.
+    _tr_high = df["high"].astype(float)
+    _tr_low = df["low"].astype(float)
+    _tr_prev_close = df["close"].astype(float).shift(1)
+    _true_range = pd.concat(
+        [
+            _tr_high - _tr_low,
+            (_tr_high - _tr_prev_close).abs(),
+            (_tr_low - _tr_prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    _atr_for_mismatch_check = _true_range.rolling(14, min_periods=1).mean().to_numpy()
+
     open_trade: dict | None = None
     trades_today: dict[pd.Timestamp, int] = {}
     pnl_today: dict[pd.Timestamp, float] = {}
     fallback_stop_count = 0
     pip_scale_mismatch_count = 0
     pip_scale_mismatch_worst_ratio = None  # smallest (stop_distance / entry_price) seen, for the warning
+    atr_scale_mismatch_count = 0
+    atr_scale_mismatch_worst_ratio = None  # smallest (stop_distance / ATR) seen, for the warning
     gap_loss_count = 0
     clamped_loss_count = 0
     account_blown = False
@@ -409,6 +434,22 @@ def run_execution(
                                 pip_scale_mismatch_count += 1
                                 if pip_scale_mismatch_worst_ratio is None or distance_ratio < pip_scale_mismatch_worst_ratio:
                                     pip_scale_mismatch_worst_ratio = distance_ratio
+                        # Second, independent check: the same fixed-pips
+                        # stop compared to this instrument's own recent ATR
+                        # rather than to its raw price level. A stop can be
+                        # a perfectly ordinary-looking fraction of price
+                        # (comfortably inside the 0.02%-25% band above) and
+                        # still be tiny next to how much this instrument
+                        # actually moves bar to bar -- that's still a real
+                        # pip_size/instrument mismatch, just one the
+                        # price-ratio check alone can miss.
+                        bar_atr = _atr_for_mismatch_check[i]
+                        if bar_atr and bar_atr > 0:
+                            atr_ratio = abs(fixed_stop_distance) / bar_atr
+                            if atr_ratio < 0.15:
+                                atr_scale_mismatch_count += 1
+                                if atr_scale_mismatch_worst_ratio is None or atr_ratio < atr_scale_mismatch_worst_ratio:
+                                    atr_scale_mismatch_worst_ratio = atr_ratio
                     if bar_tp_distance:
                         take_price = entry_price + direction * bar_tp_distance
                     elif take_profit_pips:
@@ -532,6 +573,27 @@ def run_execution(
             "these trades is unreliable. Set pip_size to match the real "
             "instrument (e.g. 0.01 for gold/JPY pairs) in the Risk "
             "configuration before trusting this result.",
+            RuntimeWarning,
+        )
+
+    if atr_scale_mismatch_count:
+        import warnings
+        warnings.warn(
+            f"{atr_scale_mismatch_count} trade(s) had a fixed-pips stop "
+            f"under 15% of this instrument's own recent ATR (as little as "
+            f"{atr_scale_mismatch_worst_ratio:.1%} of one bar's typical "
+            f"range on the worst one) — a stop that tight gets taken out "
+            f"by ordinary noise almost every time, regardless of whether "
+            f"the strategy's entry logic is any good. This can happen even "
+            f"when the stop looks like a normal fraction of price (see "
+            f"pip_scale_mismatch above, if also shown): a high-priced but "
+            f"volatile instrument, such as an equity index priced in the "
+            f"thousands, can still move far more per bar than a fixed pip "
+            f"count sized for a lower-volatility instrument like gold or "
+            f"FX ever assumed. Set pip_size to match the real instrument "
+            "(or click \"detect pip size from data\" on the Data tab) "
+            "before trusting this result, or use an ATR-based dynamic stop "
+            "instead of a fixed pip count.",
             RuntimeWarning,
         )
 

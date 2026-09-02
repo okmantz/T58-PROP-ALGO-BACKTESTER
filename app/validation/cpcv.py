@@ -62,7 +62,16 @@ class CPCVError(Exception):
     """Raised when CPCV cannot proceed (e.g. not enough data for the requested grouping)."""
 
 
-def _metric_value(stats: dict, metric: str) -> float:
+def _metric_value(stats: dict, metric: str, trades: list | None = None, prop_rules=None, mc_cfg=None) -> float:
+    """Same convention as app.search.robustness._metric_value: pulls
+    ordinary metrics off the backtest stats dict, but "eval_pass_probability"
+    (probability of hitting the profit target before a daily-loss/
+    max-drawdown/consistency limit) isn't in that dict -- it only exists
+    after a Monte Carlo run -- so this runs a small per-path Monte Carlo
+    for it instead, whenever prop_rules is available."""
+    if metric == "eval_pass_probability" and prop_rules is not None:
+        from app.monte_carlo.engine import eval_pass_probability_for_trades
+        return eval_pass_probability_for_trades(trades or [], prop_rules, mc_cfg)
     v = stats.get(metric, 0.0)
     if v == float("inf"):
         return 10.0
@@ -132,9 +141,11 @@ def run_cpcv(
     n_groups: int = 6,
     n_test_groups: int = 2,
     embargo_frac: float = 0.01,
-    metric: str = "profit_factor",
+    metric: str = "eval_pass_probability",
     robustness_threshold: float = 0.5,
     max_paths: int | None = 30,
+    prop_rules=None,
+    mc_cfg=None,
 ) -> CPCVResult:
     """
     strategy_builder: zero-argument callable returning a FRESH Strategy
@@ -142,6 +153,9 @@ def run_cpcv(
     run_walk_forward) -- required because some strategy sources cache
     state keyed to the data they last saw.
     """
+    if metric == "eval_pass_probability" and prop_rules is None:
+        metric = "profit_factor"  # can't run per-path Monte Carlo without prop rules
+
     n = len(df)
     if n_groups < 3 or n_test_groups < 1 or n_test_groups >= n_groups:
         raise CPCVError("n_groups must be >= 3 and 1 <= n_test_groups < n_groups.")
@@ -176,8 +190,8 @@ def run_cpcv(
 
         train_bt = run_backtest(train_df, strategy_builder(), risk)
         test_bt = run_backtest(test_df, strategy_builder(), risk)
-        is_val = _metric_value(train_bt.statistics.to_dict(), metric)
-        oos_val = _metric_value(test_bt.statistics.to_dict(), metric)
+        is_val = _metric_value(train_bt.statistics.to_dict(), metric, train_bt.trades, prop_rules, mc_cfg)
+        oos_val = _metric_value(test_bt.statistics.to_dict(), metric, test_bt.trades, prop_rules, mc_cfg)
 
         paths.append(CPCVPathResult(
             path_index=path_idx,
@@ -245,8 +259,10 @@ def compute_pbo(
     n_groups: int = 6,
     n_test_groups: int = 2,
     embargo_frac: float = 0.01,
-    metric: str = "sharpe_ratio",
+    metric: str = "eval_pass_probability",
     max_paths: int | None = 30,
+    prop_rules=None,
+    mc_cfg=None,
 ) -> PBOResult:
     """
     candidate_specs: the same uniform candidate-spec dicts used throughout
@@ -263,6 +279,9 @@ def compute_pbo(
     the result is degenerate by construction (pbo will be 0 or 1 and the
     note says so).
     """
+    if metric == "eval_pass_probability" and prop_rules is None:
+        metric = "sharpe_ratio"  # can't run per-candidate Monte Carlo without prop rules
+
     n_candidates = len(candidate_specs)
     if n_candidates < 1:
         raise CPCVError("compute_pbo requires at least one candidate.")
@@ -322,8 +341,8 @@ def compute_pbo(
                     continue
                 train_bt = run_backtest(train_df, train_strategy, risk)
                 test_bt = run_backtest(test_df, test_strategy, risk)
-                is_vals.append(_metric_value(train_bt.statistics.to_dict(), metric))
-                oos_vals.append(_metric_value(test_bt.statistics.to_dict(), metric))
+                is_vals.append(_metric_value(train_bt.statistics.to_dict(), metric, train_bt.trades, prop_rules, mc_cfg))
+                oos_vals.append(_metric_value(test_bt.statistics.to_dict(), metric, test_bt.trades, prop_rules, mc_cfg))
 
             is_matrix[path_idx, :] = is_vals
             oos_matrix[path_idx, :] = oos_vals

@@ -69,7 +69,7 @@ def _display_name(strategy: Strategy) -> str:
 class QuickOptimizeConfig:
     ga_population: int = 16
     ga_generations: int = 8
-    fitness_metric: str = "composite_prop_score"
+    fitness_metric: str = "eval_pass_probability"
     ga_search_mc_sims: int = 200
     final_mc_sims: int = 1000
     n_folds: int = 4

@@ -92,7 +92,7 @@ class FullPipelineConfig:
     ga_population: int = 12
     ga_generations: int = 6
     ga_search_mc_sims: int = 200
-    fitness_metric: str = "prop_guide_score"
+    fitness_metric: str = "eval_pass_probability"
     final_mc_sims: int = 10_000
     # Step 1's baseline Monte Carlo run is diagnostic only -- it's logged
     # and reported alongside the final numbers, but never feeds the
@@ -105,7 +105,7 @@ class FullPipelineConfig:
     baseline_mc_sims: int = 2_000
     holdout_frac: float = 0.2
     oos_check_folds: int = 4               # for the post-hoc run_walk_forward check
-    oos_check_metric: str = "profit_factor"
+    oos_check_metric: str = "eval_pass_probability"
     random_seed: int | None = 42
     save_to_library: bool = True           # code strategies only -- manual configs aren't files
     library_status: str | None = None      # None = auto-pick from the READY/MARGINAL/NOT READY
@@ -554,6 +554,7 @@ def run_full_pipeline(
             oos_validation = run_walk_forward(
                 df, lambda: build_strategy_from_spec(final_spec, final_tmp_dir), risk,
                 n_folds=cfg.oos_check_folds, metric=cfg.oos_check_metric,
+                prop_rules=prop_rules, mc_cfg=MonteCarloConfig(n_simulations=cfg.ga_search_mc_sims, random_seed=cfg.random_seed),
             )
             if oos_validation is None:
                 oos_skip_reason = "Not enough bars to build the requested number of out-of-sample folds."

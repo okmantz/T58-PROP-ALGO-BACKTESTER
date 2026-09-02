@@ -69,6 +69,7 @@ from app.optimize.parameter_space import RefinementError
 from app.optimize.refinement import RefinementConfig, compute_fitness, run_iterative_refinement
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
 from app.reports.generator import generate_full_report
+from app.search.family_diversity import enforce_family_diversity
 from app.search.results_db import ResultsDB
 from app.search.robustness import (
     deflated_sharpe_ratio, parameter_neighborhood_robustness, run_walk_forward,
@@ -177,6 +178,15 @@ class SearchStageConfig:
     fitness_metric: str = "eval_pass_probability"
     workers: int | None = None                # None = os.cpu_count()
     random_seed: int = 42
+
+    # Strategy Family Diversity -- caps how many Stage 1 survivors from
+    # the SAME classified family (app.strategy.family_taxonomy) can
+    # advance into Stage 2, so an "all families" or wide-grid search
+    # can't let one family's sheer combinatorial size (e.g. a 10,000-
+    # candidate parameter grid for one hypothesis) crowd out every other
+    # family before the expensive stages even see them. None (default)
+    # disables the cap -- exactly today's behavior, unchanged.
+    max_per_family_stage1: int | None = None
 
     def __post_init__(self):
         self.min_trades = max(int(self.min_trades), 1)
@@ -543,13 +553,21 @@ def run_search(
                 if done % log_every == 0 or done == len(futures):
                     log(f"  Stage 1: {done}/{len(futures)} evaluated...")
 
+            passed_stage1 = [r for r in stage1_records if r.get("passed_stage1")]
+            diversity_dropped = 0
+            if stage_cfg.max_per_family_stage1:
+                passed_stage1, _dropped = enforce_family_diversity(
+                    passed_stage1, stage_cfg.max_per_family_stage1, score_key="quick_score",
+                )
+                diversity_dropped = len(_dropped)
             survivors1 = sorted(
-                (r for r in stage1_records if r.get("passed_stage1")),
+                passed_stage1,
                 key=lambda r: r.get("quick_score", 0.0), reverse=True,
             )[: stage_cfg.stage1_top_n]
             log(
                 f"Stage 1 complete: {len(survivors1)}/{len(stage1_records)} candidate(s) survived "
                 f"the cheap filter and advance to Stage 2 (GA refinement)."
+                + (f" ({diversity_dropped} further dropped by the family-diversity cap.)" if diversity_dropped else "")
             )
             if not survivors1:
                 # Auto-relax: the original filters found nothing to work
@@ -588,6 +606,10 @@ def run_search(
                         )
                     ]
                     if candidates_now:
+                        if stage_cfg.max_per_family_stage1:
+                            candidates_now, _ = enforce_family_diversity(
+                                candidates_now, stage_cfg.max_per_family_stage1, score_key="quick_score",
+                            )
                         survivors1 = sorted(
                             candidates_now, key=lambda r: r.get("quick_score", 0.0), reverse=True,
                         )[: stage_cfg.stage1_top_n]

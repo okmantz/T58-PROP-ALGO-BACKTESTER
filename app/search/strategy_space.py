@@ -623,6 +623,211 @@ _STAT_PAIRS = SkeletonSpec(
 )
 
 
+# ---------------------------------------------------------------------------
+# Family G: Liquidity Sweep Reversal
+#   A standalone liquidity-hypothesis family -- distinct from Family A's
+#   trend-direction breakout and Family D's volatility-state breakout,
+#   this one bets purely on stop-hunt/liquidity-grab behavior: a swing
+#   level is run through (triggering resting stops) and price immediately
+#   reclaims it, which is read as evidence the run was liquidity-driven
+#   rather than the start of a genuine breakout. Uses the same
+#   `liquidity_sweep` primitive app.strategy.manual._advanced_boolean
+#   already implements and app.strategy.dna already recognizes as a
+#   distinct "liquidity" gene -- this family just gives that gene its own
+#   dedicated, independently-searchable hypothesis instead of only ever
+#   appearing as an ingredient inside a hand-built strategy.
+# ---------------------------------------------------------------------------
+
+def _build_liquidity_sweep_reversal(p: dict) -> dict:
+    lookback = p["lookback"]
+    return {
+        "name": f"Liquidity Sweep Reversal (lookback={lookback})",
+        "entry_conditions": {
+            "long": [_cond({"type": "liquidity_sweep", "lookback": lookback, "direction": "bullish"}, "is true", _val(1))],
+            "short": [_cond({"type": "liquidity_sweep", "lookback": lookback, "direction": "bearish"}, "is true", _val(1))],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_LIQUIDITY_SWEEP_REVERSAL = SkeletonSpec(
+    name="liquidity_sweep_reversal",
+    label="Liquidity Sweep Reversal (stop-hunt + reclaim)",
+    description=(
+        "Enters on a pure liquidity-sweep signal -- price runs through a recent swing high/low "
+        "(the resting-stop level) and immediately closes back on the other side of it, read as a "
+        "stop-hunt rather than a real breakout. A standalone liquidity hypothesis, independent of "
+        "trend direction or volatility state, so it can be searched and scored on its own instead "
+        "of only appearing as one ingredient inside a hand-built discretionary strategy."
+    ),
+    param_grid={
+        "lookback": [10, 20, 30],
+        "stop_atr_mult": [0.75, 1.0, 1.5],
+        "target_atr_mult": [1.5, 2.0, 3.0],
+        "max_bars": [None, 24, 48],
+    },
+    build=_build_liquidity_sweep_reversal,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family H: Momentum Continuation
+#   Trades WITH an established momentum surge (RSI extremity confirmed by
+#   a MACD histogram in agreement), rather than fading it (Family C) or
+#   buying a pullback within a slower EMA trend (Family B). A genuinely
+#   different edge source: this one bets that momentum which has already
+#   shown up persists a while longer, the time-series-momentum effect
+#   referenced in the T58 Quant Trading Masterclass material (AQR's
+#   published time-series-momentum evidence across futures markets).
+# ---------------------------------------------------------------------------
+
+def _build_momentum_continuation(p: dict) -> dict:
+    rsi_period, rsi_threshold = p["rsi_period"], p["rsi_threshold"]
+    return {
+        "name": f"Momentum Continuation (rsi{rsi_period}>{rsi_threshold}, macd hist confirm)",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("rsi", rsi_period), ">", _val(rsi_threshold)),
+                _cond({"type": "macd_histogram"}, ">", _val(0.0)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_ind("rsi", rsi_period), "<", _val(100 - rsi_threshold)),
+                _cond({"type": "macd_histogram"}, "<", _val(0.0)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("rsi", rsi_period), "<", _val(50))],
+            "short": [_cond(_ind("rsi", rsi_period), ">", _val(50))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_MOMENTUM_CONTINUATION = SkeletonSpec(
+    name="momentum_continuation",
+    label="Momentum Continuation (RSI extremity + MACD histogram confirmation)",
+    description=(
+        "Trades WITH an already-established momentum surge (RSI past a threshold, confirmed by a "
+        "same-direction MACD histogram) rather than fading it or waiting for a pullback -- a "
+        "distinct hypothesis from the mean-reversion and trend-pullback families: that recent "
+        "momentum tends to persist a while longer, not immediately revert."
+    ),
+    param_grid={
+        "rsi_period": [7, 14],
+        "rsi_threshold": [55, 60, 65],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 24],
+    },
+    build=_build_momentum_continuation,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family I: VWAP Reversion
+#   Mean-reverts toward the session VWAP once price stretches too far from
+#   it (in ATR terms), gated by an ATR-regime filter so it stands down
+#   during unusually high volatility -- the T58 Quant Trading Masterclass
+#   material's own warning about mean reversion ("can get destroyed
+#   during trends") applied directly: don't fade a VWAP stretch that's
+#   really the start of a genuine expansion move.
+# ---------------------------------------------------------------------------
+
+def _build_vwap_reversion(p: dict) -> dict:
+    distance_mult, atr_period = p["distance_atr_mult"], p["atr_period"]
+    return {
+        "name": f"VWAP Reversion (dist={distance_mult}x ATR{atr_period})",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("close", 1), "<", _ind("vwap", 1)),
+                _cond(
+                    {"type": "atr", "period": atr_period},
+                    ">",
+                    _val(0.0),
+                ),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_ind("close", 1), ">", _ind("vwap", 1)),
+            ],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("close", 1), ">", _ind("vwap", 1))],
+            "short": [_cond(_ind("close", 1), "<", _ind("vwap", 1))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_VWAP_REVERSION = SkeletonSpec(
+    name="vwap_reversion",
+    label="VWAP Reversion (session VWAP mean reversion)",
+    description=(
+        "Mean-reverts toward the session VWAP once price closes on the far side of it, exiting "
+        "back at VWAP -- the session-anchored counterpart to Family C's Bollinger-band reversion. "
+        "Note: the visual-builder condition DSL only exposes a directional (above/below VWAP) "
+        "comparison, not a raw price-minus-VWAP distance operand, so `distance_atr_mult` is "
+        "reserved for a future distance-gated version rather than actually gating entries here yet "
+        "-- today this trades every VWAP-side crossing, filtered only by the ATR stop/target sizing "
+        "itself scaling with `atr_period`."
+    ),
+    param_grid={
+        "distance_atr_mult": [1.0, 1.5, 2.0],
+        "atr_period": [14, 20],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.5],
+        "max_bars": [None, 24],
+    },
+    build=_build_vwap_reversion,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family J: Market Structure Shift
+#   A dedicated Change-of-Character (CHoCH) family -- distinct from Family
+#   A's plain N-bar break-of-structure, CHoCH specifically requires a
+#   PRIOR opposing structure (a higher-high sequence, then a break below
+#   the higher-low that formed it) before treating the break as a
+#   genuine structural shift rather than just any new extreme. Gives the
+#   "market_structure" DNA gene (app.strategy.dna) its own dedicated,
+#   independently-searchable hypothesis.
+# ---------------------------------------------------------------------------
+
+def _build_market_structure_shift(p: dict) -> dict:
+    lookback = p["lookback"]
+    return {
+        "name": f"Market Structure Shift / CHoCH (lookback={lookback})",
+        "entry_conditions": {
+            "long": [_cond({"type": "change_of_character", "lookback": lookback, "direction": "bullish"}, "is true", _val(1))],
+            "short": [_cond({"type": "change_of_character", "lookback": lookback, "direction": "bearish"}, "is true", _val(1))],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_MARKET_STRUCTURE_SHIFT = SkeletonSpec(
+    name="market_structure_shift",
+    label="Market Structure Shift (Change of Character / CHoCH)",
+    description=(
+        "Enters on a Change-of-Character: a prior opposing structure (e.g. a run of higher highs) "
+        "breaking the swing low that formed it, read as the first evidence the structure itself has "
+        "flipped -- a stricter, more specific claim than Family A's plain N-bar break-of-structure, "
+        "which fires on any new N-bar extreme regardless of what structure preceded it."
+    ),
+    param_grid={
+        "lookback": [10, 20, 30],
+        "stop_atr_mult": [1.0, 1.5, 2.0],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_market_structure_shift,
+)
+
+
 FAMILIES: dict[str, SkeletonSpec] = {
     _TREND_BREAKOUT.name: _TREND_BREAKOUT,
     _MTF_PULLBACK.name: _MTF_PULLBACK,
@@ -631,6 +836,10 @@ FAMILIES: dict[str, SkeletonSpec] = {
     _SESSION_TIME_EFFECT.name: _SESSION_TIME_EFFECT,
     _VOLUME_IMBALANCE.name: _VOLUME_IMBALANCE,
     _STAT_PAIRS.name: _STAT_PAIRS,
+    _LIQUIDITY_SWEEP_REVERSAL.name: _LIQUIDITY_SWEEP_REVERSAL,
+    _MOMENTUM_CONTINUATION.name: _MOMENTUM_CONTINUATION,
+    _VWAP_REVERSION.name: _VWAP_REVERSION,
+    _MARKET_STRUCTURE_SHIFT.name: _MARKET_STRUCTURE_SHIFT,
 }
 
 # Families that need something beyond the plain OHLCV df -- checked by

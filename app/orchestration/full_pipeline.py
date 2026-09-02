@@ -447,17 +447,27 @@ def run_full_pipeline(
             return result.genomes
 
     # Fast-skip: a pip_size/instrument-scale mismatch (see the
-    # pip_scale_mismatch warning in app.backtest.execution) invalidates
-    # every position size and every stop distance the baseline computed --
-    # spending a full multi-generation GA search (typically the single
-    # most expensive step of a Full Pipeline run, 100-270s in a real
-    # 23-strategy batch) tuning parameters against numbers that can't be
-    # trusted is pure wasted wall-clock time. The fix is changing
-    # risk.pip_size to match the instrument (see suggest_pip_size), not
-    # anything the GA can search its way around. Skip straight to
-    # reporting NOT READY with the actionable reason instead.
+    # pip_scale_mismatch AND atr_scale_mismatch warnings in
+    # app.backtest.execution) invalidates every position size and every
+    # stop distance the baseline computed -- spending a full
+    # multi-generation GA search (typically the single most expensive
+    # step of a Full Pipeline run, 100-270s in a real 23-strategy batch)
+    # tuning parameters against numbers that can't be trusted is pure
+    # wasted wall-clock time. The fix is changing risk.pip_size to match
+    # the instrument (see suggest_pip_size), not anything the GA can
+    # search its way around. Skip straight to reporting NOT READY with
+    # the actionable reason instead.
+    #
+    # Both warnings are matched here (not just the price-ratio one)
+    # because a fixed-pips stop can pass the price-ratio check -- look
+    # like a perfectly ordinary fraction of price -- while still being
+    # tiny next to the instrument's own actual volatility (ATR); a
+    # high-priced but volatile instrument such as an equity index is the
+    # case that price-ratio alone misses.
     instrument_mismatch = any(
-        "doesn't match the instrument actually being tested" in w for w in baseline_bt.warnings
+        "doesn't match the instrument actually being tested" in w
+        or "under 15% of this instrument's own recent ATR" in w
+        for w in baseline_bt.warnings
     )
     if instrument_mismatch:
         refinement_skip_reason = (

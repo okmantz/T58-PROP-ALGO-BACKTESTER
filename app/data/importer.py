@@ -274,13 +274,100 @@ def _pick_data_member(names: list[str]) -> str:
     return sorted(with_digit or candidates, key=len)[0]
 
 
+def _flatten_parquet_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Flattens a MultiIndex column structure into plain strings.
+
+    Parquet files exported from things like a multi-ticker yfinance/
+    pandas dump (columns like ('Close', 'AAPL')) or a pivoted OHLCV
+    export commonly keep a 2-level column MultiIndex. _auto_map_columns
+    only ever looks at plain string column names, so a MultiIndex column
+    set would otherwise never match any alias and the import would fail
+    with a confusing "could not identify required column(s)" error even
+    though the data is perfectly good OHLCV data.
+
+    If every column shares the exact same non-field-name level (a
+    single-instrument export, e.g. every column's second level is
+    "XAUUSD"), that level is dropped entirely rather than appended --
+    it's pure noise for a single-instrument backtester and would
+    otherwise stop "Close_XAUUSD" from matching the "close" alias.
+    Only when columns genuinely differ (a real multi-ticker file) are
+    the levels joined with "_", field name first, so the existing
+    lower-case/substring alias matching in _auto_map_columns still has a
+    fighting chance of recognizing e.g. "close" inside "close_aapl".
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        n_levels = df.columns.nlevels
+        drop_levels = [
+            lvl for lvl in range(1, n_levels)
+            if df.columns.get_level_values(lvl).nunique() <= 1
+        ]
+        flat_index = df.columns.droplevel(drop_levels) if drop_levels else df.columns
+        if isinstance(flat_index, pd.MultiIndex):
+            df.columns = [
+                "_".join(str(level) for level in col if str(level) and str(level).lower() != "nan")
+                for col in flat_index.to_flat_index()
+            ]
+        else:
+            df.columns = [str(c) for c in flat_index]
+    return df
+
+
+def _promote_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Turns a DatetimeIndex (or an index that's clearly a timestamp, e.g.
+    named 'Date'/'Datetime'/'time') into a real 'timestamp' column.
+
+    Parquet, unlike CSV, very often carries the bar timestamp as the
+    DataFrame's index rather than as a plain column -- this is the default
+    for anything written via `df.to_parquet()` off a time-indexed frame
+    (pandas-datareader/yfinance-style exports, most quant research
+    pipelines). Without this, _auto_map_columns would never find a
+    timestamp column at all since it only ever looks at df.columns.
+    """
+    index_name = str(df.index.name).strip().lower() if df.index.name is not None else ""
+    looks_like_time_index = (
+        isinstance(df.index, (pd.DatetimeIndex, pd.PeriodIndex))
+        or index_name in ("date", "datetime", "timestamp", "time", "index", "gmt time", "ts", "dt")
+    )
+    if looks_like_time_index and not isinstance(df.index, pd.RangeIndex):
+        df = df.reset_index()
+        # reset_index() names an unnamed DatetimeIndex "index" -- give it
+        # an actually-recognizable name so _auto_map_columns's exact-alias
+        # pass (not just its fuzzy fallback) can find it.
+        first_col = df.columns[0]
+        if str(first_col).strip().lower() in ("index", ""):
+            df = df.rename(columns={first_col: "timestamp"})
+    return df
+
+
 def _read_parquet_ohlcv(path_or_buffer) -> pd.DataFrame:
+    """Reads a .parquet file OR a partitioned parquet directory (a folder
+    of part-*.parquet files, as written by Spark/Dask/most data-lake
+    pipelines) into a plain OHLCV-shaped DataFrame.
+
+    Handles the ways real-world parquet exports differ from this app's
+    original single-flat-file assumption:
+      - a directory of partitioned parquet parts instead of one file
+      - the timestamp living in the index instead of a column
+      - a MultiIndex column structure (multi-ticker exports)
+    Epoch-integer timestamp columns (seconds/ms/us/ns since epoch, common
+    in parquet since it has no universal "the timestamp column" marker)
+    are handled later in import_csv's timestamp-validation step via
+    _coerce_timestamp_series, once the timestamp column has actually been
+    identified -- not here, since at this point it isn't picked out yet.
+    """
     try:
-        return pd.read_parquet(io.BytesIO(_bytes_of(path_or_buffer)))
+        if isinstance(path_or_buffer, (str, Path)) and Path(path_or_buffer).is_dir():
+            df = pd.read_parquet(path_or_buffer)
+        else:
+            df = pd.read_parquet(io.BytesIO(_bytes_of(path_or_buffer)))
     except ImportError as exc:
         raise ValueError(
             "Reading .parquet files requires the 'pyarrow' package (pip install pyarrow)."
         ) from exc
+    df = _flatten_parquet_columns(df)
+    df = _promote_datetime_index(df)
+    return df
 
 
 def _read_member_bytes(member_name: str, member_bytes: bytes) -> pd.DataFrame:
@@ -319,6 +406,10 @@ def _read_raw_file(path_or_buffer) -> pd.DataFrame:
     """
     Read a market-data file, dispatching on extension first:
 
+    - a directory              -> treated as a partitioned parquet dataset
+                                   (a folder of part-*.parquet files) if it
+                                   contains any .parquet files; pd.read_parquet
+                                   reads the whole partition set as one frame.
     - .parquet             -> pd.read_parquet directly (already tabular,
                                no delimiter/header guessing needed)
     - .zip / .7z            -> opens the archive and reads whichever member
@@ -329,6 +420,11 @@ def _read_raw_file(path_or_buffer) -> pd.DataFrame:
       Tkinter/Flask file handle that doesn't expose one) falls through to
       the existing delimiter/header-detecting CSV reader below.
     """
+    if isinstance(path_or_buffer, (str, Path)) and Path(path_or_buffer).is_dir():
+        directory = Path(path_or_buffer)
+        if any(directory.rglob("*.parquet")):
+            return _read_parquet_ohlcv(directory)
+        raise ValueError(f"'{directory}' is a directory with no .parquet files inside it.")
     ext = _extension_of(path_or_buffer)
     if ext == ".parquet":
         return _read_parquet_ohlcv(path_or_buffer)
@@ -471,6 +567,56 @@ def _auto_map_columns(columns: list[str], raw: "pd.DataFrame | None" = None) -> 
     return mapping
 
 
+def _coerce_timestamp_series(series: pd.Series) -> pd.Series:
+    """Parses a raw timestamp column/index into real datetimes, handling
+    epoch-integer timestamps as well as ordinary date strings.
+
+    Parquet has no universal marker for "this column is a datetime
+    stored as an epoch integer" the way a CSV's ISO-8601 string does --
+    plenty of real exports (MetaTrader, some data-lake pipelines, a
+    DataFrame that got cast to int64 before saving) store the bar time as
+    plain seconds/milliseconds/microseconds/nanoseconds since epoch.
+    Blindly calling pd.to_datetime() on an int64 column assumes
+    nanoseconds and silently produces nonsense dates (e.g. a 2024
+    epoch-seconds value parsed as nanoseconds lands in 1970) instead of
+    erroring, so it has to be handled explicitly rather than left to the
+    generic parser below.
+
+    Magnitude bands below are picked so any date from roughly 2001-2286
+    is classified correctly regardless of which unit it's actually in --
+    there's no ambiguity between the bands for real-world trading data.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce", utc=False)
+
+    if pd.api.types.is_numeric_dtype(series):
+        sample = series.dropna()
+        if not sample.empty:
+            magnitude = float(sample.abs().median())
+            if magnitude > 1e17:
+                unit = "ns"
+            elif magnitude > 1e14:
+                unit = "us"
+            elif magnitude > 1e11:
+                unit = "ms"
+            elif magnitude > 1e8:
+                unit = "s"
+            else:
+                unit = None  # too small to be a plausible epoch timestamp
+            if unit is not None:
+                parsed = pd.to_datetime(series, unit=unit, errors="coerce", utc=False)
+                # Sanity check: a real epoch value converts to a normal
+                # calendar year. If it doesn't, this wasn't actually an
+                # epoch timestamp (e.g. a numeric bar index) -- fall
+                # through to the generic parser instead of returning
+                # garbage dates.
+                valid = parsed.dropna()
+                if not valid.empty and valid.dt.year.between(1990, 2200).mean() > 0.9:
+                    return parsed
+
+    return pd.to_datetime(series, errors="coerce", utc=False)
+
+
 def import_csv(
     path_or_buffer,
     manual_mapping: Optional[dict[str, str]] = None,
@@ -560,11 +706,7 @@ def import_csv(
     # Timestamp validation
     # ---------------------------------------------------------
 
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        errors="coerce",
-        utc=False,
-    )
+    df["timestamp"] = _coerce_timestamp_series(df["timestamp"])
 
     bad_ts = int(
         df["timestamp"].isna().sum()

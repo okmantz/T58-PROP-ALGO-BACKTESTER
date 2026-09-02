@@ -48,6 +48,7 @@ from app.data.alpaca_source import (
 from app.data.importer import import_csv, import_csv_bytes
 from app.data.storage import get_app_base_dir, get_raw_data_dir, list_datasets_by_instrument, list_stored_datasets, store_csv_bytes
 from app.ensemble.ensemble import EnsembleError, EnsembleVoteConfig, run_ensemble_blend, run_ensemble_vote
+from app.evolution import checkpoint as evo_checkpoint
 from app.evolution.engine import EvolutionConfig, EvolutionRunner
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.multi_objective import (
@@ -2422,6 +2423,62 @@ def evolution_reset():
             _EVOLUTION_RUNNER.reset()
             _EVOLUTION_LOG.clear()
     return redirect(url_for("evolution_form"))
+
+
+@app.route("/evolution/promote", methods=["POST"])
+def evolution_promote():
+    """Web equivalent of the desktop app's PROMOTE TO STRATEGY LIBRARY
+    button: saves one leaderboard candidate's manual-builder config into
+    the Strategy Library (as a "manual" type -- see
+    app.strategy.library.STRATEGY_TYPES, which didn't recognize "manual"
+    at all until this fix, so this exact action always failed with
+    "Unknown strategy type 'manual'" on both desktop and web). Looks in
+    the live runner first, then falls back to the on-disk checkpoint so
+    this also works after a server restart, matching the desktop app's
+    _load_evolution_leaderboard_from_disk fallback.
+    """
+    candidate_id = (request.form.get("candidate_id") or "").strip()
+    if not candidate_id:
+        return jsonify({"ok": False, "error": "No candidate_id given."}), 400
+
+    record = None
+    with _EVOLUTION_LOCK:
+        runner = _EVOLUTION_RUNNER
+    if runner is not None:
+        for r in runner.leaderboard:
+            d = r.to_checkpoint_dict()
+            if d.get("candidate_id") == candidate_id:
+                record = d
+                break
+    if record is None:
+        try:
+            checkpoint = evo_checkpoint.load_checkpoint()
+            if checkpoint is not None:
+                for d in checkpoint.leaderboard:
+                    if d.get("candidate_id") == candidate_id:
+                        record = d
+                        break
+        except Exception:
+            pass
+    if record is None:
+        return jsonify({"ok": False, "error": f"Candidate '{candidate_id}' not found on the leaderboard."}), 404
+
+    config = (record.get("spec") or {}).get("config")
+    if not config:
+        return jsonify({"ok": False, "error": "This candidate has no manual-builder config to promote."}), 400
+
+    family = (record.get("meta") or {}).get("family", "strategy")
+    filename = f"evolab_promoted_{family}_{candidate_id[-8:]}.json"
+    text = json.dumps(config, indent=2)
+    try:
+        try:
+            save_strategy_text(text, filename, "manual", overwrite=False)
+        except StrategyAlreadyExists:
+            save_strategy_text(text, filename, "manual", overwrite=True)
+        set_strategy_status("manual", filename, "validated")  # see main_window.py's matching note
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "filename": filename})
 
 
 @app.route("/evolution/status.json")

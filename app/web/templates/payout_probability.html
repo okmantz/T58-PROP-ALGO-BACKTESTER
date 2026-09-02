@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>T58 Multi-Asset Portfolio</title>
+<title>T58 Payout Probability</title>
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/static/icon-192.png">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
@@ -23,43 +23,36 @@
     width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
     background: var(--panel-3); color: var(--text); font-size: 15px;
   }
-  input:focus, select:focus, textarea:focus {
-    outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15);
-  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15); }
   textarea { min-height: 140px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
   .row { display: flex; gap: 10px; }
   .row > div { flex: 1; }
   input[type=file] { width: 100%; color: #ccc; }
   .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
-  .tabs button {
-    flex: 1; min-width: 70px; padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border-light);
-    background: var(--panel-3); color: #ccc; font-size: 13px;
-  }
+  .tabs button { flex: 1; min-width: 70px; padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border-light); background: var(--panel-3); color: #ccc; font-size: 13px; }
   .tabs button.active { background: var(--teal); color: #04120e; font-weight: 600; border-color: var(--teal); }
-  .submit-btn {
-    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e;
-    font-size: 16px; font-weight: 700; margin-top: 6px;
-    box-shadow: 0 0 22px rgba(53,224,176,0.35);
-  }
+  .submit-btn { width: 100%; padding: 15px; border-radius: 10px; border: 1px solid var(--teal); background: var(--teal); color: #04120e; font-size: 16px; font-weight: 700; margin-top: 6px; box-shadow: 0 0 22px rgba(53,224,176,0.35); }
   .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
   .notice { background: #142a1a; border: 1px solid #235a32; color: #b4ffcb; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
-  .leg-block { border: 1px solid var(--border-light); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
-  .leg-block h3 { font-size: 12px; text-transform: uppercase; color: #999; margin: 0 0 8px; }
   .headline { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 10px; }
   .stat { background: var(--panel-3); border: 1px solid var(--border-light); border-radius: 10px; padding: 10px; }
   .stat .label { font-size: 10px; color: #888; text-transform: uppercase; }
   .stat .value { font-size: 16px; font-weight: 700; margin-top: 2px; }
   .links a { display: block; color: #9ecbff; font-size: 13px; margin-top: 6px; text-decoration: none; }
+  .funnel-row { display:flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border-light); font-size: 13px; }
+  .funnel-row:last-child { border-bottom: none; }
 </style>
 </head>
 <body>
-{% set active_page = active_page|default('portfolio') %}
+{% set active_page = active_page|default('payout_probability') %}
 <div class="t58-shell">
 {% include '_sidebar.html' %}
 <div class="t58-main">
 <div class="t58-page-header">
-  <h1>Multi-asset portfolio</h1>
-  <p>The SAME strategy and risk settings applied to several DIFFERENT instruments at once, correlation-aware re-weighted and chained into one combined equity curve. Several imperfectly-correlated return streams smooth the combined curve in a way re-tuning a single strategy's parameters can't.</p>
+  <h1>Payout probability</h1>
+  <p>Goes beyond a single pass-probability number: simulates thousands of complete account lifecycles
+  (Start &rarr; Evaluation &rarr; Funded &rarr; Payout #1 &rarr; Payout #2 &rarr; ... &rarr; Reset/Continue) and
+  reports the actual funnel -- how many of those simulated accounts made it through EACH stage.</p>
 </div>
 
 {% if error %}
@@ -68,26 +61,43 @@
 
 {% if result %}
 <div class="card">
-  <h2>Result</h2>
-  <p class="help">Legs: {{ result.legs | join(', ') }}</p>
+  <h2>Result — {{ result.strategy_name }}</h2>
   <div class="headline">
-    <div class="stat"><div class="label">Combined trades</div><div class="value">{{ result.trades }}</div></div>
-    <div class="stat"><div class="label">Combined net profit</div><div class="value">${{ '%.0f' % result.net_profit }}</div></div>
-    <div class="stat"><div class="label">Combined max drawdown</div><div class="value">{{ '%.1f' % result.max_dd }}%</div></div>
-    <div class="stat"><div class="label">Combined Sharpe</div><div class="value">{{ '%.2f' % result.sharpe }}</div></div>
+    <div class="stat"><div class="label">Prop Survival Score</div><div class="value">{{ '%.0f' % result.score }} / 100</div></div>
+    <div class="stat"><div class="label">Net positive after resets</div><div class="value">{{ '%.1f' % result.net_positive_after_resets }}%</div></div>
   </div>
-  <p class="help" style="margin-top:10px;">Diversification ratio: {{ '%.2f' % result.diversification_ratio if result.diversification_ratio else 'n/a' }} (weighted-avg individual volatility / portfolio volatility; above 1 means diversification helped).</p>
-  {% for w in result.warnings %}<div class="notice">{{ w }}</div>{% endfor %}
+  <h2 style="margin-top:16px;">Account lifecycle funnel ({{ '{:,}'.format(result.funnel.n_accounts) }} simulated accounts)</h2>
+  <div class="funnel-row"><span>Passed Evaluation</span><span>{{ '{:,}'.format(result.funnel.passed_evaluation_count) }} ({{ '%.1f' % result.funnel.passed_evaluation_pct }}%)</span></div>
+  <div class="funnel-row"><span>Reached Funded</span><span>{{ '{:,}'.format(result.funnel.reached_funded_count) }} ({{ '%.1f' % result.funnel.reached_funded_pct }}%)</span></div>
+  {% for count in result.funnel.payout_counts %}
+  <div class="funnel-row"><span>Reached Payout #{{ loop.index }}</span><span>{{ '{:,}'.format(count) }} ({{ '%.1f' % result.funnel.payout_probabilities[loop.index0] }}%)</span></div>
+  {% endfor %}
+  {% for n in result.notes %}<div class="notice" style="margin-top:10px;">{{ n }}</div>{% endfor %}
   <div class="links">
-    <a href="{{ result.report_html }}" target="_blank">Open full portfolio report &rarr;</a>
+    <a href="{{ result.report_html }}" target="_blank">Open full Payout Probability report &rarr;</a>
   </div>
 </div>
 {% endif %}
 
-<form method="post" action="/portfolio/run" enctype="multipart/form-data">
+<form method="post" action="/payout-probability/run" enctype="multipart/form-data">
 
   <div class="card">
-    <h2>1. Strategy (applied to every leg)</h2>
+    <h2>1. Market data</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }}</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+    <label>Or upload CSV(s)</label>
+    <input type="file" name="csv_file" accept=".csv" multiple>
+  </div>
+
+  <div class="card">
+    <h2>2. Strategy</h2>
     <div class="tabs" id="strategy-tabs">
       <button type="button" data-mode="manual" class="active">Manual</button>
       <button type="button" data-mode="python">Python</button>
@@ -120,64 +130,45 @@
   </div>
 
   <div class="card">
-    <h2>2. Shared risk settings</h2>
+    <h2>3. Risk &amp; prop rules</h2>
     <div class="row">
-      <div><label>Initial account balance</label><input type="number" name="initial_balance" value="100000"></div>
-      <div><label>Risk value</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
+      <div><label>Initial balance ($)</label><input type="number" name="initial_balance" value="100000"></div>
+      <div><label>Account size ($)</label><input type="number" name="account_size" value="100000"></div>
     </div>
     <div class="row">
-      <div><label>Risk mode</label>
-        <select name="risk_mode"><option value="percent">% of balance</option><option value="fixed">Fixed lot</option></select>
-      </div>
+      <div><label>Risk value</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
       <div><label>Pip size</label><input type="number" step="0.0001" name="pip_size" value="0.0001"></div>
     </div>
-  </div>
-
-  <div class="card">
-    <h2>3. Instrument legs (at least 2 required, up to 4)</h2>
-    <p class="help">Each leg is a separate instrument's market data. Nominal weight sets each leg's relative share of the risk budget BEFORE correlation adjustment.</p>
-    {% for i in range(1, 5) %}
-    <div class="leg-block">
-      <h3>Leg {{ i }}{% if i > 2 %} (optional){% endif %}</h3>
-      {% if stored_datasets %}
-      <label>Use a previously stored dataset</label>
-      <select name="leg{{ i }}_existing_dataset">
-        <option value="">— none —</option>
-        {% for ds in stored_datasets %}
-        <option value="{{ ds.name }}">{{ ds.name }}</option>
-        {% endfor %}
-      </select>
-      {% endif %}
-      <label>Or upload a CSV for this instrument</label>
-      <input type="file" name="leg{{ i }}_csv" accept=".csv">
-      <label>Nominal weight</label>
-      <input type="number" step="0.1" name="leg{{ i }}_weight" value="1.0">
-      <label>Strategy for this leg</label>
-      <select name="leg{{ i }}_library_mode" class="leg-strategy-mode" data-leg="{{ i }}" onchange="populateLegLibrarySelect({{ i }})">
-        <option value="">— use shared strategy above —</option>
-        <option value="python">Load from library: Python</option>
-        <option value="pinescript">Load from library: PineScript</option>
-        <option value="mql5">Load from library: MQL5</option>
-      </select>
-      <select name="leg{{ i }}_library_name" id="leg{{ i }}_library_name" style="display:none;"></select>
-      <p class="help" style="margin:4px 0 0;">Pick a saved strategy to give this leg its own edge instead of the shared one -- this is how a portfolio combines genuinely different strategies (e.g. a trend-follower + a mean-reversion strategy) into one book.</p>
+    <div class="row">
+      <div><label>Eval profit target (%)</label><input type="number" name="profit_target" value="8"></div>
+      <div><label>Daily loss limit (%)</label><input type="number" name="daily_loss" value="5"></div>
     </div>
-    {% endfor %}
+    <div class="row">
+      <div><label>Max drawdown (%)</label><input type="number" name="max_dd" value="10"></div>
+    </div>
   </div>
 
   <div class="card">
-    <details>
-      <summary>Advanced re-weighting settings</summary>
-      <label>Correlation penalty strength (0 = ignore, 1 = full inverse-correlation re-weighting)</label>
-      <input type="number" step="0.05" name="correlation_penalty_strength" value="0.6">
-      <div class="row">
-        <div><label>Max weight fraction (any one leg's cap)</label><input type="number" step="0.05" name="max_instrument_weight_frac" value="0.5"></div>
-        <div><label>Min weight fraction (floor vs. own nominal)</label><input type="number" step="0.05" name="min_weight_frac" value="0.15"></div>
-      </div>
-    </details>
+    <h2>4. Lifecycle simulation settings</h2>
+    <p class="help">Reset/retry economics model what it actually costs, out of pocket, to keep re-attempting the
+    evaluation after a failure -- and what you actually keep after the firm's profit split.</p>
+    <div class="row">
+      <div><label>Simulated account lifetimes</label><input type="number" name="n_sims" value="5000"></div>
+      <div><label>Payout milestones to track</label><input type="number" name="max_payouts_tracked" value="5"></div>
+    </div>
+    <label>Funding approval probability (%) — 100 = every eval pass becomes funded immediately</label>
+    <input type="number" name="funding_approval_pct" value="100">
+    <div class="row">
+      <div><label>Evaluation fee ($)</label><input type="number" name="evaluation_fee" value="0"></div>
+      <div><label>Reset fee ($, blank = same as evaluation fee)</label><input type="number" name="reset_fee"></div>
+    </div>
+    <div class="row">
+      <div><label>Trader's profit split (%)</label><input type="number" name="profit_split" value="80"></div>
+      <div><label>Max lifetime attempts</label><input type="number" name="max_attempts" value="3"></div>
+    </div>
   </div>
 
-  <button class="submit-btn" type="submit">Run Portfolio Backtest</button>
+  <button class="submit-btn" type="submit">Run Payout Probability Simulation</button>
 </form>
 
 </div>
@@ -210,26 +201,6 @@
       .then(r => r.ok ? r.text() : Promise.reject())
       .then(text => { document.getElementById('strategy_code').value = text; })
       .catch(() => alert('Could not load that saved strategy.'));
-  }
-
-  function populateLegLibrarySelect(legIndex) {
-    const modeSelect = document.querySelector(`select[name="leg${legIndex}_library_mode"]`);
-    const nameSelect = document.getElementById(`leg${legIndex}_library_name`);
-    const mode = modeSelect.value;
-    if (!mode) {
-      nameSelect.style.display = 'none';
-      nameSelect.innerHTML = '';
-      return;
-    }
-    const all = SAVED_STRATEGIES[mode] || [];
-    nameSelect.innerHTML = '<option value="">— choose a saved strategy —</option>';
-    all.forEach(s => {
-      const opt = document.createElement('option');
-      opt.value = s.name;
-      opt.textContent = s.description ? `${s.name} — ${s.description}` : s.name;
-      nameSelect.appendChild(opt);
-    });
-    nameSelect.style.display = 'block';
   }
 
   document.getElementById('strategy_file_input').addEventListener('change', (e) => {

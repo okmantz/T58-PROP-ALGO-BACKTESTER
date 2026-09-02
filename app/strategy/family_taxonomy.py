@@ -182,6 +182,10 @@ def classify_record(record: dict) -> str:
         return _SKELETON_TO_GROUP[skeleton_family]
 
     source_type = record.get("source_type", "manual")
+    if source_type == "regime_router":
+        # app.strategy.regime_router.RegimeRouterStrategy -- a composed
+        # meta-strategy, not a single hypothesis; always this group.
+        return "regime_switching"
     if source_type == "manual":
         config = record.get("config") or {}
         dna = extract_dna("manual", config)

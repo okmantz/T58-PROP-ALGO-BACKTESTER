@@ -98,6 +98,7 @@ class _CodeStrategyShim:
 def _chained_fitness(
     strategy_to_run, slices: list[pd.DataFrame], risk_to_use: RiskConfig,
     prop_rules: PropRules, mc_cfg: MonteCarloConfig, fitness_metric: str,
+    adaptive_risk=None,
 ) -> tuple[float, int]:
     """Backtests `strategy_to_run` (a fixed, already-built genome) on every
     fold's held-out test slice, chains the resulting trades into one
@@ -107,7 +108,7 @@ def _chained_fitness(
     a worker process (parallel path) with no duplicated logic."""
     all_trades: list[Trade] = []
     for test_df in slices:
-        bt = run_backtest(test_df, strategy_to_run, risk_to_use)
+        bt = run_backtest(test_df, strategy_to_run, risk_to_use, adaptive_risk=adaptive_risk)
         all_trades.extend(bt.trades)
     if not all_trades:
         return float("-inf"), 0
@@ -143,6 +144,7 @@ def _ga_worker_init(
     genes: list, test_slice_paths: list[str], risk_kwargs: dict, prop_kwargs: dict,
     tmp_dir_path: str, search_mc_kwargs: dict, fitness_metric: str,
     cost_stress_enabled: bool, cost_stress_multiplier: float, cost_stress_penalty_weight: float,
+    adaptive_risk=None,
 ) -> None:
     global _GA_WORKER
     _GA_WORKER = {
@@ -159,6 +161,7 @@ def _ga_worker_init(
         "cost_stress_enabled": cost_stress_enabled,
         "cost_stress_multiplier": cost_stress_multiplier,
         "cost_stress_penalty_weight": cost_stress_penalty_weight,
+        "adaptive_risk": adaptive_risk,
     }
 
 
@@ -176,11 +179,13 @@ def _ga_eval_task(genome: list) -> tuple[float, int]:
     strategy = _ga_worker_build(genome)
     fitness, trade_count = _chained_fitness(
         strategy, w["test_slices"], w["risk"], w["prop_rules"], w["search_mc_cfg"], w["fitness_metric"],
+        w.get("adaptive_risk"),
     )
     if w["cost_stress_enabled"] and w["cost_stress_penalty_weight"] > 0 and math.isfinite(fitness):
         stressed_risk = _stressed_risk_config(w["risk"], w["cost_stress_multiplier"])
         stressed_fitness, _ = _chained_fitness(
             strategy, w["test_slices"], stressed_risk, w["prop_rules"], w["search_mc_cfg"], w["fitness_metric"],
+            w.get("adaptive_risk"),
         )
         fitness = apply_cost_stress_penalty(fitness, stressed_fitness, w["cost_stress_penalty_weight"])
     return fitness, trade_count
@@ -232,6 +237,7 @@ def run_walkforward_aware_refinement(
     ai_suggest_cb: Callable[[list], list[list[float]]] | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
+    adaptive_risk=None,
 ) -> WalkforwardGAResult:
     """
     parallel: when True (the default) and the search is large enough to be
@@ -333,18 +339,20 @@ def run_walkforward_aware_refinement(
             candidate_strategy = build(genome)
             fitness, trade_count = _chained_fitness(
                 candidate_strategy, test_slices, risk, prop_rules, search_mc_cfg, cfg.fitness_metric,
+                adaptive_risk,
             )
             if cfg.cost_stress_enabled and cfg.cost_stress_penalty_weight > 0 and math.isfinite(fitness):
                 stressed_risk = _stressed_risk_config(risk, cfg.cost_stress_multiplier)
                 stressed_fitness, _ = _chained_fitness(
                     candidate_strategy, test_slices, stressed_risk, prop_rules, search_mc_cfg, cfg.fitness_metric,
+                    adaptive_risk,
                 )
                 fitness = apply_cost_stress_penalty(fitness, stressed_fitness, cfg.cost_stress_penalty_weight)
             return fitness, trade_count
 
         def full_df_fitness(genome: list) -> float:
             candidate_strategy = build(genome)
-            bt = run_backtest(df, candidate_strategy, risk)
+            bt = run_backtest(df, candidate_strategy, risk, adaptive_risk=adaptive_risk)
             if not bt.trades:
                 return float("-inf")
             pnls = [t.pnl for t in bt.trades]
@@ -414,6 +422,7 @@ def run_walkforward_aware_refinement(
                         asdict(risk), asdict(prop_rules), str(pool_tmp_dir),
                         asdict(search_mc_cfg), cfg.fitness_metric,
                         cfg.cost_stress_enabled, cfg.cost_stress_multiplier, cfg.cost_stress_penalty_weight,
+                        adaptive_risk,
                     ),
                     # Runs from a background thread in real usage (the
                     # desktop GUI's Full Pipeline / Walk-Forward-Aware GA

@@ -2285,6 +2285,26 @@ class MainWindow:
             "New to this? Start with MANUAL and a simple moving-average crossover — it's the fastest way to "
             "see the whole app work end to end before bringing in your own code."
         )
+
+        h3("The Strategy Library — saving, reusing, and tuning strategies")
+        body(
+            "Every Python/PineScript/MQL5 strategy you upload can be saved here, so it lives inside the "
+            "app/repo instead of only on your computer — you (or the Full Pipeline, Evolution Lab, etc.) "
+            "can load it back up any time without re-browsing to the original file."
+        )
+        bullet("REFRESH LIBRARY — reload the list (e.g. after dropping a file into the library folder by hand).")
+        bullet("VIEW CODE / CONFIG — read a saved strategy's actual source (or its manual-builder config) "
+               "without leaving this tab.")
+        bullet("VIEW DNA — a keyword-based breakdown of a strategy's own entry / exit / risk logic into "
+               "plain tags, so you can see at a glance what kind of strategy it actually is.")
+        bullet("FIND COMMON PATTERNS (ALL) — mines every saved strategy for genes (DNA tags) that show up "
+               "together often, surfacing patterns across your whole library rather than one file at a time.")
+        bullet("ADD SELECTED TO BATCH QUEUE, then RUN BATCH TEST or RUN FULL PIPELINE (BATCH) — test several "
+               "library strategies back-to-back, each getting its own separate report, instead of one at a time.")
+        bullet("OPTIMIZE SELECTED — runs Quick Optimize: auto-tunes one strategy's parameters toward pass/"
+               "win-rate/payout targets using the same search engine as 06 Refinement, and saves the result "
+               "back into the library as a new draft — the original file is left untouched.")
+        bullet("OPEN LIBRARY FOLDER / EXPORT LIBRARY AS ZIP — for backing up or moving your library by hand.")
         rule()
 
         h2("STEP 3 — Enter your prop firm's rules (03 PROP RULES)")
@@ -2303,6 +2323,18 @@ class MainWindow:
         bullet("Initial balance, risk mode (percent of equity vs fixed), and risk per trade.")
         bullet("Spread/slippage/commission — leave at realistic defaults unless your broker publishes different numbers.")
         tip("Not sure what to put here? The defaults are sane starting points — you can always come back and tune them.")
+
+        h3("Adaptive Risk (optional) — graduated, limit-aware position sizing")
+        body(
+            "Instead of one fixed risk-per-trade for the whole account life, Adaptive Risk throttles position "
+            "size down as the account gets closer to its own drawdown limit (and can lock in profit once "
+            "ahead), the way a careful trader manages size manually near their firm's hard limits."
+        )
+        bullet("Add rules by hand (a drawdown_pct trigger + a smaller risk to switch to), or click the "
+               "one-click preset button to auto-build a sensible graduated throttle straight off whatever "
+               "Prop Rules are already entered on Step 3.")
+        bullet("Available everywhere a strategy actually runs: 05 Run & Report, 15 Full Pipeline, "
+               "06 Refinement, Quick Optimize, and Evolution Lab all have their own enable checkbox for it.")
         rule()
 
         h2("STEP 5 — Run a single backtest (05 RUN & REPORT)")
@@ -2318,23 +2350,154 @@ class MainWindow:
             "(Step 9 in this guide) automatically searches for a better configuration and validates it out-"
             "of-sample before giving you a verdict. For a first pass, most people skip straight to Step 9."
         )
+        body("A few things this report checks automatically, every single run:")
+        bullet("Lookahead check — re-runs the strategy on data cut off right after a sample of its own real "
+               "signal bars and confirms the signals don't change; a strategy that's secretly peeking at "
+               "future data would fail this and get flagged in the run log.")
+        bullet("Cost-ladder section — re-prices the exact same trades at several extra levels of trading cost "
+               "(0%, 0.05%, 0.10%, 0.25% added friction) so you can see how fragile the edge is to slippage.")
+        bullet("Holdout comparison — a chronological 80/20 in-sample/holdout split with no re-tuning on the "
+               "holdout portion, so you get an early read on overfitting without running a full Walk-Forward.")
+        warn(
+            "Watch for pip_scale_mismatch / gap_loss warnings in the run log — they mean the pip size doesn't "
+            "match this instrument's actual price scale (a common issue testing an FX-tuned strategy against "
+            "gold or a stock), which can produce wildly wrong P&L numbers if ignored."
+        )
         rule()
 
-        h2("STEPS 6-8, 10-14 — optional deeper validation tools")
+        h2("PAYOUT PROBABILITY — full-lifecycle survival simulator")
         body(
-            "Everything between here and the Full Pipeline tab is optional and can be safely skipped on a "
-            "first pass through the app:"
+            "Goes beyond a single eval-pass number: simulates thousands of complete account lifecycles "
+            "(Start -> Evaluation -> Funded -> Payout #1 -> Payout #2 -> ... -> Reset/Continue) and reports "
+            "the funnel — how many simulated accounts actually made it through EACH stage, not just whether "
+            "they passed the eval. Uses whatever strategy, data, prop rules, and risk are set on Steps 1-4."
         )
-        bullet("06 REFINEMENT / 13 WALK-FORWARD GA — automatically search for better parameter values.")
-        bullet("07 SEARCH LAB — generate and test many strategy variants at once.")
-        bullet("08 WALK-FORWARD OPT / 09 CPCV-PBO / 10 SENSITIVITY / 12 MULTI-OBJECTIVE — deeper robustness "
-               "checks quants use to catch overfitting.")
-        bullet("11 PORTFOLIO — backtest several strategies/instruments together as one portfolio.")
-        bullet("14 ENSEMBLE — combine several strategies' signals into one.")
+        rule()
+
+        h2("STEP 6 — Iterative Refinement (06 Refinement, optional)")
+        body(
+            "A genetic-algorithm-style parameter search: re-runs your strategy many times with mutated "
+            "parameters on the SAME historical data, keeps the best-performing configurations each round, "
+            "and converges toward the best-scoring configuration it can find. Produces its own separate "
+            "report — your normal 05 Run & Report result is never touched unless you apply the winner back."
+        )
+        tip("Found a good configuration? Use APPLY BEST CONFIG TO STRATEGY TAB to carry it straight back to "
+            "02 Strategy without retyping any parameter by hand.")
+        rule()
+
+        h2("STEP 7 — Search Lab (07 Search Lab, optional)")
+        body(
+            "Generates and tests many strategy variations at once instead of one at a time: a fast filter "
+            "narrows thousands of candidates down to a shortlist, the same Iterative Refinement engine tunes "
+            "each shortlisted candidate, and a strict validation gate (walk-forward, lookahead check, "
+            "parameter-neighborhood robustness, a deflated Sharpe ratio that corrects for how many candidates "
+            "were tried) decides what actually survives."
+        )
         tip(
-            "These are all genuinely useful once you have a strategy worth digging into further — just not "
-            "required to get your first result. The 15 FULL PIPELINE tab below already runs a solid, "
-            "automated version of parameter search and out-of-sample validation on its own."
+            "Run a search here first, then check the Family Diversity tab (under FINDING AN EDGE below) to "
+            "see which whole hypothesis families — trend, breakout, mean reversion, liquidity sweep, and so "
+            "on — actually held up, not just which single candidate scored highest."
+        )
+        rule()
+
+        h1("VALIDATION LAB (steps 08-13, plus Regime Survival Matrix) — optional deeper robustness checks")
+        body(
+            "Everything in this group is optional and can be safely skipped on a first pass — the 15 Full "
+            "Pipeline tab below already runs a solid, automated version of search and out-of-sample "
+            "validation on its own. Come back here once you have a strategy worth digging into further."
+        )
+        h2("08 — Walk-Forward Optimization")
+        body(
+            "Re-optimizes the strategy fresh on each rolling or anchored fold's training window using a "
+            "small GA search, applies the winning configuration UNCHANGED to that fold's held-out test "
+            "window, and chains every fold's out-of-sample trades into one continuous equity curve — trust "
+            "this number over a single in-sample backtest."
+        )
+        h2("09 — CPCV / PBO")
+        body(
+            "Combinatorial Purged Cross-Validation stress-tests the strategy across many different "
+            "combinatorial train/test partitions of the same data, instead of one holdout split. Probability "
+            "of Backtest Overfitting (PBO) checks a small pool of candidates (this strategy plus a few "
+            "automatically perturbed variants) and reports the odds that whichever looks best in-sample is "
+            "really just noise."
+        )
+        h2("10 — Parameter Sensitivity")
+        body(
+            "Sweeps every tunable numeric parameter across +/- a percentage of its current value, holding "
+            "everything else fixed, and flags a 'cliff' wherever the metric drops sharply between adjacent "
+            "steps — the sign of a knife-edge parameter rather than a real, stable plateau. Can also produce "
+            "a 2D heatmap for a chosen pair of parameters, since two can interact even when each looks fine alone."
+        )
+        h2("11 — Multi-Asset Portfolio")
+        body(
+            "Applies the strategy configured on Step 2 to every instrument you list, computes the "
+            "correlation matrix of their daily returns, re-weights each instrument's risk (correlated "
+            "instruments get sized down), and merges every instrument's trades into one shared account "
+            "equity curve — including its own Monte Carlo pass-probability on the combined account."
+        )
+        tip("ADD LEG FROM LIBRARY lets a portfolio combine genuinely different saved strategies, not just "
+            "one strategy run across several instruments.")
+        h2("12 — Multi-Objective Optimization")
+        body(
+            "Runs a real NSGA-II search across several objectives at once (e.g. Sharpe, max drawdown, "
+            "eval-pass probability) instead of collapsing them into one weighted score the way Iterative "
+            "Refinement's GA does. Produces a Pareto front — candidates where none is strictly worse than "
+            "any other on the front. Picking a final winner from that list is your call."
+        )
+        h2("13 — Walk-Forward-Aware GA")
+        body(
+            "The same crossover/mutation/tournament-selection GA as Iterative Refinement, but every "
+            "candidate's fitness is scored ONLY on chained out-of-sample fold data — never on the training "
+            "windows or the full dataset. A genome that only fits one historical stretch scores lower and "
+            "gets selected against, generation over generation."
+        )
+        h2("Regime Survival Matrix")
+        body(
+            "Classifies every bar on trend, volatility, session, and market environment, then attributes "
+            "THIS strategy's own trades to whichever regime was active at entry — so you can see exactly "
+            "which market conditions to gate the strategy off in, not just one aggregate backtest number."
+        )
+        rule()
+
+        h1("FINDING AN EDGE (14 Ensemble, Generate Strategies, Evolution Lab, Family Diversity)")
+        h2("14 — Multi-Strategy Ensemble")
+        body(
+            "The mirror case of Portfolio: several DIFFERENT strategies combined on the SAME instrument, "
+            "instead of one strategy across several instruments. Two modes: Blend keeps every strategy "
+            "trading independently at a correlation-adjusted share of the account's risk budget (reuses "
+            "Portfolio's own math); Vote combines every strategy's signal into one entry, taken only once "
+            "enough of them agree on direction."
+        )
+        h2("Generate Strategies (AI)")
+        body(
+            "Drafts a NEW strategy's source code from a plain-language idea, using a local Ollama model — "
+            "grounded in whatever papers you've dropped into the research/ folder and in your own best-"
+            "performing saved strategies of the same language, so it matches this app's actual code style "
+            "instead of guessing. Every strategy this produces is saved tagged DRAFT and has to earn its "
+            "way through the normal backtest -> validation ladder like anything else — nothing runs "
+            "automatically."
+        )
+        h2("Evolution Lab")
+        body(
+            "Natural-selection-based strategy discovery: each generation generates a fresh population of "
+            "strategies across every hypothesis family, runs them through pre-filter -> robustness -> "
+            "walk-forward -> Monte Carlo -> prop simulation -> real CPCV/PBO -> a stress test at higher "
+            "execution costs -> a correlation-based cluster dedupe, keeps the top performers by PROP FITNESS "
+            "(not raw profit), mutates them, and repeats."
+        )
+        numstep(1, "Set a population size, elite keep, max generations (blank = run until stopped), and the "
+                    "other run settings, then click START. It runs in the background — safe to leave running "
+                    "for hours while you work in other tabs.")
+        numstep(2, "Watch the leaderboard fill in as generations complete. Click a row for its detail (stats "
+                    "+ code) and PROMOTE TO STRATEGY LIBRARY once you find one worth keeping.")
+        tip("Every candidate evaluated (not just the winners) is logged, so later generations' journal "
+            "entries can say what's historically worked before, not just what this generation found.")
+        h2("Family Diversity")
+        body(
+            "Groups the most recent Search Lab run's candidates by hypothesis family (trend following, "
+            "breakout, mean reversion, liquidity sweep, momentum, VWAP, opening range, market structure, "
+            "volatility expansion/contraction, pullback, statistical arbitrage, relative strength, regime "
+            "switching) and ranks the FAMILIES themselves — run a search on 07 Search Lab first."
         )
         rule()
 
@@ -2426,18 +2589,48 @@ class MainWindow:
         )
         rule()
 
+        h1("AI RESEARCH — 18 Research Agent")
+        body(
+            "Ask a local Ollama model to investigate the strategy configured on Steps 01-04. It can call "
+            "run_backtest, run_prop_simulation, run_monte_carlo, run_walk_forward, run_regime_analysis, "
+            "run_parameter_sensitivity, run_cost_stress, compare_strategies, search_research (your research/ "
+            "paper library), and search_experiments (this app's own memory of every past strategy test) — "
+            "each one runs this app's real, already-validated engine, never a guess."
+        )
+        warn(
+            "The agent can only RECOMMEND a next step (e.g. a parameter worth testing) — it has no tool that "
+            "edits or applies code, so nothing it suggests ever takes effect until you act on it yourself "
+            "through 06 Refinement / Quick Optimize / 15 Full Pipeline."
+        )
+        bullet("One-time setup: install Ollama (ollama.com/download), enable it on this tab, and enter the "
+               "host/model — everything runs locally, nothing is sent to the cloud.")
+        bullet("EMBED RESEARCH LIBRARY — indexes whatever papers you've dropped into the research/ folder so "
+               "the agent (and Generate Strategies, on the FINDING AN EDGE tab) can search them by meaning, "
+               "not just keyword.")
+        bullet("VIEW LEADERBOARD — every strategy test recorded from 15 Full Pipeline, Quick Optimize, or a "
+               "Batch Test, ranked and diffed against its own parent configuration so you can see exactly "
+               "what changed between a KEEP and a DISCARD.")
+        bullet("RUN RESEARCH LOOP — a closed loop: hypothesis -> Ollama drafts a strategy -> backtest -> "
+               "Monte Carlo -> prop-survival check -> a real computed failure diagnosis if it doesn't hold "
+               "up -> Ollama refines the hypothesis -> repeat. Safe to leave running; it dedupes against "
+               "strategies with DNA it's already tried and failed.")
+        rule()
+
         # -------------------------------------------------------------
         # Short version recap
         # -------------------------------------------------------------
         h1("SHORT VERSION — RECAP")
         body("Once you've done the full walkthrough once, this is all you need to remember for next time:")
         numstep(1, "01 DATA → select or fetch your data.")
-        numstep(2, "02 STRATEGY → pick/build your strategy.")
+        numstep(2, "02 STRATEGY → pick/build your strategy (or load/optimize one from the Strategy Library).")
         numstep(3, "03 PROP RULES + 04 RISK → confirm these still match your firm/settings.")
         numstep(4, "15 FULL PIPELINE → RUN FULL PIPELINE → read the verdict.")
         numstep(5, "If READY and you want to see it trade live → LIVE TRADING → Live Demo Test (paper) or "
                     "Deploy Live (real capital, once you're confident).")
-        tip("That's the whole loop. Everything else in the sidebar is there for when you want to dig deeper.")
+        tip(
+            "That's the whole loop. VALIDATION LAB, FINDING AN EDGE, and AI RESEARCH in the sidebar are all "
+            "there for when you want to dig deeper — none of them are required to get your first result."
+        )
 
         text.config(state="disabled")
 
@@ -7875,7 +8068,7 @@ class MainWindow:
     # -> keep top N -> mutate -> repeat loop this tab drives.
     # ------------------------------------------------------------------
     def _build_evolution_lab_tab(self):
-        f = self.tab_evolution
+        f = self._scrollable(self.tab_evolution)
         Label(
             f, text="EVOLUTION LAB", bg=BG, fg=TEXT, font=_safe_font(16, "bold"),
         ).pack(anchor="w", padx=24, pady=(20, 4))
@@ -10526,20 +10719,31 @@ def _make_dpi_aware() -> None:
 
 
 def _apply_tk_scaling(root: Tk) -> None:
-    """Make Tk's own font/widget scaling match the real screen DPI.
+    """Pin Tk's font/widget scaling to the app's original 96-DPI design,
+    regardless of the monitor's real DPI.
 
-    _make_dpi_aware() stops Windows from stretching the window bitmap,
-    but Tk separately needs to be told the true pixels-per-inch so its
-    "point"-sized fonts and padding come out the right *physical* size
-    on a high-DPI screen instead of tiny. Tk's scaling factor is
-    (DPI / 72); 96 DPI (100% scaling) is Tk's own built-in default of
-    1.333, so this is a no-op there and only corrects higher-DPI
-    displays.
+    This app was built almost entirely with literal-pixel geometry --
+    fixed Frame/Canvas widths, wraplength=, hand-drawn glow charts at
+    fixed pixel coordinates, fixed-size PhotoImage icons -- alongside
+    point-sized fonts. Those two things only line up correctly at the
+    96-DPI scaling Tk defaults to (1.333 = 96/72).
+
+    An earlier version of this function matched Tk's scaling to the
+    *real* screen DPI instead (the standard high-DPI fix for apps built
+    with DPI-relative layouts). Once _make_dpi_aware() below stops
+    Windows from lying about the screen's DPI, that made Tk report a
+    correct but *higher* DPI on any scaled display (125%/150%/etc.) --
+    so every point-sized font rendered bigger while the literal-pixel
+    containers around it stayed the same fixed pixel count, and text
+    started overflowing/getting clipped throughout the app. Forcing the
+    fixed 1.333 baseline here instead keeps fonts and hardcoded pixel
+    geometry in the same proportion the app was actually designed and
+    tested at, on any monitor. Combined with DPI-awareness (which stops
+    the OS from bitmap-stretching the whole window), this renders the
+    app at its original, decent-sized layout, crisply, everywhere.
     """
     try:
-        dpi = root.winfo_fpixels("1i")
-        if dpi > 0:
-            root.tk.call("tk", "scaling", dpi / 72.0)
+        root.tk.call("tk", "scaling", 96.0 / 72.0)
     except Exception:
         pass
 

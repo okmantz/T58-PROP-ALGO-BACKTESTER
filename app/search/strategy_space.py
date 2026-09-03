@@ -828,6 +828,490 @@ _MARKET_STRUCTURE_SHIFT = SkeletonSpec(
 )
 
 
+# ---------------------------------------------------------------------------
+# Family K: Previous-Day Range Breakout
+#   A daily-structural breakout: yesterday's high/low, not an intraday
+#   N-bar Donchian window (Family A) or a volatility-gated one (Family D).
+#   A classic "prior day's high/low" level trade -- genuinely different
+#   TIMEFRAME of structure than any of the intraday-lookback families.
+# ---------------------------------------------------------------------------
+
+def _build_prev_day_range_breakout(p: dict) -> dict:
+    max_bars = p["max_bars"]
+    return {
+        "name": "Previous-Day Range Breakout",
+        "entry_conditions": {
+            "long": [_cond(_ind("close", 1), "cross above", {"type": "previous_day_high"})],
+            "short": [_cond(_ind("close", 1), "cross below", {"type": "previous_day_low"})],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+    }
+
+
+_PREV_DAY_RANGE_BREAKOUT = SkeletonSpec(
+    name="prev_day_range_breakout",
+    label="Previous-Day Range Breakout (yesterday's high/low)",
+    description=(
+        "Enters the moment price crosses above yesterday's high or below yesterday's low -- a "
+        "daily-STRUCTURE breakout, distinct in timeframe from every intraday N-bar lookback "
+        "family here (A, D). Classic prior-session-level trade, no trend or volatility filter."
+    ),
+    param_grid={
+        "stop_atr_mult": [1.0, 1.5, 2.0],
+        "target_atr_mult": [1.5, 2.5, 3.5],
+        "max_bars": [None, 48, 96],
+    },
+    build=_build_prev_day_range_breakout,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family L: MACD Crossover Trend
+#   The MACD line crossing its own signal line, filtered by a slower EMA
+#   trend so the crossover is only taken with the prevailing trend --
+#   distinct from Family H (which reads MACD histogram SIGN as a momentum
+#   confirmation alongside RSI extremity, not a crossover EVENT) and from
+#   Family B (RSI dip/pop pullback, no MACD at all).
+# ---------------------------------------------------------------------------
+
+def _build_macd_cross_trend(p: dict) -> dict:
+    ema_trend = p["ema_trend"]
+    return {
+        "name": f"MACD Cross Trend (ema{ema_trend} filter)",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "macd"}, "cross above", {"type": "macd_signal"}),
+                _cond(_ind("close", 1), ">", _ind("ema", ema_trend)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond({"type": "macd"}, "cross below", {"type": "macd_signal"}),
+                _cond(_ind("close", 1), "<", _ind("ema", ema_trend)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond({"type": "macd"}, "cross below", {"type": "macd_signal"})],
+            "short": [_cond({"type": "macd"}, "cross above", {"type": "macd_signal"})],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_MACD_CROSS_TREND = SkeletonSpec(
+    name="macd_cross_trend",
+    label="MACD Crossover Trend (MACD/signal cross + EMA filter)",
+    description=(
+        "Trades the MACD line crossing its own signal line, only in the direction of a slower "
+        "EMA trend filter, exiting on the opposite crossover. A crossover-EVENT momentum "
+        "hypothesis, distinct from Family H's histogram-SIGN confirmation approach."
+    ),
+    param_grid={
+        "ema_trend": [50, 100, 200],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_macd_cross_trend,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family M: Swing Structure Fade
+#   Fades price AT a just-confirmed swing high/low -- buy the swing low,
+#   sell the swing high -- a contrarian, structure-anchored reversal
+#   distinct from every band/VWAP-based reversion family (C, I): the
+#   reference point here is a confirmed price PIVOT, not a statistical
+#   envelope, and distinct from Family J's CHoCH (which requires a prior
+#   OPPOSING structure break, not just any confirmed pivot).
+# ---------------------------------------------------------------------------
+
+def _build_swing_structure_fade(p: dict) -> dict:
+    lookback = p["lookback"]
+    return {
+        "name": f"Swing Structure Fade (lookback={lookback})",
+        "entry_conditions": {
+            "long": [_cond({"type": "swing_low", "lookback": lookback}, "is true", _val(1))],
+            "short": [_cond({"type": "swing_high", "lookback": lookback}, "is true", _val(1))],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_SWING_STRUCTURE_FADE = SkeletonSpec(
+    name="swing_structure_fade",
+    label="Swing Structure Fade (buy confirmed swing lows, sell swing highs)",
+    description=(
+        "A contrarian pivot-fade: buys a just-CONFIRMED swing low, sells a just-confirmed swing "
+        "high, no trend or band filter. The reference point is a real, non-lookahead-confirmed "
+        "price pivot rather than a statistical band (C) or VWAP (I) -- a genuinely different "
+        "reversal mechanism from either."
+    ),
+    param_grid={
+        "lookback": [5, 10, 15],
+        "stop_atr_mult": [0.75, 1.0, 1.5],
+        "target_atr_mult": [1.5, 2.0, 3.0],
+        "max_bars": [None, 24, 48],
+    },
+    build=_build_swing_structure_fade,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family N: Fair Value Gap Imbalance Continuation
+#   Enters in the direction of a freshly-printed Fair Value Gap (a 3-candle
+#   price imbalance / displacement), filtered by a slower EMA trend --
+#   betting that a genuine displacement candle continues, not that price
+#   returns to "fill" the gap. NOTE on scope: the visual-builder DSL only
+#   exposes the FVG as a point-in-time boolean event, not a persisting
+#   price zone/level, so a "wait for price to return and fill the gap"
+#   version of this hypothesis isn't representable here -- this family is
+#   honestly scoped to the continuation reading only, the same kind of
+#   explicit scope note Family G (stat_pairs) already gives for its own
+#   single-leg limitation.
+# ---------------------------------------------------------------------------
+
+def _build_fvg_imbalance_continuation(p: dict) -> dict:
+    ema_trend = p["ema_trend"]
+    return {
+        "name": f"FVG Imbalance Continuation (ema{ema_trend} filter)",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "fair_value_gap", "direction": "bullish"}, "is true", _val(1)),
+                _cond(_ind("close", 1), ">", _ind("ema", ema_trend)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond({"type": "fair_value_gap", "direction": "bearish"}, "is true", _val(1)),
+                _cond(_ind("close", 1), "<", _ind("ema", ema_trend)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_FVG_IMBALANCE_CONTINUATION = SkeletonSpec(
+    name="fvg_imbalance_continuation",
+    label="Fair Value Gap Imbalance Continuation (displacement + EMA filter)",
+    description=(
+        "Enters in the direction of a freshly-printed Fair Value Gap (3-candle price imbalance), "
+        "filtered by a slower EMA trend -- bets the displacement continues. SCOPE NOTE: the FVG "
+        "primitive here is a point-in-time event, not a persisting zone, so this is honestly the "
+        "continuation reading of the hypothesis, not a 'wait for the gap to fill' reversion read."
+    ),
+    param_grid={
+        "ema_trend": [50, 100],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.5],
+        "max_bars": [None, 24, 48],
+    },
+    build=_build_fvg_imbalance_continuation,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family O: Order Block Reaction
+#   Enters immediately on the deterministic order-block proxy already
+#   implemented in app.strategy.manual._advanced_boolean (the last opposite
+#   candle right before a displacement candle) -- an SMC-style structural
+#   continuation trade distinct from every other family here, giving the
+#   "order_block" DNA gene (app.strategy.dna) its own dedicated,
+#   independently-searchable hypothesis the same way Family G already does
+#   for "liquidity_sweep" and Family J does for CHoCH. SCOPE NOTE: same
+#   point-in-time-event limitation as Family N -- no persisting zone/retest
+#   is modeled, this is the immediate-reaction reading.
+# ---------------------------------------------------------------------------
+
+def _build_order_block_reaction(p: dict) -> dict:
+    lookback = p["lookback"]
+    return {
+        "name": f"Order Block Reaction (lookback={lookback})",
+        "entry_conditions": {
+            "long": [_cond({"type": "order_block", "lookback": lookback, "direction": "bullish"}, "is true", _val(1))],
+            "short": [_cond({"type": "order_block", "lookback": lookback, "direction": "bearish"}, "is true", _val(1))],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_ORDER_BLOCK_REACTION = SkeletonSpec(
+    name="order_block_reaction",
+    label="Order Block Reaction (SMC displacement-origin candle)",
+    description=(
+        "Enters on the deterministic order-block proxy: the last opposite candle immediately "
+        "preceding a displacement move. Gives the 'order_block' DNA gene its own dedicated, "
+        "independently-searchable hypothesis rather than only ever appearing as one ingredient "
+        "inside a hand-built discretionary strategy. SCOPE NOTE: an immediate-reaction reading, "
+        "not a 'wait for price to retest the zone' version -- see Family N's same caveat."
+    ),
+    param_grid={
+        "lookback": [10, 20, 30],
+        "stop_atr_mult": [0.75, 1.0, 1.5],
+        "target_atr_mult": [1.5, 2.0, 3.0],
+        "max_bars": [None, 24, 48],
+    },
+    build=_build_order_block_reaction,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family P: Volatility Contraction Squeeze Breakout
+#   The mirror-image bet of Family D: instead of requiring volatility to
+#   already be EXPANDING at the breakout bar, this requires it to still be
+#   CONTRACTED (a "squeeze") relative to its own baseline -- catching a
+#   breakout AS the regime is turning, not after it has already turned.
+#   Expect a much lower trade count than Family D by construction (most
+#   real squeezes resolve into an expansion bar, which then no longer
+#   reads as contracted) -- Stage 1's cheap filter will simply drop this
+#   family if it's too rare on a given dataset, same as every other
+#   thin-signal family here.
+# ---------------------------------------------------------------------------
+
+def _build_volatility_contraction_squeeze(p: dict) -> dict:
+    lookback, atr_period, contraction_mult = p["lookback"], p["atr_period"], p["contraction_mult"]
+    return {
+        "name": f"Volatility Squeeze Breakout (lb={lookback}, atr{atr_period} x{contraction_mult} contraction)",
+        "entry_conditions": {
+            "long": [
+                _cond(_breakout_flag(lookback, "bullish"), "is true", _val(1)),
+                _cond({"type": "atr_regime", "period": atr_period, "contraction_mult": contraction_mult}, "==", _val(-1)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_breakout_flag(lookback, "bearish"), "is true", _val(1)),
+                _cond({"type": "atr_regime", "period": atr_period, "contraction_mult": contraction_mult}, "==", _val(-1)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p.get("max_bars")),
+    }
+
+
+_VOLATILITY_CONTRACTION_SQUEEZE = SkeletonSpec(
+    name="volatility_contraction_squeeze",
+    label="Volatility Squeeze Breakout (Donchian + ATR contraction filter)",
+    description=(
+        "The mirror image of Family D: an N-bar breakout taken only while ATR is STILL running "
+        "materially below its own recent baseline (a squeeze), catching a breakout as the "
+        "volatility regime turns rather than after it already has. Expect materially fewer "
+        "trades than Family D by construction -- that's the hypothesis being tested, not a bug."
+    ),
+    param_grid={
+        "lookback": [10, 20, 40],
+        "atr_period": [14, 20],
+        "contraction_mult": [0.75, 0.85],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_volatility_contraction_squeeze,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family Q: Overnight / Session-Open Gap Fade
+#   Fades the gap between the current session-open price and the PRIOR
+#   day's close, only within a short session-open window -- a classic gap-
+#   fade mean-reversion, anchored to the previous close rather than a
+#   Bollinger band (C) or VWAP (I), and gated by clock time rather than by
+#   any price or volatility state (E's session family is an opening-range
+#   BREAKOUT, the opposite direction bet, at the same kind of session
+#   anchor).
+# ---------------------------------------------------------------------------
+
+def _build_overnight_gap_fade(p: dict) -> dict:
+    start, end = p["session_start"], p["session_end"]
+    return {
+        "name": f"Overnight Gap Fade ({start}-{end} vs prior close)",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("close", 1), "<", {"type": "previous_day_close"}),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("close", 1), ">", {"type": "previous_day_close"}),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("close", 1), ">", {"type": "previous_day_close"})],
+            "short": [_cond(_ind("close", 1), "<", {"type": "previous_day_close"})],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+        "_time_based_exit": p["flat_time"],
+    }
+
+
+_OVERNIGHT_GAP_FADE = SkeletonSpec(
+    name="overnight_gap_fade",
+    label="Overnight / Session-Open Gap Fade (fade toward prior close)",
+    description=(
+        "Within a short session-open window, fades whichever side of the prior day's close price "
+        "opened on, targeting a reversion back to that prior close, force-flattened by a clock "
+        "time. Anchored to yesterday's CLOSE (not a band or VWAP), and a fade rather than E's "
+        "opening-range BREAKOUT at the same kind of session anchor -- opposite direction bet."
+    ),
+    param_grid={
+        "session_start": ["08:30", "13:30"],
+        "session_end": ["09:00", "14:00"],
+        "flat_time": ["16:00"],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.0],
+        "max_bars": [12, 24],
+    },
+    build=lambda p: _apply_time_based_exit(_build_overnight_gap_fade(p)),
+    valid=lambda p: p["session_start"] < p["session_end"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Family R: WMA Ribbon Trend Alignment
+# ---------------------------------------------------------------------------
+
+def _build_wma_ribbon_trend(p: dict) -> dict:
+    fast, mid, slow = p["wma_fast"], p["wma_mid"], p["wma_slow"]
+    return {
+        "name": f"WMA Ribbon Trend (wma {fast}/{mid}/{slow})",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("wma", fast), "cross above", _ind("wma", mid)),
+                _cond(_ind("wma", mid), ">", _ind("wma", slow)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_ind("wma", fast), "cross below", _ind("wma", mid)),
+                _cond(_ind("wma", mid), "<", _ind("wma", slow)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("wma", fast), "cross below", _ind("wma", mid))],
+            "short": [_cond(_ind("wma", fast), "cross above", _ind("wma", mid))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_WMA_RIBBON_TREND = SkeletonSpec(
+    name="wma_ribbon_trend",
+    label="WMA Ribbon Trend (3-MA stacked alignment, WMA)",
+    description=(
+        "Enters when a fast WMA crosses its own mid WMA WHILE the mid WMA already leads the slow "
+        "WMA (a 3-MA stack aligning), exiting on the fast/mid cross reversing. Uses Weighted "
+        "Moving Averages, not used by any EMA-based family here (A, B) -- a distinct smoothing "
+        "characteristic (WMA reacts faster to recent bars than EMA at the same period)."
+    ),
+    param_grid={
+        "wma_fast": [10, 20],
+        "wma_mid": [30, 50],
+        "wma_slow": [100, 150],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_wma_ribbon_trend,
+    valid=lambda p: p["wma_fast"] < p["wma_mid"] < p["wma_slow"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Family S: Percentage-Change Momentum Burst
+#   Trades a raw N-bar percentage-change ignition once it clears a
+#   threshold -- a pure rate-of-change momentum-ignition hypothesis, using
+#   neither RSI nor MACD (H, L) nor a price-structure breakout (A, D, K).
+# ---------------------------------------------------------------------------
+
+def _build_pct_change_momentum_burst(p: dict) -> dict:
+    period, threshold = p["period"], p["threshold_pct"]
+    return {
+        "name": f"Pct-Change Momentum Burst (period={period}, thresh={threshold}%)",
+        "entry_conditions": {
+            "long": [_cond({"type": "percentage_change", "period": period}, ">", _val(threshold))],
+            "short": [_cond({"type": "percentage_change", "period": period}, "<", _val(-threshold))],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_PCT_CHANGE_MOMENTUM_BURST = SkeletonSpec(
+    name="pct_change_momentum_burst",
+    label="Percentage-Change Momentum Burst (raw rate-of-change ignition)",
+    description=(
+        "Enters the instant an N-bar percentage price change clears a threshold in either "
+        "direction -- a pure raw rate-of-change ignition hypothesis, using neither RSI/MACD (the "
+        "momentum-continuation families) nor a price-structure breakout (the Donchian families). "
+        "Simplest possible momentum-ignition bet, included as a baseline the other, more elaborate "
+        "momentum families should be able to beat."
+    ),
+    param_grid={
+        "period": [5, 10, 20],
+        "threshold_pct": [0.5, 1.0, 1.5],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.5],
+        "max_bars": [None, 24],
+    },
+    build=_build_pct_change_momentum_burst,
+)
+
+
+# ---------------------------------------------------------------------------
+# Family T: Pure RSI Extreme Reversion
+#   Fades RSI extremity alone, with NO band/channel filter at all -- the
+#   simplest possible mean-reversion hypothesis, included as a baseline
+#   Family C's (Bollinger + RSI) more elaborate version should be able to
+#   beat. Distinct from every other RSI-using family here: B uses RSI as
+#   a PULLBACK-within-trend filter, H uses RSI as a momentum-persistence
+#   confirmation -- this is the only family that trades RSI extremity on
+#   its own, as a standalone reversal signal.
+# ---------------------------------------------------------------------------
+
+def _build_rsi_extreme_reversion(p: dict) -> dict:
+    rsi_period, oversold = p["rsi_period"], p["oversold"]
+    overbought = 100 - oversold
+    return {
+        "name": f"Pure RSI Extreme Reversion (rsi{rsi_period}, {oversold}/{overbought})",
+        "entry_conditions": {
+            "long": [_cond(_ind("rsi", rsi_period), "<", _val(oversold))],
+            "short": [_cond(_ind("rsi", rsi_period), ">", _val(overbought))],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("rsi", rsi_period), ">", _val(50))],
+            "short": [_cond(_ind("rsi", rsi_period), "<", _val(50))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_RSI_EXTREME_REVERSION = SkeletonSpec(
+    name="rsi_extreme_reversion",
+    label="Pure RSI Extreme Reversion (RSI alone, no band/channel filter)",
+    description=(
+        "Fades RSI extremity alone -- no Bollinger band (C), no channel, no trend filter -- "
+        "exiting back at RSI 50. The simplest possible mean-reversion hypothesis, included as a "
+        "baseline Family C's more elaborate dual Bollinger+RSI gate should be able to beat. The "
+        "only family here trading RSI extremity as a standalone reversal signal rather than a "
+        "pullback filter (B) or a momentum confirmation (H)."
+    ),
+    param_grid={
+        "rsi_period": [7, 14, 21],
+        "oversold": [20, 25, 30],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.0],
+        "max_bars": [None, 24, 48],
+    },
+    build=_build_rsi_extreme_reversion,
+)
+
+
 FAMILIES: dict[str, SkeletonSpec] = {
     _TREND_BREAKOUT.name: _TREND_BREAKOUT,
     _MTF_PULLBACK.name: _MTF_PULLBACK,
@@ -840,6 +1324,23 @@ FAMILIES: dict[str, SkeletonSpec] = {
     _MOMENTUM_CONTINUATION.name: _MOMENTUM_CONTINUATION,
     _VWAP_REVERSION.name: _VWAP_REVERSION,
     _MARKET_STRUCTURE_SHIFT.name: _MARKET_STRUCTURE_SHIFT,
+    # -- Expansion round: 10 new families spanning daily-structure breakout,
+    # crossover-event momentum, pivot-fade reversal, SMC imbalance/order-flow
+    # continuation, volatility-contraction (squeeze) breakout, session-anchored
+    # gap fade, an alternate MA-smoothing trend style, raw rate-of-change
+    # ignition, and a standalone RSI-extremity reversion -- see each
+    # SkeletonSpec's own comment block above for what makes it a genuinely
+    # distinct hypothesis rather than a reparametrization of an existing one.
+    _PREV_DAY_RANGE_BREAKOUT.name: _PREV_DAY_RANGE_BREAKOUT,
+    _MACD_CROSS_TREND.name: _MACD_CROSS_TREND,
+    _SWING_STRUCTURE_FADE.name: _SWING_STRUCTURE_FADE,
+    _FVG_IMBALANCE_CONTINUATION.name: _FVG_IMBALANCE_CONTINUATION,
+    _ORDER_BLOCK_REACTION.name: _ORDER_BLOCK_REACTION,
+    _VOLATILITY_CONTRACTION_SQUEEZE.name: _VOLATILITY_CONTRACTION_SQUEEZE,
+    _OVERNIGHT_GAP_FADE.name: _OVERNIGHT_GAP_FADE,
+    _WMA_RIBBON_TREND.name: _WMA_RIBBON_TREND,
+    _PCT_CHANGE_MOMENTUM_BURST.name: _PCT_CHANGE_MOMENTUM_BURST,
+    _RSI_EXTREME_REVERSION.name: _RSI_EXTREME_REVERSION,
 }
 
 # Families that need something beyond the plain OHLCV df -- checked by

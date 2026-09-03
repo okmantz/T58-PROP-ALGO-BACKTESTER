@@ -1,18 +1,22 @@
-// NOTE (2026-08-31 rescale): the SL/TP pip values below were originally sized for FX pairs
-// (pip_size 0.0001) and produced near-instant catastrophic stop-outs when run against gold-scaled
-// (XAUUSD, pip_size ~0.01) data -- a 20-40 "pip" stop is $0.002-0.004 at FX scale but only
-// $0.20-0.40 at gold scale, nowhere near gold's typical per-bar ATR, so almost every entry was
-// stopped out by normal noise on the very next bar. Values below are rescaled ~25x for gold-scale
-// instruments. Before running this strategy: click "detect pip size from data" on the Data tab
-// so pip_size actually reflects the loaded instrument -- these numbers assume pip_size ~0.01
-// (2-decimal gold-style quoting), NOT the FX default of 0.0001. If you load an FX pair instead,
-// use the original (much smaller) pip counts.
+// NOTE (2026-09-03 switched to ATR-mult stops): the fixed-pip SL/TP this file used to carry
+// went through a manual "~25x for gold" rescale and STILL blew the account on a real GC1! 1-min
+// run: the guess assumed pip_size ~0.01, but that run was actually configured with pip_size=1.0,
+// so the 550/1250 "pip" SL/TP resolved to a $550/$1250 stop/target on an instrument trading in
+// the low thousands -- a 20%+ per-trade risk that triggered the account-survivability floor
+// almost immediately (see the Full Pipeline batch log, "Account BLOWN" + "fixed-pips stop ...
+// implausible fraction of price" warnings). A fixed pip/point count is fundamentally fragile:
+// it's only ever correct for the one pip_size/instrument it was tuned at. Switched to
+// T58_SL_ATR_MULT/T58_TP_ATR_MULT below instead -- these compute the stop/target as a multiple
+// of the instrument's OWN actual ATR at backtest time, in raw price units, so they're correct on
+// gold, an FX pair, an index, or crypto without ever touching pip_size at all. See
+// app/strategy/mql5.py's module docstring for how these are parsed.
 // T58 PROP STRATEGY 03 — Momentum Regime
 // Designed to participate only when trend and momentum agree.
 // Uses only constructs supported by the T58 MQL5 parser.
 //
-// T58_SL_PIPS=550
-// T58_TP_PIPS=1250
+// T58_SL_ATR_MULT=1.5
+// T58_TP_ATR_MULT=3.0
+// T58_ATR_PERIOD=14
 
 double fastMA = iMA(_Symbol, PERIOD_CURRENT, 10, 0, MODE_EMA, PRICE_CLOSE);
 double midMA = iMA(_Symbol, PERIOD_CURRENT, 30, 0, MODE_EMA, PRICE_CLOSE);

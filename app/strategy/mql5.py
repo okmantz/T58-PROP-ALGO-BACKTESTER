@@ -32,6 +32,19 @@ Supported subset
   supplied the same explicit way as the PineScript adapter):
     // T58_SL_PIPS=20
     // T58_TP_PIPS=40
+  OR, an instrument-scale-independent alternative (PREFERRED for any
+  instrument that isn't FX -- gold, indices, crypto, stocks -- since a
+  fixed point/pip count is only ever correct for the one instrument scale
+  it was tuned at; see strategies/mql5/momentum_regime.mq5's own history
+  of exactly this failure mode against gold-scale data):
+    // T58_SL_ATR_MULT=1.5
+    // T58_TP_ATR_MULT=3.0
+    // T58_ATR_PERIOD=14        (optional, defaults to 14)
+  ATR-mult directives compute a per-bar stop/target distance in raw price
+  units (StrategyResult.stop_loss_distance/take_profit_distance), which
+  the backtest engine already treats as taking precedence over the fixed
+  pip fields -- see app/strategy/base.py's StrategyResult docstring. If
+  both are present in the same file, the ATR-mult ones win.
 
 Not supported (raises StrategyError): CopyBuffer()-based indicator handles,
 custom indicators, arrays/structs, multi-symbol/multi-timeframe logic,
@@ -46,7 +59,7 @@ import pandas as pd
 
 from app.strategy.base import Strategy, StrategyError, StrategyResult, signals_from_conditions
 from app.strategy.expr import safe_eval_bool, safe_eval_numeric
-from app.strategy.indicators import ema, sma
+from app.strategy.indicators import atr, ema, sma
 
 _COMMENT_RE = re.compile(r"//.*$")
 _ASSIGN_RE = re.compile(r"^\s*(?:double|int|bool)?\s*([A-Za-z_]\w*)\s*=\s*(.+?);\s*$")
@@ -59,6 +72,9 @@ _SELL_RE = re.compile(r"trade\.Sell\s*\(|OrderSend\s*\([^)]*(?:ORDER_TYPE_SELL|O
 _CLOSE_RE = re.compile(r"trade\.PositionClose\s*\(|OrderClose\s*\(")
 _SL_DIRECTIVE_RE = re.compile(r"T58_SL_PIPS\s*=\s*([\d.]+)")
 _TP_DIRECTIVE_RE = re.compile(r"T58_TP_PIPS\s*=\s*([\d.]+)")
+_SL_ATR_DIRECTIVE_RE = re.compile(r"T58_SL_ATR_MULT\s*=\s*([\d.]+)")
+_TP_ATR_DIRECTIVE_RE = re.compile(r"T58_TP_ATR_MULT\s*=\s*([\d.]+)")
+_ATR_PERIOD_DIRECTIVE_RE = re.compile(r"T58_ATR_PERIOD\s*=\s*(\d+)")
 
 _MODE_TO_FUNC = {"MODE_SMA": sma, "MODE_EMA": ema, "MODE_LWMA": None}  # LWMA falls back to sma with a note
 
@@ -95,6 +111,9 @@ class MQL5Strategy(Strategy):
         work = df.copy()
         stop_loss_pips: float | None = None
         take_profit_pips: float | None = None
+        sl_atr_mult: float | None = None
+        tp_atr_mult: float | None = None
+        atr_period = 14
 
         long_conditions: list[str] = []
         short_conditions: list[str] = []
@@ -126,6 +145,15 @@ class MQL5Strategy(Strategy):
             tp_match = _TP_DIRECTIVE_RE.search(raw_line)
             if tp_match:
                 take_profit_pips = float(tp_match.group(1))
+            sl_atr_match = _SL_ATR_DIRECTIVE_RE.search(raw_line)
+            if sl_atr_match:
+                sl_atr_mult = float(sl_atr_match.group(1))
+            tp_atr_match = _TP_ATR_DIRECTIVE_RE.search(raw_line)
+            if tp_atr_match:
+                tp_atr_mult = float(tp_atr_match.group(1))
+            atr_period_match = _ATR_PERIOD_DIRECTIVE_RE.search(raw_line)
+            if atr_period_match:
+                atr_period = int(atr_period_match.group(1))
 
             line = no_comment.strip()
             if not line:
@@ -193,6 +221,19 @@ class MQL5Strategy(Strategy):
                 if any(op in rhs for op in ("<", ">", "==", "!=", "&&", "||")):
                     work[var_name] = safe_eval_bool(work, _c_bool_to_python(rhs), var_name)
                     continue
+
+                # A bare numeric-literal initializer, e.g. `int tradesToday = 0;`
+                # or `double maxRiskPct = 1.5;` -- extremely common for local
+                # counter/state variables in real EAs (daily trade counters,
+                # loss counters, risk constants) that are never themselves an
+                # indicator or a boolean condition. Broadcasts the constant
+                # across every bar, same as PineScript's input.int/float
+                # handling already does for the equivalent Pine pattern.
+                try:
+                    work[var_name] = float(rhs.strip())
+                    continue
+                except ValueError:
+                    pass
 
                 # Plain arithmetic over previously-defined numeric variables,
                 # e.g. `trendStrengthPct = (emaFast - emaSlow) / emaSlow;`.
@@ -280,12 +321,28 @@ class MQL5Strategy(Strategy):
         raw_signals = signals_from_conditions(work.index, long_entry, exit_cond, short_entry, exit_cond)
         signals = self._validate_signals(raw_signals, df)
 
+        # ATR-mult directives (instrument-scale-independent) take precedence
+        # over fixed pip directives when both are present -- see the module
+        # docstring and app/strategy/base.py's StrategyResult docstring.
+        stop_loss_distance = None
+        take_profit_distance = None
+        if sl_atr_mult is not None or tp_atr_mult is not None:
+            atr_series = atr(df, atr_period)
+            if sl_atr_mult is not None:
+                stop_loss_distance = atr_series * sl_atr_mult
+                stop_loss_pips = None
+            if tp_atr_mult is not None:
+                take_profit_distance = atr_series * tp_atr_mult
+                take_profit_pips = None
+
         return StrategyResult(
             name="MQL5 Strategy",
             source_type=self.source_type,
             signals=signals,
             stop_loss_pips=stop_loss_pips,
             take_profit_pips=take_profit_pips,
+            stop_loss_distance=stop_loss_distance,
+            take_profit_distance=take_profit_distance,
         )
 
     def _combine(self, work: pd.DataFrame, condition_vars: list[str]) -> pd.Series:

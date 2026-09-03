@@ -30,6 +30,21 @@ Supported subset
   concept:
     // T58_SL_PIPS=20
     // T58_TP_PIPS=40
+  OR, an instrument-scale-independent alternative (PREFERRED for any
+  instrument that isn't FX -- gold, indices, crypto, stocks -- since a
+  fixed pip count is only ever correct for the one pip_size it was tuned
+  at; get pip_size wrong, or run the same script against a different
+  instrument later, and the stop/target silently becomes nonsensical --
+  see strategies/pinescript/trend_pullback.pine's own history of exactly
+  this failure mode):
+    // T58_SL_ATR_MULT=1.5
+    // T58_TP_ATR_MULT=3.0
+    // T58_ATR_PERIOD=14        (optional, defaults to 14)
+  ATR-mult directives compute a per-bar stop/target distance in raw price
+  units (StrategyResult.stop_loss_distance/take_profit_distance), which
+  the backtest engine already treats as taking precedence over the fixed
+  pip fields -- see app/strategy/base.py's StrategyResult docstring. If
+  both are present in the same file, the ATR-mult ones win.
 
 Not supported (raises StrategyError): custom functions, arrays/matrices,
 security()/multi-timeframe requests, repainting constructs, plotting,
@@ -44,7 +59,7 @@ import pandas as pd
 
 from app.strategy.base import Strategy, StrategyError, StrategyResult, signals_from_conditions
 from app.strategy.expr import safe_eval_bool
-from app.strategy.indicators import INDICATOR_FUNCS, crossover, crossunder
+from app.strategy.indicators import INDICATOR_FUNCS, atr, crossover, crossunder
 
 _ASSIGN_RE = re.compile(r"^\s*(?:var\s+)?([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
 _TA_CALL_RE = re.compile(r"ta\.(sma|ema|wma|rsi)\s*\(\s*([^,()]+)\s*,\s*([^()]+)\s*\)")
@@ -57,6 +72,9 @@ _ENTRY_RE = re.compile(
 _CLOSE_RE = re.compile(r'strategy\.close\s*\(\s*"([^"]*)"\s*(?:,.*?when\s*=\s*(.+?))?\s*\)')
 _SL_DIRECTIVE_RE = re.compile(r"T58_SL_PIPS\s*=\s*([\d.]+)")
 _TP_DIRECTIVE_RE = re.compile(r"T58_TP_PIPS\s*=\s*([\d.]+)")
+_SL_ATR_DIRECTIVE_RE = re.compile(r"T58_SL_ATR_MULT\s*=\s*([\d.]+)")
+_TP_ATR_DIRECTIVE_RE = re.compile(r"T58_TP_ATR_MULT\s*=\s*([\d.]+)")
+_ATR_PERIOD_DIRECTIVE_RE = re.compile(r"T58_ATR_PERIOD\s*=\s*(\d+)")
 
 _PRICE_ALIASES = {"open", "high", "low", "close", "hl2", "hlc3", "ohlc4"}
 
@@ -70,6 +88,48 @@ def _strip_comment(line: str) -> tuple[str, str]:
         elif ch == "/" and not in_str and i + 1 < len(line) and line[i + 1] == "/":
             return line[:i], line[i:]
     return line, ""
+
+
+_MAX_CONTINUATION_LINES = 20
+
+
+def _join_continuation_lines(raw_lines: list[str]) -> list[str]:
+    """Real Pine scripts routinely wrap ONE logical statement -- most
+    commonly a `strategy(...)`/`indicator(...)` declaration -- across
+    several physical lines for readability:
+
+        strategy("My Strategy",
+             overlay=true,
+             pyramiding=0)
+
+    This parser otherwise processes one physical line at a time, so
+    without this step every continuation line (e.g. `     overlay=true,`)
+    is mistaken for its own top-level assignment statement and rejected
+    as an unsupported expression -- even though the logical statement
+    itself would have been silently ignored as a cosmetic declaration
+    header if it had been written on a single line (see the module
+    docstring's "any other unrecognized statement is silently ignored"
+    note). Joins any line with unbalanced open parens with the physical
+    lines that follow it until the parens balance again, so the whole
+    call is seen as the single logical line it actually is. Caps
+    accumulation at `_MAX_CONTINUATION_LINES` so a genuinely stray/
+    mismatched paren elsewhere in the file can't silently swallow the
+    rest of the script instead of surfacing as its own clear error.
+    """
+    joined: list[str] = []
+    buffer: list[str] = []
+    depth = 0
+    for raw_line in raw_lines:
+        code, _ = _strip_comment(raw_line)
+        buffer.append(raw_line)
+        depth += code.count("(") - code.count(")")
+        if depth <= 0 or len(buffer) >= _MAX_CONTINUATION_LINES:
+            joined.append(" ".join(buffer) if len(buffer) > 1 else buffer[0])
+            buffer = []
+            depth = 0
+    if buffer:
+        joined.append(" ".join(buffer) if len(buffer) > 1 else buffer[0])
+    return joined
 
 
 class PineScriptStrategy(Strategy):
@@ -119,6 +179,9 @@ class PineScriptStrategy(Strategy):
         constants: dict[str, float] = {}
         stop_loss_pips: float | None = None
         take_profit_pips: float | None = None
+        sl_atr_mult: float | None = None
+        tp_atr_mult: float | None = None
+        atr_period = 14
 
         long_conditions: list[str] = []
         long_exit_conditions: list[str] = []
@@ -128,7 +191,7 @@ class PineScriptStrategy(Strategy):
         # context stack of (indent_level, condition_var_name) for `if` blocks
         if_stack: list[tuple[int, str]] = []
 
-        raw_lines = self.code.splitlines()
+        raw_lines = _join_continuation_lines(self.code.splitlines())
         for raw_line in raw_lines:
             code, comment = _strip_comment(raw_line)
 
@@ -138,6 +201,15 @@ class PineScriptStrategy(Strategy):
             tp_match = _TP_DIRECTIVE_RE.search(comment)
             if tp_match:
                 take_profit_pips = float(tp_match.group(1))
+            sl_atr_match = _SL_ATR_DIRECTIVE_RE.search(comment)
+            if sl_atr_match:
+                sl_atr_mult = float(sl_atr_match.group(1))
+            tp_atr_match = _TP_ATR_DIRECTIVE_RE.search(comment)
+            if tp_atr_match:
+                tp_atr_mult = float(tp_atr_match.group(1))
+            atr_period_match = _ATR_PERIOD_DIRECTIVE_RE.search(comment)
+            if atr_period_match:
+                atr_period = int(atr_period_match.group(1))
 
             if not code.strip():
                 continue
@@ -251,12 +323,28 @@ class PineScriptStrategy(Strategy):
         raw_signals = signals_from_conditions(work.index, long_entry, long_exit, short_entry, short_exit)
         signals = self._validate_signals(raw_signals, df)
 
+        # ATR-mult directives (instrument-scale-independent) take precedence
+        # over fixed pip directives when both are present -- see the module
+        # docstring and app/strategy/base.py's StrategyResult docstring.
+        stop_loss_distance = None
+        take_profit_distance = None
+        if sl_atr_mult is not None or tp_atr_mult is not None:
+            atr_series = atr(df, atr_period)
+            if sl_atr_mult is not None:
+                stop_loss_distance = atr_series * sl_atr_mult
+                stop_loss_pips = None
+            if tp_atr_mult is not None:
+                take_profit_distance = atr_series * tp_atr_mult
+                take_profit_pips = None
+
         return StrategyResult(
             name="PineScript Strategy",
             source_type=self.source_type,
             signals=signals,
             stop_loss_pips=stop_loss_pips,
             take_profit_pips=take_profit_pips,
+            stop_loss_distance=stop_loss_distance,
+            take_profit_distance=take_profit_distance,
         )
 
     # -- internal utilities -------------------------------------------

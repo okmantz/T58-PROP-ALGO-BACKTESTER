@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, asdict
 
+import numpy as np
 import pandas as pd
 
 from app.backtest.adaptive_risk import AdaptiveRiskConfig, AdaptiveRiskState
@@ -89,7 +90,6 @@ def run_execution(
     """
     n = len(df)
     equity = risk.initial_balance
-    equity_curve = []
     trades: list[Trade] = []
     adaptive_state = AdaptiveRiskState(initial_balance=risk.initial_balance)
 
@@ -103,22 +103,30 @@ def run_execution(
     # several thousand points per share with a triple-digit-point ATR is
     # the textbook case. Comparing the stop distance to the instrument's
     # own recent ATR catches that; comparing it only to price does not.
-    _tr_high = df["high"].astype(float)
-    _tr_low = df["low"].astype(float)
-    _tr_prev_close = df["close"].astype(float).shift(1)
-    _true_range = pd.concat(
-        [
-            _tr_high - _tr_low,
-            (_tr_high - _tr_prev_close).abs(),
-            (_tr_low - _tr_prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    _atr_for_mismatch_check = _true_range.rolling(14, min_periods=1).mean().to_numpy()
+    # UPGRADE (speed): this used to build three full-length pandas Series,
+    # pd.concat() them into a temporary (n, 3) DataFrame, then reduce with
+    # .max(axis=1) -- on 2M+ rows that's several redundant Series/DataFrame
+    # allocations plus a row-wise (not columnar) max, purely to compute a
+    # single elementwise "biggest of 3 numbers" per bar. Plain numpy
+    # elementwise np.maximum() does the identical calculation without ever
+    # materializing an (n, 3) DataFrame, and the subsequent EWM-free simple
+    # rolling mean is left on the (much cheaper, already a plain ndarray)
+    # pandas Series just for its rolling-window implementation.
+    _tr_high = df["high"].to_numpy(dtype=float)
+    _tr_low = df["low"].to_numpy(dtype=float)
+    _close_arr = df["close"].to_numpy(dtype=float)
+    _tr_prev_close = np.empty_like(_tr_high)
+    _tr_prev_close[0] = np.nan
+    _tr_prev_close[1:] = _close_arr[:-1]
+    _true_range = np.maximum(
+        _tr_high - _tr_low,
+        np.maximum(np.abs(_tr_high - _tr_prev_close), np.abs(_tr_low - _tr_prev_close)),
+    )
+    _atr_for_mismatch_check = (
+        pd.Series(_true_range).rolling(14, min_periods=1).mean().to_numpy()
+    )
 
     open_trade: dict | None = None
-    trades_today: dict = {}   # keyed by numpy.datetime64 day-floor (see bar_dates below)
-    pnl_today: dict = {}      # keyed by numpy.datetime64 day-floor (see bar_dates below)
     fallback_stop_count = 0
     pip_scale_mismatch_count = 0
     pip_scale_mismatch_worst_ratio = None  # smallest (stop_distance / entry_price) seen, for the warning
@@ -169,6 +177,23 @@ def run_execution(
     # ONCE, vectorized, outside the loop instead of n times inside it.
     bar_dates = pd.DatetimeIndex(ts).normalize().to_numpy()
 
+    # UPGRADE (speed): trades_today / pnl_today used to be plain dicts keyed
+    # by the numpy.datetime64 in bar_dates, with a hash + dict lookup (get(),
+    # __contains__, __setitem__) on every single bar of the loop below --
+    # for a 2M+ row 1-minute dataset that's several million Python-level
+    # dict operations that exist purely to answer "which trading day is this
+    # bar in, and what's this day's running count/P&L so far". Since every
+    # bar already belongs to exactly one of a small, fixed number of
+    # calendar days, np.unique() converts bar_dates into a dense integer
+    # day-index per bar ONCE, up front, and the running per-day state
+    # becomes plain numpy arrays indexed by that integer -- an array index
+    # is materially cheaper than a dict lookup, and it also means these
+    # never grow a Python dict entry-by-entry across a multi-year run.
+    _unique_days, day_idx = np.unique(bar_dates, return_inverse=True)
+    trades_today_count = np.zeros(len(_unique_days), dtype=np.int64)
+    pnl_today_sum = np.zeros(len(_unique_days), dtype=np.float64)
+    day_has_pnl = np.zeros(len(_unique_days), dtype=bool)
+
     sl_dist_vals = stop_loss_distance.values if stop_loss_distance is not None else None
     tp_dist_vals = take_profit_distance.values if take_profit_distance is not None else None
     trail_dist_vals = trailing_stop_distance.values if trailing_stop_distance is not None else None
@@ -178,8 +203,18 @@ def run_execution(
 
     force_closed_count = 0
 
+    # UPGRADE (speed): equity_curve used to be a plain Python list that
+    # every one of n bars appended a (timestamp, equity) tuple to, then fed
+    # to pd.DataFrame(list_of_tuples, columns=[...]) at the end --
+    # constructing a DataFrame from a list of 2M+ Python tuples is a
+    # row-wise conversion (pandas has to inspect and transpose every tuple),
+    # which is far slower than building the two columns as numpy arrays
+    # directly and handing pandas already-columnar data. Preallocating (vs.
+    # letting the list grow) also avoids 2M+ individual tuple allocations.
+    equity_arr = np.empty(n, dtype=np.float64)
+
     for i in range(n):
-        bar_date = bar_dates[i]
+        bar_date = day_idx[i]
 
         # --- manage open trade: trailing stop / break-even, then stop/take intrabar ---
         if open_trade is not None:
@@ -204,7 +239,7 @@ def run_execution(
             # stopped out of.
             adverse_extreme = lows[i] if direction == 1 else highs[i]
             floating_adverse_pnl = (adverse_extreme - open_trade["entry_price"]) * open_trade["size"] * direction
-            day_realized_so_far = pnl_today.get(bar_date, 0.0)
+            day_realized_so_far = pnl_today_sum[bar_date]
             if (
                 daily_limit_amount is not None
                 and (day_realized_so_far + floating_adverse_pnl) <= -daily_limit_amount
@@ -235,11 +270,12 @@ def run_execution(
                     adaptive_risk_multiplier=open_trade["adaptive_multiplier"],
                     adaptive_risk_rules_active=tuple(open_trade["adaptive_rules_active"]),
                 ))
-                adaptive_state.record_trade_close(pnl, is_new_day=bar_date not in pnl_today)
-                pnl_today[bar_date] = pnl_today.get(bar_date, 0.0) + pnl
+                adaptive_state.record_trade_close(pnl, is_new_day=not day_has_pnl[bar_date])
+                pnl_today_sum[bar_date] += pnl
+                day_has_pnl[bar_date] = True
                 open_trade = None
                 force_closed_count += 1
-                equity_curve.append((ts[i], equity))
+                equity_arr[i] = equity
                 continue
 
             stop = open_trade["stop_price"]
@@ -337,8 +373,9 @@ def run_execution(
                     adaptive_risk_multiplier=open_trade["adaptive_multiplier"],
                     adaptive_risk_rules_active=tuple(open_trade["adaptive_rules_active"]),
                 ))
-                adaptive_state.record_trade_close(pnl, is_new_day=bar_date not in pnl_today)
-                pnl_today[bar_date] = pnl_today.get(bar_date, 0.0) + pnl
+                adaptive_state.record_trade_close(pnl, is_new_day=not day_has_pnl[bar_date])
+                pnl_today_sum[bar_date] += pnl
+                day_has_pnl[bar_date] = True
                 open_trade = None
 
         # --- mark-to-market equity curve point for this bar ---
@@ -354,7 +391,7 @@ def run_execution(
             mtm_equity = equity + floating_close_pnl
         else:
             mtm_equity = equity
-        equity_curve.append((ts[i], mtm_equity))
+        equity_arr[i] = mtm_equity
 
         # --- account-blown circuit breaker ---
         # A real prop/broker account is terminated the instant it breaches
@@ -372,20 +409,25 @@ def run_execution(
             account_blown_at = pd.Timestamp(ts[i])
 
         # --- consider new entry ---
-        day_realized_pnl = pnl_today.get(bar_date, 0.0)
+        day_realized_pnl = pnl_today_sum[bar_date]
         daily_limit_breached = (
             daily_limit_amount is not None and day_realized_pnl <= -daily_limit_amount
         )
         if open_trade is None and sig[i] != 0 and not daily_limit_breached and not account_blown:
-            n_today = trades_today.get(bar_date, 0)
+            n_today = trades_today_count[bar_date]
             if n_today < risk.max_trades_per_day:
                 direction = int(sig[i])
                 raw_price = closes[i]
                 entry_price = raw_price + (spread_price + slip_price) * direction
 
-                bar_sl_distance = float(sl_dist_vals[i]) if sl_dist_vals is not None and not pd.isna(sl_dist_vals[i]) else None
-                bar_tp_distance = float(tp_dist_vals[i]) if tp_dist_vals is not None and not pd.isna(tp_dist_vals[i]) else None
-                bar_trail_distance = float(trail_dist_vals[i]) if trail_dist_vals is not None and not pd.isna(trail_dist_vals[i]) else None
+                # UPGRADE (speed): pd.isna() on a single numpy float64 scalar
+                # dispatches through pandas' general-purpose type checking,
+                # which is materially slower than a direct NaN check for a
+                # value already known to be a plain float. math.isnan() does
+                # the identical check for these purely-numeric arrays.
+                bar_sl_distance = float(sl_dist_vals[i]) if sl_dist_vals is not None and not math.isnan(sl_dist_vals[i]) else None
+                bar_tp_distance = float(tp_dist_vals[i]) if tp_dist_vals is not None and not math.isnan(tp_dist_vals[i]) else None
+                bar_trail_distance = float(trail_dist_vals[i]) if trail_dist_vals is not None and not math.isnan(trail_dist_vals[i]) else None
 
                 used_fallback_stop = False
                 if not bar_sl_distance and not stop_loss_pips:
@@ -417,7 +459,7 @@ def run_execution(
                     # Degenerate sizing (e.g. an ATR-based stop distance
                     # that rounds to ~0 for this bar) — skip this entry
                     # rather than opening a trade with an invalid size.
-                    trades_today[bar_date] = n_today  # no-op, keeps loop simple
+                    pass  # n_today unchanged; no-op, kept for readability
                 else:
                     if used_fallback_stop:
                         fallback_stop_count += 1
@@ -485,7 +527,7 @@ def run_execution(
                         "adaptive_multiplier": adaptive_multiplier,
                         "adaptive_rules_active": adaptive_rules_active,
                     }
-                    trades_today[bar_date] = n_today + 1
+                    trades_today_count[bar_date] = n_today + 1
 
     # close any still-open trade at final bar close
     if open_trade is not None:
@@ -514,9 +556,14 @@ def run_execution(
             adaptive_risk_multiplier=open_trade["adaptive_multiplier"],
             adaptive_risk_rules_active=tuple(open_trade["adaptive_rules_active"]),
         ))
-        adaptive_state.record_trade_close(pnl, is_new_day=bar_dates[i] not in pnl_today)
+        adaptive_state.record_trade_close(pnl, is_new_day=not day_has_pnl[day_idx[i]])
 
-    equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
+    # UPGRADE (speed): building the DataFrame straight from the two
+    # already-columnar numpy arrays (the original `ts` array + the
+    # preallocated equity_arr) instead of a list of per-bar tuples avoids
+    # pandas' row-wise tuple-unpacking path entirely -- see equity_arr's
+    # definition above for why that path was expensive at 2M+ rows.
+    equity_df = pd.DataFrame({"timestamp": ts, "equity": equity_arr})
 
     if account_blown:
         import warnings

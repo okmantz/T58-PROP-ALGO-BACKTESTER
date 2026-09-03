@@ -68,16 +68,33 @@ def _drawdown_series(equity: pd.Series) -> pd.Series:
 
 
 def _periodic_max_drawdown(equity_df: pd.DataFrame, freq: str) -> float:
+    """Worst intra-period drawdown (e.g. worst single day, worst single
+    week) across the whole equity curve.
+
+    UPGRADE (2026-09-03, speed): this used to build ``df.resample(freq)``
+    and then loop over every resulting period in plain Python, calling
+    ``_drawdown_series`` (itself a vectorized-but-small pandas computation)
+    once per period. On a year or more of intraday data that's 250-1500+
+    tiny pandas calls instead of one -- profiling a real backtest showed
+    this function (called twice per run: once for daily, once for weekly)
+    as the single largest cost in statistics.py, ahead of everything else
+    computed from the trade list combined. Replaced with one groupby-
+    cummax pass across the ENTIRE series at once (pandas' own vectorized,
+    compiled implementation, not a Python loop calling it 1500 times) --
+    same math, computed once instead of once per period.
+    """
     df = equity_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.set_index("timestamp")
-    worst = 0.0
-    for _, grp in df.resample(freq):
-        if grp.empty:
-            continue
-        dd = _drawdown_series(grp["equity"])
-        worst = min(worst, dd.min())
-    return abs(worst) * 100.0
+    equity = df["equity"]
+    if equity.empty:
+        return 0.0
+    period_key = equity.index.to_period(freq)
+    running_max = equity.groupby(period_key).cummax()
+    dd = (equity - running_max) / running_max.replace(0, np.nan)
+    dd = dd.fillna(0.0)
+    worst = dd.groupby(period_key).min().min()
+    return abs(worst) * 100.0 if pd.notna(worst) else 0.0
 
 
 def compute_statistics(

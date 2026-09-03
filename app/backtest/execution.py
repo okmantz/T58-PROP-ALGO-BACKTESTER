@@ -117,8 +117,8 @@ def run_execution(
     _atr_for_mismatch_check = _true_range.rolling(14, min_periods=1).mean().to_numpy()
 
     open_trade: dict | None = None
-    trades_today: dict[pd.Timestamp, int] = {}
-    pnl_today: dict[pd.Timestamp, float] = {}
+    trades_today: dict = {}   # keyed by numpy.datetime64 day-floor (see bar_dates below)
+    pnl_today: dict = {}      # keyed by numpy.datetime64 day-floor (see bar_dates below)
     fallback_stop_count = 0
     pip_scale_mismatch_count = 0
     pip_scale_mismatch_worst_ratio = None  # smallest (stop_distance / entry_price) seen, for the warning
@@ -156,6 +156,19 @@ def run_execution(
     lows = df["low"].values
     closes = df["close"].values
 
+    # UPGRADE (2026-09-03, speed): this used to be
+    # `bar_date = pd.Timestamp(ts[i]).normalize()` computed FRESH every
+    # single iteration of the per-bar loop below -- constructing a
+    # pd.Timestamp object and normalizing it is one of the more expensive
+    # things you can do per-element in pandas, and this loop runs on
+    # every backtest in the app (Run & Report, every Search Lab stage,
+    # every GA generation, every walk-forward fold) -- often 1,000+ times
+    # per Full Pipeline run alone. bar_date is only ever used below as a
+    # dict key (pnl_today / trades_today), so a plain numpy datetime64
+    # day-floor value works identically as a dict key and is computed
+    # ONCE, vectorized, outside the loop instead of n times inside it.
+    bar_dates = pd.DatetimeIndex(ts).normalize().to_numpy()
+
     sl_dist_vals = stop_loss_distance.values if stop_loss_distance is not None else None
     tp_dist_vals = take_profit_distance.values if take_profit_distance is not None else None
     trail_dist_vals = trailing_stop_distance.values if trailing_stop_distance is not None else None
@@ -166,7 +179,7 @@ def run_execution(
     force_closed_count = 0
 
     for i in range(n):
-        bar_date = pd.Timestamp(ts[i]).normalize()
+        bar_date = bar_dates[i]
 
         # --- manage open trade: trailing stop / break-even, then stop/take intrabar ---
         if open_trade is not None:
@@ -501,7 +514,7 @@ def run_execution(
             adaptive_risk_multiplier=open_trade["adaptive_multiplier"],
             adaptive_risk_rules_active=tuple(open_trade["adaptive_rules_active"]),
         ))
-        adaptive_state.record_trade_close(pnl, is_new_day=pd.Timestamp(ts[i]).normalize() not in pnl_today)
+        adaptive_state.record_trade_close(pnl, is_new_day=bar_dates[i] not in pnl_today)
 
     equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
 

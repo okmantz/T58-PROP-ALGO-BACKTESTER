@@ -7,15 +7,27 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# Every extension the importer (app.data.importer.SUPPORTED_DATA_EXTENSIONS)
-# can actually read as tabular market data. list_stored_datasets() and the
-# bundled-data seeder below used to hardcode "*.csv" only, which meant a
-# .parquet (or .tsv/.txt) file sitting right there in data/raw was invisible
-# to the desktop app's stored-dataset list AND the web app's dropdown even
-# though selecting/importing it would have worked fine -- kept in sync with
-# the importer's own set rather than duplicated as a separate literal so the
-# two can't drift apart again.
-RAW_DATA_EXTENSIONS = (".csv", ".tsv", ".txt", ".parquet")
+from app.data.importer import SUPPORTED_ARCHIVE_EXTENSIONS
+
+# Every extension the importer (app.data.importer.SUPPORTED_DATA_EXTENSIONS,
+# plus SUPPORTED_ARCHIVE_EXTENSIONS) can actually read as tabular market
+# data. list_stored_datasets() and the bundled-data seeder below used to
+# hardcode "*.csv" only, which meant a .parquet (or .tsv/.txt) file sitting
+# right there in data/raw was invisible to the desktop app's stored-dataset
+# list AND the web app's dropdown even though selecting/importing it would
+# have worked fine -- kept in sync with the importer's own sets rather than
+# duplicated as separate literals so the two can't drift apart again.
+#
+# UPGRADE (2026-09-03): .zip and .7z were missing from this tuple even
+# though app.data.importer has fully supported reading both for a while
+# (_read_zip/_read_7z, py7zr already in config/requirements.txt) -- an
+# archive sitting in data/raw/ was importable if you somehow got its path
+# into the app, but never showed up in the "Available Datasets" list or the
+# web dropdown in the first place, so in practice it was invisible. Fixed
+# by importing SUPPORTED_ARCHIVE_EXTENSIONS from the importer instead of
+# re-guessing it here -- exactly the kind of drift this tuple's own comment
+# already warned about.
+RAW_DATA_EXTENSIONS = (".csv", ".tsv", ".txt", ".parquet") + tuple(SUPPORTED_ARCHIVE_EXTENSIONS)
 
 
 def get_app_base_dir() -> Path:
@@ -113,13 +125,24 @@ def _quick_row_count(path: Path) -> int:
     meaningless number instead of a row count. pyarrow can read a
     .parquet file's row count straight out of its footer metadata without
     decoding any actual column data, which is just as cheap as the
-    line-count trick for text formats."""
+    line-count trick for text formats.
+
+    .zip/.7z archives are binary too, and unlike .parquet there's no cheap
+    metadata field to read a row count from without actually decompressing
+    the member inside -- too slow to do on every dashboard refresh for
+    every archive on disk. Returns -1 (a "count unknown, don't decompress
+    just to render a number" sentinel) rather than running the plain
+    newline-count fallback below, which on compressed bytes produces a
+    number that looks like a row count but means nothing.
+    """
     if path.suffix.lower() == ".parquet":
         try:
             import pyarrow.parquet as pq
             return pq.ParquetFile(path).metadata.num_rows
         except Exception:
             return 0
+    if path.suffix.lower() in SUPPORTED_ARCHIVE_EXTENSIONS:
+        return -1
     try:
         with open(path, "rb") as f:
             count = sum(1 for _ in f)
@@ -144,6 +167,10 @@ def list_datasets_by_instrument() -> list[dict]:
             "full_name": ds.name,
             "size_bytes": ds.size_bytes,
             "rows": rows,
+            # rows == -1 is the "unknown, it's an archive" sentinel from
+            # _quick_row_count -- never treat that as empty just because
+            # it's not a positive count. A genuinely tiny/placeholder file
+            # (archive or not) is still caught by the size_bytes check.
             "empty": ds.size_bytes <= EMPTY_DATASET_BYTES or rows == 0,
         })
 
@@ -155,7 +182,12 @@ def list_datasets_by_instrument() -> list[dict]:
             "files": files,
             "file_count": len(files),
             "empty_count": sum(1 for f in files if f["empty"]),
-            "total_rows": sum(f["rows"] for f in files),
+            # -1 is _quick_row_count's "unknown, it's an archive" sentinel
+            # (see its docstring) -- summed in naively, one archive in a
+            # folder would silently knock 1 off the whole group's displayed
+            # total. Excluded here so archives just don't contribute to the
+            # row count instead of corrupting it.
+            "total_rows": sum(f["rows"] for f in files if f["rows"] >= 0),
         })
     return result
 

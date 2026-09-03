@@ -70,6 +70,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 from app.backtest.adaptive_risk import build_limit_aware_preset
 from app.backtest.engine import run_backtest
@@ -77,6 +78,7 @@ from app.backtest.risk import RiskConfig
 from app.evolution import checkpoint as evo_checkpoint
 from app.evolution.knowledge_graph import DEFAULT_KG_PATH, KnowledgeGraph, feature_vector_for_spec
 from app.evolution.prop_fitness import PropFitnessBreakdown, compute_prop_fitness
+from app.evolution.surrogate import FamilySurrogateBank
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.parameter_space import apply_genome, extract_genome
 from app.optimize.refinement import _mutate, _stressed_risk_config
@@ -287,6 +289,19 @@ class EvolutionConfig:
     min_immigrants_per_family: int = 2   # every family gets at least this many fresh candidates, every generation
     max_elite_frac_per_family: float = 0.5   # no single family may hold more than this share of the elite/breeding pool
 
+    # Surrogate-model-guided search (replaces blind mutation for elite
+    # breeding once enough history exists): a per-family Gaussian Process
+    # fit on every fully-evaluated manual-config candidate's genome ->
+    # fitness, proposing next-generation children by Upper Confidence
+    # Bound instead of random mutation/crossover. See app.evolution.surrogate
+    # for why this is pure numpy (no scipy/sklearn dependency) and why it
+    # can only ever make proposals SMARTER, never required -- every
+    # fallback path below is plain mutation, unchanged from before.
+    surrogate_guided_search: bool = True
+    surrogate_min_observations: int = 8
+    surrogate_kappa: float = 1.5
+    surrogate_pool_size: int = 300
+
     min_trades_target_for_fitness: int = 30
     max_generations: int | None = None          # None = run until stop() is called
     random_seed: int = 42
@@ -470,6 +485,12 @@ class EvolutionRunner:
         self.resumed = False                                          # set True if a checkpoint was loaded
         self._pool: ProcessPoolExecutor | None = None
         self._pool_tmp_dir: tempfile.TemporaryDirectory | None = None
+        self._surrogate = (
+            FamilySurrogateBank(
+                min_observations=self.cfg.surrogate_min_observations,
+                kappa=self.cfg.surrogate_kappa,
+            ) if self.cfg.surrogate_guided_search else None
+        )
 
         self._load_checkpoint_if_compatible()
 
@@ -656,6 +677,8 @@ class EvolutionRunner:
 
                 evaluated = self._full_eval(stage1_survivors)
                 self._log(f"ROBUSTNESS / OOS / MONTE CARLO / PROP SIMULATION: {len(evaluated)} candidates scored.")
+                if self._surrogate is not None:
+                    self._record_surrogate_observations(evaluated)
                 if self._stop_flag.is_set() or not evaluated:
                     self._finish_empty_generation(gen, population, evaluated, elapsed=time.time() - t0)
                     self._save_checkpoint(next_generation=gen + 1)
@@ -727,6 +750,34 @@ class EvolutionRunner:
         self._log(f"Generation {gen}: nothing survived far enough to update the leaderboard{suffix} -- continuing to the next generation.")
 
     # -- GENERATE ---------------------------------------------------------
+    def _record_surrogate_observations(self, evaluated: list["EvolutionCandidateRecord"]) -> None:
+        """Feeds every fully-evaluated manual-config candidate's genome ->
+        final_score into this run's per-family surrogate bank. Best-effort:
+        a malformed config/gene mismatch skips that one candidate rather
+        than aborting the generation -- the surrogate is an optimization
+        hint, never load-bearing."""
+        for r in evaluated:
+            if r.spec.get("source_type") != "manual" or r.fitness is None:
+                continue
+            config = r.spec.get("config")
+            if not config:
+                continue
+            try:
+                genes = extract_genome(config)
+                if not genes:
+                    continue
+                # extract_genome(config) reads each gene's CURRENT value out
+                # of this exact candidate's config into base_value, so this
+                # already reflects what this candidate actually tested.
+                genome_norm = np.array([
+                    (g.base_value - g.lo) / (g.hi - g.lo) if g.hi > g.lo else 0.5
+                    for g in genes
+                ])
+                fam = r.meta.get("family", "?")
+                self._surrogate.observe(fam, genome_norm, r.fitness.final_score)
+            except Exception:  # noqa: BLE001 -- surrogate learning must never break a run
+                continue
+
     def _generate_population(self, gen: int, elites: list[tuple[dict, dict]]) -> list[tuple[str, dict, dict]]:
         """Returns a list of (candidate_id, spec, meta). Generation 0 is
         pure random family sampling. Later generations mix mutated
@@ -769,6 +820,7 @@ class EvolutionRunner:
 
         if elites:
             rng = random.Random(seed)
+            np_rng = np.random.default_rng(seed)
             n_children = max(0, self.cfg.population_size - len(out))
             per_elite = max(1, n_children // len(elites))
             for spec, meta in elites:
@@ -779,12 +831,43 @@ class EvolutionRunner:
                 if not genes:
                     continue
                 base_genome = [g.base_value for g in genes]
-                for _ in range(per_elite):
+                fam = meta.get("family", "mutant")
+
+                # Surrogate-guided proposal: once this family has enough
+                # observed (genome -> fitness) history, propose children by
+                # UCB over the fitted GP instead of blind mutation. Falls
+                # through to plain mutation for whatever the surrogate
+                # doesn't cover (not enough history yet, a fit failure, or
+                # simply per_elite - len(surrogate_children) leftover slots)
+                # so a cold-start family or a failed fit never loses
+                # candidates, it just gets the same behavior as before.
+                surrogate_children_norm = None
+                if self._surrogate is not None:
+                    surrogate_children_norm = self._surrogate.propose(
+                        fam, per_elite, np_rng, len(genes), pool_size=self.cfg.surrogate_pool_size,
+                    )
+
+                n_from_surrogate = 0
+                if surrogate_children_norm is not None:
+                    for genome_norm in surrogate_children_norm:
+                        child_genome = [
+                            float(g.lo + float(v) * (g.hi - g.lo)) for g, v in zip(genes, genome_norm)
+                        ]
+                        child_genome = [
+                            float(round(v)) if g.is_int else v for g, v in zip(genes, child_genome)
+                        ]
+                        child_config = apply_genome(config, genes, child_genome)
+                        child_spec = {"source_type": "manual", "config": child_config}
+                        cid = f"{fam}-gen{gen}-{rng.randrange(10**8):08x}"
+                        out.append((cid, child_spec, {"family": fam, "params": {}, "mutated_from": meta.get("family"), "surrogate": True}))
+                        n_from_surrogate += 1
+
+                for _ in range(max(0, per_elite - n_from_surrogate)):
                     child_genome = _mutate(base_genome, genes, self.cfg.mutation_rate, self.cfg.mutation_strength, rng)
                     child_config = apply_genome(config, genes, child_genome)
                     child_spec = {"source_type": "manual", "config": child_config}
-                    cid = f"{meta.get('family', 'mutant')}-gen{gen}-{rng.randrange(10**8):08x}"
-                    out.append((cid, child_spec, {"family": meta.get("family", "mutant"), "params": {}, "mutated_from": meta.get("family")}))
+                    cid = f"{fam}-gen{gen}-{rng.randrange(10**8):08x}"
+                    out.append((cid, child_spec, {"family": fam, "params": {}, "mutated_from": meta.get("family")}))
         return out[: max(self.cfg.population_size, len(out))]
 
     def _diversify_elites(self, clustered: list[EvolutionCandidateRecord]) -> list[EvolutionCandidateRecord]:

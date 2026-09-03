@@ -52,6 +52,7 @@ import multiprocessing
 import os
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -469,6 +470,13 @@ def _stage3_task(candidate_id: str, spec: dict, cfg: dict) -> dict:
     }
 
 
+class SearchCancelled(Exception):
+    """Raised when the caller sets ``cancel_event`` mid-run. Not an error --
+    the UI catches this to report a clean user-requested stop rather than a
+    crash. Any candidates already scored before the cancel point are still
+    written to the results DB, so a stopped run isn't a wasted one."""
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -483,10 +491,21 @@ def run_search(
     instrument: str = "unknown",
     timeframe: str = "unknown",
     progress_cb: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> SearchSummary:
     def log(msg: str) -> None:
         if progress_cb:
             progress_cb(msg)
+
+    def check_cancelled(pool) -> None:
+        """Call between/within stage loops. On a stop request, cancels every
+        not-yet-started future and drops out of the pool without waiting for
+        the whole remaining batch, then raises SearchCancelled so the caller
+        can stop cleanly instead of surfacing this as a crash."""
+        if cancel_event is not None and cancel_event.is_set():
+            log("\nStop requested -- cancelling remaining candidates and shutting down workers...")
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise SearchCancelled("Search Lab run stopped by user.")
 
     run_id = uuid.uuid4().hex[:12]
     t0 = time.time()
@@ -545,6 +564,7 @@ def run_search(
             done = 0
             log_every = max(1, len(futures) // 10)
             for fut in as_completed(futures):
+                check_cancelled(pool)
                 rec = fut.result()
                 rec["family"] = space.meta.get(rec["candidate_id"], {}).get("family", space.family or "single")
                 stage1_records.append(rec)
@@ -552,6 +572,7 @@ def run_search(
                 done += 1
                 if done % log_every == 0 or done == len(futures):
                     log(f"  Stage 1: {done}/{len(futures)} evaluated...")
+            check_cancelled(pool)
 
             passed_stage1 = [r for r in stage1_records if r.get("passed_stage1")]
             diversity_dropped = 0
@@ -662,12 +683,14 @@ def run_search(
             }
             done = 0
             for fut in as_completed(futures):
+                check_cancelled(pool)
                 rec = fut.result()
                 rec["family"] = space.meta.get(rec["candidate_id"], {}).get("family", space.family or "single")
                 stage2_records.append(rec)
                 db.insert_candidate(run_id, rec["candidate_id"], "stage2", rec)
                 done += 1
                 log(f"  Stage 2: {done}/{len(survivors1)} skeleton(s) refined...")
+            check_cancelled(pool)
 
             survivors2 = sorted(
                 (r for r in stage2_records if r.get("passed_stage2") and math.isfinite(r.get("fitness", float("-inf")))),
@@ -703,11 +726,16 @@ def run_search(
             }
             done = 0
             for fut in as_completed(futures):
+                check_cancelled(pool)
                 rec = fut.result()
                 rec["family"] = space.meta.get(rec["candidate_id"], {}).get("family", space.family or "single")
                 stage3_records.append(rec)
                 done += 1
                 log(f"  Stage 3: {done}/{len(survivors2)} candidate(s) validated...")
+    except SearchCancelled:
+        db.finish_run(run_id, status="cancelled")
+        db.close()
+        raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

@@ -229,8 +229,71 @@ class ResultsDB:
         cur = self._conn.execute(q, params)
         return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
+    def live_leaderboard(self, run_id: str, top_n: int = 20) -> list[dict]:
+        """Best-known row per candidate_id across EVERY stage reached SO
+        FAR, ranked by whichever score that stage actually has (composite_score
+        for stage3, fitness for stage2, quick_score for stage1) -- meant to
+        be polled WHILE a run is still in progress (see poll_live_leaderboard
+        below for polling from a separate thread/connection), not only
+        after leaderboard()'s stage3-only view is available. Each
+        candidate_id appears once, at whichever stage it's currently
+        furthest into."""
+        cur = self._conn.execute(
+            """
+            SELECT c.* FROM candidates c
+            INNER JOIN (
+                SELECT candidate_id,
+                       MAX(CASE stage WHEN 'stage3' THEN 3 WHEN 'stage2' THEN 2 WHEN 'stage1' THEN 1 ELSE 0 END) AS stage_rank
+                FROM candidates WHERE run_id = ?
+                GROUP BY candidate_id
+            ) latest
+            ON c.candidate_id = latest.candidate_id
+               AND (CASE c.stage WHEN 'stage3' THEN 3 WHEN 'stage2' THEN 2 WHEN 'stage1' THEN 1 ELSE 0 END) = latest.stage_rank
+            WHERE c.run_id = ?
+            ORDER BY COALESCE(c.composite_score, c.fitness, c.quick_score, -1e18) DESC
+            LIMIT ?
+            """,
+            (run_id, run_id, top_n),
+        )
+        return [_row_to_dict(cur, row) for row in cur.fetchall()]
+
     def count_stage(self, run_id: str, stage: str) -> int:
         cur = self._conn.execute(
             "SELECT COUNT(*) FROM candidates WHERE run_id = ? AND stage = ?", (run_id, stage),
         )
         return int(cur.fetchone()[0])
+
+
+def poll_live_leaderboard(db_path: str | Path, run_id: str, top_n: int = 20) -> list[dict]:
+    """Live-leaderboard polling for a caller that does NOT own the
+    ResultsDB instance the search itself is writing through -- e.g. a UI
+    refresh timer polling a Search Lab / multi-instrument run still in
+    progress in a background thread. Opens a short-lived, read-only
+    connection (SQLite's WAL mode -- already enabled in ResultsDB.__init__
+    -- lets a read-only reader see already-committed rows without
+    blocking, or being blocked by, the writer) and closes it again before
+    returning, so this is safe to call on a timer without accumulating
+    open connections.
+
+    Returns an empty list (never raises) if the database file doesn't
+    exist yet -- e.g. polled in the brief window before a run's ResultsDB
+    has created it -- since \"no leaderboard yet\" is a normal state for a
+    just-started run, not an error worth surfacing to the UI.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    uri = f"file:{path.as_posix()}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError:
+        return []
+    try:
+        shell = ResultsDB.__new__(ResultsDB)
+        shell.path = str(path)
+        shell._conn = conn
+        return shell.live_leaderboard(run_id, top_n=top_n)
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()

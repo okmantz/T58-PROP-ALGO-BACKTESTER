@@ -70,6 +70,7 @@ from app.optimize.parameter_space import RefinementError
 from app.optimize.refinement import RefinementConfig, compute_fitness, run_iterative_refinement
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
 from app.reports.generator import generate_full_report
+from app.search.failure_triage import aggregate_failure_reasons
 from app.search.family_diversity import enforce_family_diversity
 from app.search.results_db import ResultsDB
 from app.search.robustness import (
@@ -168,6 +169,27 @@ class SearchStageConfig:
     cost_stress_penalty_weight: float = 0.35
 
     # Stage 3 -- validation gate
+    #
+    # Hard floor, checked BEFORE the expensive part of Stage 3 (full-fidelity
+    # Monte Carlo, the lookahead detector, walk-forward, and parameter-
+    # neighborhood robustness all run once each per candidate). A candidate
+    # that already can't clear this floor on a single plain backtest has no
+    # chance of clearing Stage 3 overall -- Stage 2's GA/surrogate refinement
+    # already optimizes toward the Stage 3 fitness metric, but it can still
+    # hand forward a candidate that regressed on ONE of these floor checks
+    # while improving on the metric it was actually selecting on (e.g. a
+    # config that raised eval_pass_probability slightly while quietly
+    # dropping below the minimum trade count). Every candidate killed here
+    # is a full Monte Carlo run (`full_mc_sims`, by default 3000 paths) that
+    # was never spent on a doomed strategy. Defaults intentionally mirror
+    # Stage 1's own floor (same shape of check, same failure modes) rather
+    # than being stricter, since Stage 2 already re-optimized past Stage 1's
+    # bar once -- this exists to catch regressions and edge cases, not to
+    # duplicate Stage 1's filtering work.
+    stage3_min_trades: int = 20
+    stage3_min_profit_factor: float = 1.05
+    stage3_max_drawdown_buffer_mult: float = 1.5
+
     full_mc_sims: int = 3000
     walk_forward_folds: int = 4
     walk_forward_metric: str = "eval_pass_probability"
@@ -193,6 +215,9 @@ class SearchStageConfig:
         self.min_trades = max(int(self.min_trades), 1)
         self.min_profit_factor = max(float(self.min_profit_factor), 0.0)
         self.stage1_top_n = max(int(self.stage1_top_n), 1)
+        self.stage3_min_trades = max(int(self.stage3_min_trades), 1)
+        self.stage3_min_profit_factor = max(float(self.stage3_min_profit_factor), 0.0)
+        self.stage3_max_drawdown_buffer_mult = max(float(self.stage3_max_drawdown_buffer_mult), 0.1)
         self.ga_population = max(int(self.ga_population), 4)
         self.ga_generations = max(int(self.ga_generations), 1)
         self.stage2_top_n = max(int(self.stage2_top_n), 1)
@@ -369,6 +394,28 @@ def _stage3_task(candidate_id: str, spec: dict, cfg: dict) -> dict:
         return {
             **base, "statistics": stats,
             "error": "no trades on full dataset", "passed_stage3_gate": False,
+        }
+
+    # Early-kill floor -- BEFORE the expensive Monte Carlo / lookahead /
+    # walk-forward / robustness work below. See SearchStageConfig's
+    # stage3_min_trades/stage3_min_profit_factor/stage3_max_drawdown_buffer_mult
+    # docstring for why this exists.
+    if not _passes_stage1_filters(
+        stats,
+        min_trades=cfg.get("stage3_min_trades", 20),
+        min_profit_factor=cfg.get("stage3_min_profit_factor", 1.05),
+        max_dd_limit=prop_rules.max_drawdown_pct * cfg.get("stage3_max_drawdown_buffer_mult", 1.5),
+    ):
+        return {
+            **base, "statistics": stats,
+            "error": (
+                "failed Stage 3 early-kill floor (min_trades="
+                f"{cfg.get('stage3_min_trades', 20)}, min_profit_factor="
+                f"{cfg.get('stage3_min_profit_factor', 1.05):.2f}, "
+                f"max_drawdown<={prop_rules.max_drawdown_pct * cfg.get('stage3_max_drawdown_buffer_mult', 1.5):.1f}%)"
+                " -- skipped before Monte Carlo/walk-forward/robustness."
+            ),
+            "passed_stage3_gate": False,
         }
 
     trade_pnls = [t.pnl for t in bt.trades]
@@ -590,6 +637,12 @@ def run_search(
                 f"the cheap filter and advance to Stage 2 (GA refinement)."
                 + (f" ({diversity_dropped} further dropped by the family-diversity cap.)" if diversity_dropped else "")
             )
+            stage1_triage = aggregate_failure_reasons(
+                stage1_records, "Stage 1", "passed_stage1",
+                min_trades=stage_cfg.min_trades, min_profit_factor=stage_cfg.min_profit_factor,
+            )
+            for line in stage1_triage.format_log_lines():
+                log(line)
             if not survivors1:
                 # Auto-relax: the original filters found nothing to work
                 # with at all, which throws away the whole search rather
@@ -713,6 +766,9 @@ def run_search(
             stage3_cfg = {
                 "full_mc_sims": stage_cfg.full_mc_sims, "random_seed": stage_cfg.random_seed,
                 "fitness_metric": stage_cfg.fitness_metric,
+                "stage3_min_trades": stage_cfg.stage3_min_trades,
+                "stage3_min_profit_factor": stage_cfg.stage3_min_profit_factor,
+                "stage3_max_drawdown_buffer_mult": stage_cfg.stage3_max_drawdown_buffer_mult,
                 "walk_forward_folds": stage_cfg.walk_forward_folds,
                 "walk_forward_metric": stage_cfg.walk_forward_metric,
                 "walk_forward_min_efficiency": stage_cfg.walk_forward_min_efficiency,
@@ -732,6 +788,12 @@ def run_search(
                 stage3_records.append(rec)
                 done += 1
                 log(f"  Stage 3: {done}/{len(survivors2)} candidate(s) validated...")
+            stage3_triage = aggregate_failure_reasons(
+                stage3_records, "Stage 3", "passed_stage3_gate",
+                min_trades=stage_cfg.stage3_min_trades, min_profit_factor=stage_cfg.stage3_min_profit_factor,
+            )
+            for line in stage3_triage.format_log_lines():
+                log(line)
     except SearchCancelled:
         db.finish_run(run_id, status="cancelled")
         db.close()

@@ -1312,6 +1312,334 @@ _RSI_EXTREME_REVERSION = SkeletonSpec(
 )
 
 
+# ---------------------------------------------------------------------------
+# Families U-Z: Prop-Eval-Shaped Scalp Families
+#
+# Every family above (A-T) was hand-designed around a general trading
+# hypothesis (trend, momentum, mean reversion, structure, liquidity...) and
+# then given SOME ATR stop/target -- but the stop/target shape those
+# families use (target_atr_mult usually 1.5-4x a 1-2x stop, i.e. "let a
+# winner run") is a general-purpose trading shape, not a shape built for
+# what a prop-firm evaluation actually needs: a HIGH win rate, a TIGHT
+# risk/reward, and a FAST time-to-target, so the account can clear its
+# profit target before a bad losing streak has enough room to hit the
+# daily-loss/max-drawdown limit first. A strategy can have a perfectly
+# real, positive-expectancy edge and still be a poor prop-eval fit if it
+# needs 40 bars and a 3:1 winner to pay for four losers along the way.
+#
+# These six families reuse the exact same manual-condition primitives as
+# A-T (liquidity sweep, session/opening-range levels, CHoCH, fair value
+# gap, EMA trend, ATR/volatility regime) but are deliberately built the
+# other way around: pick (or add) a confirmation filter that raises the
+# entry's win probability, THEN size the exit for a tight target (often
+# target_atr_mult < stop_atr_mult -- a sub-1.0 reward:risk that needs a
+# high win rate to be worth taking at all) and a short max_bars_in_trade,
+# so a candidate either proves out fast or gets cut loose fast rather than
+# tying up eval capital for dozens of bars either way. None of this is a
+# guarantee any of the six actually clears Stage 3 -- that's exactly what
+# Search Lab/Evolution Lab are for -- but it means the search space itself
+# finally contains hypotheses shaped for the objective Owen is actually
+# scoring against (eval_pass_probability), not just more variations on
+# hypotheses shaped for raw net profit.
+# ---------------------------------------------------------------------------
+
+# Family U: Liquidity Sweep Quick Reclaim
+#   Family G's stop-hunt-and-reclaim signal, re-shaped for speed: a
+#   shorter lookback (fires more often, on smaller/faster sweeps) and a
+#   sub-1.0 reward:risk with a short max_bars_in_trade, instead of Family
+#   G's wider 1.5-3x target meant to let a reclaim run.
+
+def _build_liquidity_sweep_quick_reclaim(p: dict) -> dict:
+    lookback = p["lookback"]
+    return {
+        "name": f"Liquidity Sweep Quick Reclaim (lookback={lookback})",
+        "entry_conditions": {
+            "long": [_cond({"type": "liquidity_sweep", "lookback": lookback, "direction": "bullish"}, "is true", _val(1))],
+            "short": [_cond({"type": "liquidity_sweep", "lookback": lookback, "direction": "bearish"}, "is true", _val(1))],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_LIQUIDITY_SWEEP_QUICK_RECLAIM = SkeletonSpec(
+    name="liquidity_sweep_quick_reclaim",
+    label="Liquidity Sweep Quick Reclaim (fast scalp variant)",
+    description=(
+        "The prop-eval-shaped sibling of Family G: the same stop-hunt-and-reclaim signal on a "
+        "shorter, more frequent lookback, but with a sub-1.0 reward:risk (a tight target relative "
+        "to the stop) and a short max_bars_in_trade cap -- built to prove out or fail fast rather "
+        "than sizing for a large winning move."
+    ),
+    param_grid={
+        "lookback": [5, 8, 12],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [0.5, 0.75],
+        "max_bars": [4, 8, 12],
+    },
+    build=_build_liquidity_sweep_quick_reclaim,
+)
+
+
+# Family V: Range Midpoint Fade
+#   Fades yesterday's high/low back toward the middle of the established
+#   range, but ONLY while an ATR-regime filter confirms the market is
+#   currently CONTRACTED (calm/range-bound) -- a range fade taken during
+#   an expanding/trending regime is exactly the failure mode the T58 Quant
+#   Trading Masterclass material warns mean reversion is prone to. Gating
+#   on regime is what raises this fade's win probability enough to be
+#   worth the tight target below.
+
+def _build_range_midpoint_fade(p: dict) -> dict:
+    atr_period = p["atr_period"]
+    return {
+        "name": f"Range Midpoint Fade (atr{atr_period} contraction-gated)",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("close", 1), "<", {"type": "previous_day_low"}),
+                _cond({"type": "atr_regime", "period": atr_period}, "<=", _val(0)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_ind("close", 1), ">", {"type": "previous_day_high"}),
+                _cond({"type": "atr_regime", "period": atr_period}, "<=", _val(0)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_RANGE_MIDPOINT_FADE = SkeletonSpec(
+    name="range_midpoint_fade",
+    label="Range Midpoint Fade (contraction-gated mean reversion scalp)",
+    description=(
+        "Fades a close beyond yesterday's high/low back toward the range, but stands down whenever "
+        "an ATR-regime filter reads the market as currently EXPANDING (only trades a calm/neutral "
+        "regime, atr_regime <= 0) -- unlike Family C's always-on Bollinger fade, this one skips the "
+        "volatility regime mean reversion is most likely to get run over in. Tight target, short "
+        "max_bars: built to fade quiet-range noise quickly, not to catch a big reversal."
+    ),
+    param_grid={
+        "atr_period": [14, 20],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [0.6, 0.9],
+        "max_bars": [6, 12, 16],
+    },
+    build=_build_range_midpoint_fade,
+)
+
+
+# Family W: Opening Range Retest Confirmation
+#   Family E's opening-range breakout, but ENTRY REQUIRES A RETEST: the
+#   triggering bar must have traded back down to (long) / up to (short)
+#   the opening-range level and still closed beyond it, rather than firing
+#   on the very first breakout bar. A retest-confirmed breakout is a
+#   textbook way to filter out the false breakouts that are a big part of
+#   why naive breakout entries have a lower win rate -- this family
+#   accepts fewer, later signals in exchange for a meaningfully higher
+#   probability of being right, then exploits that quickly with a tight
+#   target instead of letting Family E's wider target ride.
+
+def _build_opening_range_retest_confirmation(p: dict) -> dict:
+    start, end = p["session_start"], p["session_end"]
+    return {
+        "name": f"Opening Range Retest Confirmation ({start}-{end})",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("close", 1), ">",
+                      {"type": "opening_range_high", "session_start": start, "session_end": end}),
+                _cond(_ind("low", 1), "<=",
+                      {"type": "opening_range_high", "session_start": start, "session_end": end}),
+            ],
+            "long_connectors": ["AND", "AND"],
+            "short": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("close", 1), "<",
+                      {"type": "opening_range_low", "session_start": start, "session_end": end}),
+                _cond(_ind("high", 1), ">=",
+                      {"type": "opening_range_low", "session_start": start, "session_end": end}),
+            ],
+            "short_connectors": ["AND", "AND"],
+        },
+        "exit_conditions": {"long": [], "short": [], "long_connectors": [], "short_connectors": []},
+        "risk_management": _risk_management(
+            p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"],
+        ),
+        "_time_based_exit": p["flat_time"],
+    }
+
+
+_OPENING_RANGE_RETEST_CONFIRMATION = SkeletonSpec(
+    name="opening_range_retest_confirmation",
+    label="Opening Range Retest Confirmation (confirmation-gated session breakout scalp)",
+    description=(
+        "Family E's opening-range breakout, but the entry bar must also have traded back to the "
+        "opening-range level and still closed beyond it -- a retest-and-hold, not the first-touch "
+        "breakout. Fewer signals than Family E, but each one has already survived one immediate "
+        "failure test, which is exactly the mechanism that raises a breakout entry's win rate. "
+        "Tight target and short max_bars exploit that confirmation quickly instead of sizing for "
+        "a large post-breakout move the way Family E does."
+    ),
+    param_grid={
+        "session_start": ["08:30", "13:30"],
+        "session_end": ["10:30", "15:30"],
+        "flat_time": ["16:00"],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [0.75, 1.0],
+        "max_bars": [6, 12],
+    },
+    build=lambda p: _apply_time_based_exit(_build_opening_range_retest_confirmation(p)),
+    valid=lambda p: p["session_start"] < p["session_end"],
+)
+
+
+# Family X: Micro-Pullback Continuation Scalp
+#   A one-bar-dip continuation, deliberately smaller-scope than Family B's
+#   RSI-pullback continuation: inside an established EMA trend, buy the
+#   very next bar after a single counter-trend (red, in an uptrend) candle,
+#   betting on an immediate one-to-a-few-bar resumption rather than
+#   waiting out a full RSI pullback/pop cycle. Trades far more often than
+#   Family B, each one sized for a small, fast target.
+
+def _build_micro_pullback_continuation(p: dict) -> dict:
+    ema_fast, ema_slow = p["ema_fast"], p["ema_slow"]
+    return {
+        "name": f"Micro-Pullback Continuation (ema {ema_fast}/{ema_slow})",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("ema", ema_fast), ">", _ind("ema", ema_slow)),
+                _cond({"type": "candle_direction", "direction": "bearish"}, "is true", _val(1)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_ind("ema", ema_fast), "<", _ind("ema", ema_slow)),
+                _cond({"type": "candle_direction", "direction": "bullish"}, "is true", _val(1)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_MICRO_PULLBACK_CONTINUATION = SkeletonSpec(
+    name="micro_pullback_continuation",
+    label="Micro-Pullback Continuation (one-bar-dip trend scalp)",
+    description=(
+        "Buys the single bar after one counter-trend candle inside an established EMA uptrend "
+        "(sells the mirror case in a downtrend), betting on immediate resumption rather than "
+        "waiting for a full RSI pullback cycle like Family B does. Trades much more often, each "
+        "one sized as a small, fast scalp rather than a swing continuation trade."
+    ),
+    param_grid={
+        "ema_fast": [20, 50],
+        "ema_slow": [100, 200],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [0.5, 0.8],
+        "max_bars": [4, 8, 10],
+    },
+    build=_build_micro_pullback_continuation,
+    valid=lambda p: p["ema_fast"] < p["ema_slow"],
+)
+
+
+# Family Y: Change-of-Character Reversal Scalp
+#   Family J's CHoCH signal, gated by a volatility-regime filter requiring
+#   CONTRACTION at the moment of the shift -- a structural reversal that
+#   shows up during a quiet regime is read as more likely a genuine,
+#   orderly rotation than one appearing mid-expansion (which is more often
+#   just chop). Tight target and short max_bars exploit the early read
+#   quickly rather than sizing for a full structural reversal the way
+#   Family J does.
+
+def _build_change_of_character_reversal_scalp(p: dict) -> dict:
+    lookback, vol_period = p["lookback"], p["vol_period"]
+    return {
+        "name": f"CHoCH Reversal Scalp (lookback={lookback}, contraction-gated)",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "change_of_character", "lookback": lookback, "direction": "bullish"}, "is true", _val(1)),
+                _cond({"type": "volatility_regime", "period": vol_period}, "<=", _val(0)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond({"type": "change_of_character", "lookback": lookback, "direction": "bearish"}, "is true", _val(1)),
+                _cond({"type": "volatility_regime", "period": vol_period}, "<=", _val(0)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_CHANGE_OF_CHARACTER_REVERSAL_SCALP = SkeletonSpec(
+    name="change_of_character_reversal_scalp",
+    label="Change of Character Reversal Scalp (contraction-gated CHoCH)",
+    description=(
+        "Family J's Change-of-Character signal, but stands down whenever a volatility-regime "
+        "filter reads the market as currently EXPANDING (only trades a calm/neutral regime, "
+        "volatility_regime <= 0) -- a structural shift during a quiet regime reads as more likely "
+        "a genuine rotation than the same signal firing mid-expansion, which is more often chop. "
+        "Tight target, short max_bars: exploits the early read quickly instead of sizing for a "
+        "full reversal like Family J does."
+    ),
+    param_grid={
+        "lookback": [10, 20],
+        "vol_period": [14, 20],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [0.75, 1.0],
+        "max_bars": [6, 12, 16],
+    },
+    build=_build_change_of_character_reversal_scalp,
+)
+
+
+# Family Z: Fair Value Gap Quick-Fill Fade
+#   The mirror-image hypothesis of Family N: instead of betting a fresh
+#   Fair Value Gap's displacement continues, this fades INTO the gap,
+#   betting the imbalance gets at least partially filled -- a textbook
+#   "gaps get filled" mean-reversion read rather than Family N's
+#   continuation read of the exact same primitive. A very short-lived
+#   setup by construction (a gap either fills within a handful of bars or
+#   the continuation reading was right instead), hence the shortest
+#   max_bars_in_trade of any family here.
+
+def _build_fvg_quick_fill_fade(p: dict) -> dict:
+    return {
+        "name": "FVG Quick-Fill Fade",
+        "entry_conditions": {
+            # Fade a BEARISH fvg (gap down) expecting a bounce back up to fill it.
+            "long": [_cond({"type": "fair_value_gap", "direction": "bearish"}, "is true", _val(1))],
+            # Fade a BULLISH fvg (gap up) expecting a pullback down to fill it.
+            "short": [_cond({"type": "fair_value_gap", "direction": "bullish"}, "is true", _val(1))],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_FVG_QUICK_FILL_FADE = SkeletonSpec(
+    name="fvg_quick_fill_fade",
+    label="Fair Value Gap Quick-Fill Fade (imbalance mean-reversion scalp)",
+    description=(
+        "Fades INTO a freshly-printed Fair Value Gap, betting the imbalance gets at least "
+        "partially filled -- the mean-reversion reading of the same primitive Family N reads as a "
+        "continuation signal. A gap either fills within a handful of bars or this hypothesis was "
+        "wrong, so this family runs the shortest max_bars_in_trade of any family in this module."
+    ),
+    param_grid={
+        "stop_atr_mult": [1.0, 1.3],
+        "target_atr_mult": [0.5, 0.8],
+        "max_bars": [4, 6, 10],
+    },
+    build=_build_fvg_quick_fill_fade,
+)
+
+
 FAMILIES: dict[str, SkeletonSpec] = {
     _TREND_BREAKOUT.name: _TREND_BREAKOUT,
     _MTF_PULLBACK.name: _MTF_PULLBACK,
@@ -1341,6 +1669,16 @@ FAMILIES: dict[str, SkeletonSpec] = {
     _WMA_RIBBON_TREND.name: _WMA_RIBBON_TREND,
     _PCT_CHANGE_MOMENTUM_BURST.name: _PCT_CHANGE_MOMENTUM_BURST,
     _RSI_EXTREME_REVERSION.name: _RSI_EXTREME_REVERSION,
+    # -- Prop-eval-shaped scalp expansion (Families U-Z): high win-rate /
+    # tight RR / fast time-to-target hypotheses, built specifically for
+    # the eval_pass_probability objective rather than raw net profit --
+    # see each SkeletonSpec's own comment block above.
+    _LIQUIDITY_SWEEP_QUICK_RECLAIM.name: _LIQUIDITY_SWEEP_QUICK_RECLAIM,
+    _RANGE_MIDPOINT_FADE.name: _RANGE_MIDPOINT_FADE,
+    _OPENING_RANGE_RETEST_CONFIRMATION.name: _OPENING_RANGE_RETEST_CONFIRMATION,
+    _MICRO_PULLBACK_CONTINUATION.name: _MICRO_PULLBACK_CONTINUATION,
+    _CHANGE_OF_CHARACTER_REVERSAL_SCALP.name: _CHANGE_OF_CHARACTER_REVERSAL_SCALP,
+    _FVG_QUICK_FILL_FADE.name: _FVG_QUICK_FILL_FADE,
 }
 
 # Families that need something beyond the plain OHLCV df -- checked by

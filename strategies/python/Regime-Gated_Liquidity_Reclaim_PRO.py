@@ -4,6 +4,34 @@ import numpy as np
 STRATEGY_NAME = "Regime-Gated Liquidity Reclaim PRO"
 
 # ============================================================
+# DATA TIMEZONE (2026-09-03: see zero-trade root-cause note below)
+# ============================================================
+
+# The session gates below (SESSION_1/2_START/END_ET) are defined in US
+# Eastern Time, but this strategy has no way to know what timezone the
+# LOADED CSV's timestamps actually are in -- it previously just assumed
+# "naive timestamp == UTC" unconditionally. That assumption was verified
+# true for Owen's original XAUUSD15 feed (see /areas/prop-algo-backtester
+# memory: "confirmed via DST-shift signature in daily broker gap"), but a
+# DIFFERENT feed -- e.g. a GC1! continuous-futures export from a different
+# vendor -- has no reason to share that same convention: CME/COMEX futures
+# data is very often distributed in Chicago time (America/Chicago) or raw
+# exchange time instead. If this constant is wrong for the loaded file,
+# EVERY session-window check below silently checks the wrong 4 hours of
+# the day, every single day, for the strategy's entire run -- combined
+# with this strategy's already-narrow multi-gate confluence (liquidity
+# sweep + FVG + trend + ATR-regime, all within the same 2-hour window),
+# that's a completely plausible way to go from "rare" to "exactly zero"
+# over a multi-year dataset without any other bug at all.
+#
+# Set this to whatever the loaded CSV's timestamps actually are BEFORE
+# treating a zero-trade result on a new data source as a strategy-logic
+# bug -- try "America/Chicago" first for CME/COMEX futures feeds if
+# "UTC" produces zero trades. Run a plain Run & Report (Step 5) after
+# each change; a single-digit-hour shift is usually enough to tell.
+SOURCE_TZ = "UTC"
+
+# ============================================================
 # CORE PARAMETERS
 # ============================================================
 
@@ -92,7 +120,7 @@ def generate_signals(df: pd.DataFrame) -> pd.Series:
     if ts.dt.tz is None:
         et = (
             ts.dt
-            .tz_localize("UTC")
+            .tz_localize(SOURCE_TZ)
             .dt
             .tz_convert("America/New_York")
         )

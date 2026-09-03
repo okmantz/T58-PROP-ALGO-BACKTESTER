@@ -114,6 +114,7 @@ def _evo_init_worker(df_pickle_path: str, risk_kwargs: dict, prop_kwargs: dict, 
 def _evo_prefilter_task(
     cid: str, spec: dict, meta: dict,
     min_trades: int, min_profit_factor: float, max_drawdown_pct: float, max_drawdown_buffer_mult: float,
+    prefilter_max_bars: int | None = None,
 ):
     """One candidate's PRE-FILTER: build + backtest + the cheap pass/fail
     test, run in a worker process. Mirrors
@@ -122,8 +123,17 @@ def _evo_prefilter_task(
     unavailable, so there's exactly one place the filter logic lives;
     this just re-parametrizes it without `self` so it can cross a
     process boundary. Returns a plain tuple (never raises) so one bad
-    generated spec can't take down the whole prefilter batch."""
+    generated spec can't take down the whole prefilter batch.
+
+    `prefilter_max_bars`, when set, backtests only the most recent N bars
+    of the loaded dataset for THIS cheap pass only -- the worker's full
+    dataset (_EVO_WORKER["df"]) is untouched, so any later stage that
+    re-fetches it (full-eval, robustness, etc.) still sees every bar.
+    See EvolutionConfig.prefilter_max_bars for why this exists.
+    """
     df, risk = _EVO_WORKER["df"], _EVO_WORKER["risk"]
+    if prefilter_max_bars and len(df) > prefilter_max_bars:
+        df = df.tail(prefilter_max_bars)
     try:
         strategy = build_strategy_from_spec(spec)
         bt = run_backtest(df, strategy, risk, adaptive_risk=_EVO_WORKER.get("adaptive_risk"))
@@ -320,7 +330,41 @@ class EvolutionConfig:
     # loosened once (same idea as Search Lab's own Stage 1 auto-relax)
     # instead of the run silently grinding forever with an empty
     # leaderboard and no indication why.
-    auto_relax_after_empty_generations: int = 3
+    # Lowered 3 -> 2 (2026-09-03): on a large intraday dataset (e.g. a
+    # multi-year 1-minute feed), a single generation's PRE-FILTER stage
+    # alone can take hours (50 candidates x one real backtest each over
+    # millions of bars) -- waiting for 3 of those in a row before ever
+    # relaxing meant an overnight run that never got there at all. See
+    # prefilter_max_bars below for the other half of this fix.
+    auto_relax_after_empty_generations: int = 2
+
+    # PRE-FILTER-only bar cap (2026-09-03): the PRE-FILTER stage is
+    # supposed to be the CHEAP stage -- one plain backtest per candidate,
+    # just to weed out obvious non-starters before the expensive
+    # robustness/OOS/Monte Carlo/CPCV stage runs on the survivors. On a
+    # multi-year 1-minute dataset (millions of bars), even that "cheap"
+    # backtest is expensive enough that a whole night can produce only 1-2
+    # generations -- which is indistinguishable, from the log alone, from
+    # the run being stuck (see _finish_empty_generation's elapsed-time
+    # logging below, added for exactly this). Setting this caps PRE-FILTER
+    # backtests to the most recent N bars ONLY; every survivor still goes
+    # through the full stack (robustness/OOS/Monte Carlo/CPCV/stress) on
+    # the COMPLETE dataset once it clears this cheap first pass -- nothing
+    # ever gets a final verdict off less than the full data. None (the
+    # default) auto-selects a cap once the loaded dataset exceeds
+    # AUTO_PREFILTER_BAR_THRESHOLD bars (see _resolved_prefilter_max_bars),
+    # and leaves normal-sized datasets (15m/1h/daily feeds) completely
+    # untouched. Set to 0 to force no cap regardless of dataset size.
+    prefilter_max_bars: int | None = None
+
+
+# A multi-year 1-minute-bar dataset (Owen's GC1! feed: ~2.04M bars) is
+# roughly this size or larger; a typical 15m/1h/daily feed is nowhere
+# close. Only datasets at or above this size get an automatic PRE-FILTER
+# cap when prefilter_max_bars is left at its default (None) -- see
+# EvolutionConfig.prefilter_max_bars and EvolutionRunner._resolved_prefilter_max_bars.
+AUTO_PREFILTER_BAR_THRESHOLD = 500_000
+AUTO_PREFILTER_BAR_CAP = 250_000
 
 
 @dataclass
@@ -598,11 +642,13 @@ class EvolutionRunner:
                     break
 
                 stage1_survivors, rejection_counts = self._prefilter(population, gen)
-                self._log(f"PRE-FILTER + BACKTEST: {len(stage1_survivors)}/{len(population)} survived.")
+                prefilter_elapsed = time.time() - t0
+                self._log(f"PRE-FILTER + BACKTEST: {len(stage1_survivors)}/{len(population)} survived "
+                          f"(took {prefilter_elapsed:.1f}s).")
                 if not stage1_survivors:
                     self._handle_empty_prefilter(gen, rejection_counts)
                 if self._stop_flag.is_set() or not stage1_survivors:
-                    self._finish_empty_generation(gen, population)
+                    self._finish_empty_generation(gen, population, elapsed=time.time() - t0)
                     self._save_checkpoint(next_generation=gen + 1)
                     gen += 1
                     continue
@@ -611,7 +657,7 @@ class EvolutionRunner:
                 evaluated = self._full_eval(stage1_survivors)
                 self._log(f"ROBUSTNESS / OOS / MONTE CARLO / PROP SIMULATION: {len(evaluated)} candidates scored.")
                 if self._stop_flag.is_set() or not evaluated:
-                    self._finish_empty_generation(gen, population, evaluated)
+                    self._finish_empty_generation(gen, population, evaluated, elapsed=time.time() - t0)
                     self._save_checkpoint(next_generation=gen + 1)
                     gen += 1
                     continue
@@ -676,8 +722,9 @@ class EvolutionRunner:
             )
             self._consecutive_empty_generations = 0
 
-    def _finish_empty_generation(self, gen, population, evaluated=None) -> None:
-        self._log(f"Generation {gen}: nothing survived far enough to update the leaderboard -- continuing to the next generation.")
+    def _finish_empty_generation(self, gen, population, evaluated=None, elapsed: float | None = None) -> None:
+        suffix = f" (took {elapsed:.1f}s)" if elapsed is not None else ""
+        self._log(f"Generation {gen}: nothing survived far enough to update the leaderboard{suffix} -- continuing to the next generation.")
 
     # -- GENERATE ---------------------------------------------------------
     def _generate_population(self, gen: int, elites: list[tuple[dict, dict]]) -> list[tuple[str, dict, dict]]:
@@ -776,6 +823,32 @@ class EvolutionRunner:
         return picked
 
     # -- PRE-FILTER + BACKTEST --------------------------------------------
+    def _resolved_prefilter_max_bars(self) -> int | None:
+        """Resolves EvolutionConfig.prefilter_max_bars to an actual cap:
+        an explicit positive value is used as-is, 0 means "no cap" no
+        matter the dataset size, and None (the default) auto-caps only
+        once the loaded dataset is at or above AUTO_PREFILTER_BAR_THRESHOLD
+        -- see that constant and EvolutionConfig.prefilter_max_bars for
+        the full reasoning. Logs once per run (not once per generation)
+        so it's visible without being noisy."""
+        configured = self.cfg.prefilter_max_bars
+        if configured == 0:
+            return None
+        if configured:
+            return configured
+        if len(self.df) >= AUTO_PREFILTER_BAR_THRESHOLD:
+            if not getattr(self, "_logged_auto_prefilter_cap", False):
+                self._logged_auto_prefilter_cap = True
+                self._log(
+                    f"  NOTE: loaded dataset has {len(self.df):,} bars (>= {AUTO_PREFILTER_BAR_THRESHOLD:,}) -- "
+                    f"auto-capping the cheap PRE-FILTER backtest to the most recent {AUTO_PREFILTER_BAR_CAP:,} "
+                    f"bars for speed. Every PRE-FILTER survivor still gets its full robustness/OOS/Monte "
+                    f"Carlo/CPCV/prop-simulation evaluation on the COMPLETE dataset -- only this cheap first "
+                    f"pass is capped. Set 'Pre-filter bars cap' explicitly (or to 0 for no cap) to override."
+                )
+            return AUTO_PREFILTER_BAR_CAP
+        return None
+
     def _prefilter(self, population: list[tuple[str, dict, dict]], gen: int):
         """Runs every candidate in `population` through build+backtest+the
         cheap pass/fail test. Dispatches across the worker pool (see
@@ -821,6 +894,7 @@ class EvolutionRunner:
                 survivors.append((cid, spec, meta, bt))
 
         pool = self._ensure_pool()
+        prefilter_max_bars = self._resolved_prefilter_max_bars()
         if pool is None:
             # Serial fallback still calls _evo_prefilter_task (single
             # source of truth for the filter logic) -- it just runs it
@@ -835,6 +909,7 @@ class EvolutionRunner:
                 cid_out, spec_out, meta_out, bt, reasons, error, stats = _evo_prefilter_task(
                     cid, spec, meta, self.cfg.min_trades, self.cfg.min_profit_factor,
                     self.prop_rules.max_drawdown_pct, self.cfg.max_drawdown_buffer_mult,
+                    prefilter_max_bars,
                 )
                 _consume(cid_out, spec_out, meta_out, bt, reasons, error, stats)
         else:
@@ -842,6 +917,7 @@ class EvolutionRunner:
                 pool.submit(
                     _evo_prefilter_task, cid, spec, meta, self.cfg.min_trades, self.cfg.min_profit_factor,
                     self.prop_rules.max_drawdown_pct, self.cfg.max_drawdown_buffer_mult,
+                    prefilter_max_bars,
                 ): (cid, spec, meta)
                 for cid, spec, meta in population
             }

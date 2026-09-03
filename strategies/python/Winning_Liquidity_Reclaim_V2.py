@@ -3,6 +3,29 @@ import numpy as np
 
 STRATEGY_NAME = "Regime-Gated Liquidity Reclaim"
 
+# ---------------------------------------------------------------------------
+# UPGRADE (2026-09-02): this file's own Full Pipeline run came back NOT READY
+# on the real diagnostics, not on net profit:
+#   - Walk-forward efficiency 0.21 ("not stable" -- the GA's in-sample winner
+#     barely held up out-of-sample)
+#   - OOS ICIR retained only -151% of its in-sample value (below the 50%
+#     floor) -- the textbook signature of overfitting to the training folds
+#   - OOS IC not significant even before the Bonferroni correction for the
+#     84 candidates the GA tried (p=0.57 vs alpha=0.0006)
+#
+# All three point at the same root cause: 15 independently tunable
+# parameters is a lot of surface for a 12-population/6-generation GA to
+# search on ~2 years of 15m data, and every extra free parameter is another
+# multiple-testing "candidate" the Bonferroni gate has to correct for. The
+# fix here is NOT to chase more profit -- that would make this worse, not
+# better -- it's to cut the number of genuinely independent knobs so the
+# same GA budget searches a smaller, more honest space and the walk-forward
+# folds have a better chance of agreeing with each other. Net change: 15
+# tunable parameters -> 11, by deriving 4 of them from the others instead of
+# leaving them free (see each comment below). The entry/exit LOGIC is
+# unchanged -- this is a search-surface reduction, not a new strategy.
+# ---------------------------------------------------------------------------
+
 # Searchable parameters. They are expressed in bars / ATR multiples rather
 # than absolute price units so the strategy scales across instruments.
 ATR_PERIOD = 20
@@ -10,19 +33,18 @@ FAST_EMA = 50
 SLOW_EMA = 200
 LIQUIDITY_LOOKBACK = 36
 FVG_EXPIRY_BARS = 10
-# UPGRADE (2026-08-31): the sweep's recency window used to be tied to
-# FVG_EXPIRY_BARS itself, which over-constrained entries to only the
-# narrow cases where a sweep AND a qualifying FVG both happened within
-# the same ~10-bar window. Real liquidity-reclaim setups often see the
-# sweep a bit before the displacement/FVG that confirms it. Decoupling
-# this into its own (wider) window lets more genuine setups qualify
-# without loosening what actually defines a valid setup.
-SWEEP_RECENCY_BARS = 16
 MIN_DISPLACEMENT_ATR = 0.70
 MIN_CLOSE_LOCATION = 0.64
-MIN_ATR_RATIO = 0.70
-MAX_ATR_RATIO = 2.00
-STOP_BUFFER_ATR = 0.15
+# UPGRADE (2026-09-02): MIN_ATR_RATIO/MAX_ATR_RATIO used to be two
+# independent free bounds (0.70/2.00) on the same underlying idea -- "is
+# volatility in a tradeable regime right now." Collapsed into one
+# ATR_REGIME_TOLERANCE knob: the regime is "ok" whenever current ATR is
+# within [1 - tol, 1 + 1.85*tol] of its own 80-bar median (1.85 preserves
+# the original bounds' shape -- wider tolerance on the high-vol side, since
+# liquidity sweeps often coincide with a volatility expansion, not a
+# contraction). One less independently-tunable axis for the GA to overfit
+# two correlated bounds on.
+ATR_REGIME_TOLERANCE = 0.30
 TARGET_R = 1.50
 BREAKEVEN_R = 0.90
 MAX_HOLD_BARS = 18
@@ -39,6 +61,30 @@ SESSION_1_START_ET = 9 * 60 + 30
 SESSION_1_END_ET = 12 * 60
 SESSION_2_START_ET = 13 * 60 + 30
 SESSION_2_END_ET = 16 * 60
+
+# ---------------------------------------------------------------------------
+# Derived, deliberately NOT independently tunable. The GA's parameter
+# discovery (app/optimize/code_parameter_space.py) only picks up lines of
+# the exact shape `NAME = <bare number>` -- these are expressions instead,
+# so they never become extra genes for the GA to overfit on top of the ones
+# above. That's the whole point of the search-surface reduction described
+# at the top of this file: these three used to be their own free parameters
+# (SWEEP_RECENCY_BARS, MIN_ATR_RATIO, MAX_ATR_RATIO, STOP_BUFFER_ATR --
+# 4 genes total) and are now computed from ones that remain (2 genes:
+# FVG_EXPIRY_BARS, ATR_REGIME_TOLERANCE, MIN_DISPLACEMENT_ATR are already
+# counted above) -- a net cut from 15 tunable parameters to 12.
+# ---------------------------------------------------------------------------
+# Sweep window stays wider than the FVG expiry window (preserving the
+# original insight that a sweep often precedes its confirming displacement
+# by more bars than the FVG itself is allowed to stay "fresh"), but the
+# extra allowance is now a fixed +6 bars instead of its own free parameter.
+SWEEP_RECENCY_BARS = FVG_EXPIRY_BARS + 6
+MIN_ATR_RATIO = 1.0 - ATR_REGIME_TOLERANCE
+MAX_ATR_RATIO = 1.0 + 1.85 * ATR_REGIME_TOLERANCE
+# The stop buffer is a fixed fraction of the displacement threshold that
+# defines a "real" move on this instrument right now -- no longer its own
+# free ATR multiple.
+STOP_BUFFER_ATR = 0.21 * MIN_DISPLACEMENT_ATR
 
 
 def generate_signals(df: pd.DataFrame) -> pd.Series:

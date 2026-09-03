@@ -85,6 +85,23 @@ _SKELETON_TO_GROUP: dict[str, str] = {
     "momentum_continuation": "momentum",
     "vwap_reversion": "vwap",
     "market_structure_shift": "market_structure",
+    "prev_day_range_breakout": "breakout",
+    "macd_cross_trend": "trend_following",
+    "swing_structure_fade": "mean_reversion",
+    "fvg_imbalance_continuation": "liquidity_sweep",
+    "order_block_reaction": "market_structure",
+    "volatility_contraction_squeeze": "volatility_contraction",
+    "overnight_gap_fade": "mean_reversion",
+    "wma_ribbon_trend": "trend_following",
+    "pct_change_momentum_burst": "momentum",
+    "rsi_extreme_reversion": "mean_reversion",
+    # Prop-eval-shaped scalp families (app.search.strategy_space Families U-Z)
+    "liquidity_sweep_quick_reclaim": "liquidity_sweep",
+    "range_midpoint_fade": "mean_reversion",
+    "opening_range_retest_confirmation": "opening_range",
+    "micro_pullback_continuation": "pullback",
+    "change_of_character_reversal_scalp": "market_structure",
+    "fvg_quick_fill_fade": "liquidity_sweep",
 }
 
 # Path 2a: app.strategy.dna active_tags() -> canonical group. Checked in

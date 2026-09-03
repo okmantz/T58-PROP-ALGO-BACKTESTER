@@ -165,6 +165,19 @@ def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
 
 
 def build_indicator_series(frame: pd.DataFrame, kind: str, period: int = 14, column: str = "close", lookback: int | None = None) -> pd.Series:
+    """Thin caching wrapper -- see app.strategy.indicator_cache for why.
+    The actual per-kind math is unchanged, in _build_indicator_series_uncached
+    below; every existing caller and behavior is identical, just memoized
+    per (frame, kind, period, column, lookback) within this process."""
+    from app.strategy import indicator_cache
+
+    return indicator_cache.get_or_compute(
+        frame, kind, period, column, lookback,
+        compute_fn=lambda: _build_indicator_series_uncached(frame, kind, period, column, lookback),
+    )
+
+
+def _build_indicator_series_uncached(frame: pd.DataFrame, kind: str, period: int = 14, column: str = "close", lookback: int | None = None) -> pd.Series:
     kind = kind.lower()
     p = _period(period)
     source = frame[column] if column in frame.columns else frame["close"]

@@ -62,6 +62,8 @@ from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_itera
 from app.optimize.multi_objective import DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
+from app.orchestration.speed_run import SpeedRunConfig, SpeedRunResult, run_speed_run
+from app.orchestration.speed_run import _rank_key as _speedrun_rank_key
 from app.orchestration.full_pipeline import (
     FullPipelineBatchItem, FullPipelineConfig, run_full_pipeline, run_full_pipeline_batch,
 )
@@ -960,6 +962,7 @@ class MainWindow:
         self.tab_wfga = Frame(self.content, bg=BG)
         self.tab_ensemble = Frame(self.content, bg=BG)
         self.tab_fullpipeline = Frame(self.content, bg=BG)
+        self.tab_speedrun = Frame(self.content, bg=BG)
         self.tab_forwardtest = Frame(self.content, bg=BG)
         self.tab_deploylive = Frame(self.content, bg=BG)
         self.tab_livemarket = Frame(self.content, bg=BG)
@@ -974,6 +977,7 @@ class MainWindow:
             self.tab_risk, self.tab_run, self.tab_payout, self.tab_refine, self.tab_search,
             self.tab_wfo, self.tab_cpcv, self.tab_sensitivity, self.tab_portfolio,
             self.tab_multiobj, self.tab_wfga, self.tab_ensemble, self.tab_fullpipeline,
+            self.tab_speedrun,
             self.tab_forwardtest, self.tab_deploylive, self.tab_livemarket, self.tab_genstrat,
             self.tab_evolution, self.tab_researchagent, self.tab_regime_matrix, self.tab_family_diversity,
         ):
@@ -993,6 +997,9 @@ class MainWindow:
             (None, None, "OVERVIEW", None, None),
             ("dashboard", "", "Dashboard", self.tab_dashboard, NEON_VIOLET),
             ("manual", "", "User Manual", self.tab_manual, METAL_BRIGHT),
+
+            (None, None, "DEADLINE MODE", None, None),
+            ("speedrun", "", "\u26a1 SPEED RUN", self.tab_speedrun, RED),
 
             (None, None, "WORKFLOW", None, None),
             ("data", "", "01  Data", self.tab_data, NEON_CYAN),
@@ -1038,6 +1045,7 @@ class MainWindow:
         for label, builder in (
             ("Dashboard", self._build_dashboard_tab),
             ("Manual builder", self._build_manual_tab),
+            ("Speed Run", self._build_speedrun_tab),
             ("Data", self._build_data_tab),
             ("Strategy", self._build_strategy_tab),
             ("Prop rules", self._build_prop_tab),
@@ -9213,6 +9221,287 @@ class MainWindow:
             self.fullpipeline_verdict_label.config(text="Failed -- see log.", fg=RED)
         finally:
             self.fullpipeline_progress.stop()
+
+    # -----------------------------------------------------------------------
+    # Speed Run — "I have almost no time left, find me anything that
+    # works." One button, no strategy to bring in: chains a wide
+    # multi-family discovery search (app.search.batch_runner via
+    # app.orchestration.speed_run) straight into concurrent Full Pipeline
+    # validation of the top survivors, then reports whichever one is best.
+    # Every setting this module exposes is a speed/thoroughness tradeoff,
+    # never a correctness one -- see app.orchestration.speed_run's module
+    # docstring. This is the one tab in the app that discovers its OWN
+    # strategy rather than testing one you already configured on Step 02,
+    # so it only needs Steps 01 (Data), 03 (Prop Rules), and 04 (Risk).
+    # -----------------------------------------------------------------------
+
+    def _build_speedrun_tab(self):
+        f = self._scrollable(self.tab_speedrun)
+
+        self._page_header(
+            f,
+            "\u26a1 / Deadline Mode",
+            "Speed Run",
+            "One button: searches EVERY registered strategy family at once for something "
+            "that shows an edge, validates the best few candidates through Full Pipeline "
+            "(walk-forward-aware GA + fresh Monte Carlo + out-of-sample check) running "
+            "concurrently, and hands back whichever one is best -- READY, MARGINAL, or "
+            "(if nothing cleared the bar) an honest 'no winner found'. This does NOT skip "
+            "any check Full Pipeline or Search Lab would otherwise run; it only asks each "
+            "of them to spend less time per candidate, and every existing safeguard "
+            "(lookahead detection, pip-scale mismatch, stop-fill honesty, the account-blown "
+            "circuit breaker) still runs exactly as it does everywhere else in this app. "
+            "Uses the data, prop rules, and risk settings from Steps 01/03/04 -- it finds "
+            "its own strategy, so Step 02 (Strategy) is skipped entirely. Depending on your "
+            "data size and machine, a run typically takes anywhere from several minutes to "
+            "an hour or more; use the settings below to trade thoroughness for speed.",
+        )
+
+        settings = self._section(
+            f, "Speed Run settings",
+            "Defaults are already tuned toward speed over thoroughness -- lower them further "
+            "for a quicker, rougher pass, or raise them if you have more time to spend before "
+            "the deadline.",
+            emphasize=True,
+        )
+        self.sr_max_candidates = LabeledEntry(settings, "Discovery: max candidates sampled (all families combined)", 1200)
+        self.sr_stage1_top_n = LabeledEntry(settings, "Discovery: Stage 1 survivors kept", 24)
+        self.sr_ga_population = LabeledEntry(settings, "Discovery: GA population", 8)
+        self.sr_ga_generations = LabeledEntry(settings, "Discovery: GA generations", 3)
+        self.sr_top_k = LabeledEntry(settings, "Candidates to validate through Full Pipeline", 3)
+        self.sr_max_concurrent = LabeledEntry(settings, "Max concurrent validations", 2)
+        self.sr_validation_folds = LabeledEntry(settings, "Validation: walk-forward/OOS folds", 3)
+        self.sr_validation_final_mc_sims = LabeledEntry(settings, "Validation: final Monte Carlo sims", 3000)
+        self._sr_metric_labels = list(FITNESS_METRICS.values())
+        self._sr_metric_label_to_key = {v: k for k, v in FITNESS_METRICS.items()}
+        self.sr_metric = LabeledCombo(
+            settings, "Fitness metric", self._sr_metric_labels, FITNESS_METRICS["eval_pass_probability"],
+        )
+        self.sr_seed = LabeledEntry(settings, "Random seed", 42)
+
+        library_section = self._section(
+            f, "Strategy Library",
+            "The winner (if any) is a code strategy discovered from scratch, so -- unlike "
+            "Manual Strategy Builder configs -- it always has something to save.",
+        )
+        self.sr_save_to_library = LabeledCheckbox(
+            library_section, "Save the winning strategy to the Strategy Library when finished", True,
+        )
+
+        button_row = Frame(f, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=10)
+        self._button(button_row, "FIND ME A WINNER", self._speedrun_run_clicked, primary=True).pack(side="left")
+        self.stop_speedrun_btn = self._button(button_row, "STOP", self._speedrun_stop_clicked)
+        self.stop_speedrun_btn.config(state="disabled")
+        self.stop_speedrun_btn.pack(side="left", padx=8)
+        self.open_speedrun_report_btn = self._button(button_row, "OPEN WINNER REPORT", self._open_speedrun_winner_report)
+        self.open_speedrun_report_btn.config(state="disabled")
+        self.open_speedrun_report_btn.pack(side="left", padx=8)
+
+        self.speedrun_progress = NeuralProgress(f)
+        self.speedrun_progress.pack(fill="x", padx=24, pady=(2, 10))
+
+        verdict_section = self._section(f, "Winner", "Filled in once a run completes.")
+        self.speedrun_verdict_label = Label(
+            verdict_section, text="No run yet.", bg=PANEL, fg=TEXT_DIM,
+            font=_safe_font(11, "bold"), justify="left", wraplength=820, anchor="w",
+        )
+        self.speedrun_verdict_label.pack(anchor="w", fill="x", padx=18, pady=(2, 10))
+
+        candidates_section = self._section(
+            f, "Validated candidates",
+            "Every candidate that made it to Full Pipeline validation, ranked best first "
+            "(READY beats MARGINAL beats anything else, tied-broken by eval pass probability). "
+            "Double-click a row (or select it and click OPEN REPORT) to open that candidate's "
+            "own full HTML report.",
+        )
+        cand_list_frame = Frame(candidates_section, bg=PANEL)
+        cand_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 6))
+        cand_list_frame.columnconfigure(0, weight=1)
+        cand_list_frame.rowconfigure(0, weight=1)
+        self.speedrun_candidates_listbox = Listbox(
+            cand_list_frame, height=8, exportselection=False, bg=PANEL_3, fg=TEXT,
+            activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+            font=(MONO, 9),
+        )
+        sr_cand_scrollbar = ttk.Scrollbar(
+            cand_list_frame, orient="vertical", command=self.speedrun_candidates_listbox.yview,
+            style="T58.Vertical.TScrollbar",
+        )
+        self.speedrun_candidates_listbox.config(yscrollcommand=sr_cand_scrollbar.set)
+        self._bind_isolated_wheel(self.speedrun_candidates_listbox)
+        self.speedrun_candidates_listbox.grid(row=0, column=0, sticky="nsew")
+        sr_cand_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.speedrun_candidates_listbox.bind("<Double-Button-1>", lambda e: self._open_speedrun_selected_candidate_report())
+
+        cand_btn_row = Frame(candidates_section, bg=PANEL)
+        cand_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
+        self._button(cand_btn_row, "OPEN REPORT", self._open_speedrun_selected_candidate_report).pack(side="left")
+
+        self._speedrun_candidates_cache: list[dict] = []
+
+        output_section = self._section(f, "Speed Run output", "Live progress log (Phase 1 discovery -> Phase 2 validation -> Phase 3 winner selection).")
+        _speedrun_output_frame = Frame(output_section, bg=PANEL)
+        self.speedrun_output = Text(
+            _speedrun_output_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, 9),
+        )
+        _speedrun_output_scroll = ttk.Scrollbar(
+            _speedrun_output_frame, orient="vertical", command=self.speedrun_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.speedrun_output.configure(yscrollcommand=_speedrun_output_scroll.set)
+        self.speedrun_output.pack(side="left", fill="both", expand=True)
+        _speedrun_output_scroll.pack(side="right", fill="y")
+        _speedrun_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.speedrun_output)
+
+        self._last_speedrun_html_path = None
+        self._speedrun_cancel_event = threading.Event()
+
+    def _log_speedrun(self, msg: str):
+        # Unlike every other tab's progress log, Speed Run's own Phase 2
+        # can call this from SEVERAL concurrent validation worker threads
+        # at once (run_speed_run serializes them with its own lock, but
+        # they're still not the single background thread every other
+        # tab's log callback assumes). Tkinter widgets are only safe to
+        # touch from the main thread, so marshal onto it via root.after()
+        # instead of writing directly -- the same pattern already used by
+        # _test_ollama_connection's background-thread callback.
+        def _write():
+            self.speedrun_output.insert(END, msg + "\n")
+            self.speedrun_output.see(END)
+        try:
+            self.root.after(0, _write)
+        except Exception:
+            pass
+
+    def _open_speedrun_winner_report(self):
+        if self._last_speedrun_html_path:
+            webbrowser.open(f"file://{self._last_speedrun_html_path.resolve()}")
+
+    def _open_speedrun_selected_candidate_report(self):
+        sel = self.speedrun_candidates_listbox.curselection()
+        if not sel or not self._speedrun_candidates_cache:
+            return
+        row = self._speedrun_candidates_cache[sel[0]]
+        html_path = row.get("html_path")
+        if html_path:
+            webbrowser.open(f"file://{html_path.resolve()}")
+
+    def _render_speedrun_candidates(self, result: SpeedRunResult):
+        self.speedrun_candidates_listbox.delete(0, END)
+        self._speedrun_candidates_cache = []
+        ranked = sorted(result.candidates, key=_speedrun_rank_key)
+        for r in ranked:
+            if r.pipeline_result is not None:
+                pr = r.pipeline_result
+                html_path = pr.report_paths.get("html")
+                line = (
+                    f"[{pr.verdict:9s}]  {r.candidate_id}  ({r.family or 'unknown family'})  "
+                    f"eval pass {pr.final_mc.evaluation_pass_probability:5.1f}%  "
+                    f"payout {pr.final_mc.first_payout_probability:5.1f}%"
+                )
+            else:
+                html_path = None
+                line = f"[FAILED   ]  {r.candidate_id}  ({r.family or 'unknown family'})  -- {r.error}"
+            self.speedrun_candidates_listbox.insert(END, line)
+            self._speedrun_candidates_cache.append({"row": r, "html_path": html_path})
+
+    def _speedrun_run_clicked(self):
+        if not self.csv_paths:
+            messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        self.speedrun_output.delete("1.0", END)
+        self.speedrun_candidates_listbox.delete(0, END)
+        self._speedrun_candidates_cache = []
+        self.open_speedrun_report_btn.config(state="disabled")
+        self.speedrun_verdict_label.config(text="Running...", fg=TEXT_DIM)
+        self._speedrun_cancel_event.clear()
+        self.stop_speedrun_btn.config(state="normal")
+        self.speedrun_progress.start(10)
+        threading.Thread(target=self._speedrun_run_pipeline, daemon=True).start()
+
+    def _speedrun_stop_clicked(self):
+        """Sets the shared cancel event, which run_speed_run() checks between
+        discovery and validation -- an in-flight validation still finishes
+        (Full Pipeline itself isn't interruptible mid-fold), but no further
+        candidates are started and whatever already finished is still
+        reported rather than thrown away."""
+        self._speedrun_cancel_event.set()
+        self.stop_speedrun_btn.config(state="disabled")
+        self._log_speedrun("\nStopping... (finishing whatever's already in flight, no new candidates will start)")
+
+    def _speedrun_run_pipeline(self):
+        try:
+            df = self._load_df_for_page(self._log_speedrun)
+            if df is None:
+                return
+            risk = self._build_risk_config()
+            rules = self._build_prop_rules()
+
+            metric_key = self._sr_metric_label_to_key.get(self.sr_metric.get_str(), "eval_pass_probability")
+            cfg = SpeedRunConfig(
+                max_candidates=self.sr_max_candidates.get_int(1200),
+                stage1_top_n=self.sr_stage1_top_n.get_int(24),
+                ga_population=self.sr_ga_population.get_int(8),
+                ga_generations=self.sr_ga_generations.get_int(3),
+                top_k_to_validate=self.sr_top_k.get_int(3),
+                max_concurrent_validations=self.sr_max_concurrent.get_int(2),
+                validation_folds=self.sr_validation_folds.get_int(3),
+                validation_final_mc_sims=self.sr_validation_final_mc_sims.get_int(3000),
+                fitness_metric=metric_key,
+                save_winner_to_library=self.sr_save_to_library.get(),
+                random_seed=self.sr_seed.get_int(42),
+            )
+
+            instrument = (
+                os.path.basename(self.csv_paths[0])
+                if len(self.csv_paths) == 1
+                else " + ".join(os.path.basename(p) for p in self.csv_paths)
+            )
+            self._log_speedrun(f"Starting Speed Run on {instrument} ({len(df)} bars)...\n")
+            result = run_speed_run(
+                df, risk, rules, OUTPUT_DIR / "speed_run", cfg,
+                progress_cb=self._log_speedrun, instrument=instrument,
+                cancel_event=self._speedrun_cancel_event,
+            )
+
+            self._render_speedrun_candidates(result)
+
+            if result.winner is not None and result.winner.pipeline_result is not None:
+                pr = result.winner.pipeline_result
+                self._last_speedrun_html_path = pr.report_paths.get("html")
+                self.open_speedrun_report_btn.config(state="normal" if self._last_speedrun_html_path else "disabled")
+                verdict_color = {"READY": GREEN, "MARGINAL": AMBER}.get(pr.verdict, TEXT_DIM)
+                self.speedrun_verdict_label.config(
+                    text=(
+                        f"WINNER: {result.winner.candidate_id} ({result.winner.family or 'unknown family'})\n"
+                        f"  {pr.verdict}  --  eval pass {pr.final_mc.evaluation_pass_probability:.1f}%  --  "
+                        f"payout {pr.final_mc.first_payout_probability:.1f}%"
+                    ),
+                    fg=verdict_color,
+                )
+                if pr.saved_library_note:
+                    self._log_speedrun(f"\n{pr.saved_library_note}")
+            else:
+                self._last_speedrun_html_path = None
+                self.open_speedrun_report_btn.config(state="disabled")
+                self.speedrun_verdict_label.config(text=f"No winner. {result.winner_reason}", fg=RED)
+
+            try:
+                self._refresh_dashboard()
+            except Exception:
+                pass
+
+            self._log_speedrun(f"\n{result.winner_reason}")
+            self._log_speedrun(f"\nDone in {result.elapsed_seconds / 60:.1f} minute(s).")
+        except Exception:
+            self._log_speedrun("\nUnexpected error:\n" + traceback.format_exc())
+            self.speedrun_verdict_label.config(text="Failed -- see log.", fg=RED)
+        finally:
+            self.speedrun_progress.stop()
+            self.stop_speedrun_btn.config(state="disabled")
 
     # -----------------------------------------------------------------------
     # Tab 16 — AI Research Agent (T58 AI Research Engine)

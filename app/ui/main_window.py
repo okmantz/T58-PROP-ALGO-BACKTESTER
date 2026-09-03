@@ -450,6 +450,7 @@ class NeuralProgress(Canvas):
     FRAME_MS = 33                     # ~30fps -- smooth without burning CPU on a purely decorative animation
     ESTIMATE_CEILING_PCT = 96.0        # never implies completion on its own -- only stop() does that
     ESTIMATE_TAU_SECONDS = 14.0        # how quickly the estimate eases toward the ceiling
+    DISPLAY_EASE_TAU_SECONDS = 0.35    # how quickly the DRAWN bar glides toward whatever it's targeting
     SWEEP_SECONDS = 1.8                # time for one highlight streak to cross the filled portion
     CORNER_RADIUS = 7
 
@@ -461,6 +462,19 @@ class NeuralProgress(Canvas):
         self._t0 = 0.0
         self._sweep_phase = 0.0
         self._manual_pct: float | None = None   # set via set_progress(); None means "use the eased estimate"
+        # UPGRADE (2026-09-03, smoothness): _current_pct() used to return
+        # whichever number it was targeting (the auto-estimate curve, or
+        # set_progress()'s manual value) DIRECTLY -- fine for the smooth
+        # auto-estimate curve, but every set_progress() call (Search Lab
+        # "Stage 1: 40/84...", a fold completing, a candidate finishing)
+        # made the bar SNAP straight to the new percentage with no
+        # transition at all. That instant jump between milestones was the
+        # actual "choppy" bit, not the fill/glow rendering. _displayed_pct
+        # is the value actually drawn; _current_pct() now eases it toward
+        # whatever the real target is every frame, so a jump from 40% to
+        # 55% glides there over a couple hundred ms instead of teleporting.
+        self._displayed_pct = 0.0
+        self._last_frame_t = time.monotonic()
         self._label = "LOADING...."
         self.bind("<Configure>", lambda _e: self._draw())
         self._draw()  # resting state before the first start()
@@ -471,6 +485,8 @@ class NeuralProgress(Canvas):
         self._running = True
         self._manual_pct = None
         self._t0 = time.monotonic()
+        self._last_frame_t = self._t0
+        self._displayed_pct = 0.0
         self._sweep_phase = 0.0
         self._tick()
 
@@ -478,12 +494,14 @@ class NeuralProgress(Canvas):
         """For the rare call site that knows a real percentage (e.g. fold
         N of M). Freezes the animated estimate at this exact value until
         the next start()/stop(). Starts the sweep animation if not
-        already running."""
+        already running. The DRAWN bar still glides to this value over a
+        fraction of a second rather than jumping -- see _current_pct()."""
         self._manual_pct = max(0.0, min(100.0, pct))
         if label is not None:
             self._label = label
         if not self._running:
             self._running = True
+            self._last_frame_t = time.monotonic()
             self._sweep_phase = 0.0
             self._tick()
         else:
@@ -498,14 +516,27 @@ class NeuralProgress(Canvas):
                 pass
             self._after_id = None
         self._manual_pct = None
+        self._displayed_pct = 0.0
         self._label = "LOADING...."
         self._draw()
 
     def _current_pct(self) -> float:
+        now = time.monotonic()
+        dt = max(0.0, now - self._last_frame_t)
+        self._last_frame_t = now
         if self._manual_pct is not None:
-            return self._manual_pct
-        elapsed = max(0.0, time.monotonic() - self._t0)
-        return self.ESTIMATE_CEILING_PCT * (1.0 - math.exp(-elapsed / self.ESTIMATE_TAU_SECONDS))
+            target = self._manual_pct
+        else:
+            elapsed = max(0.0, now - self._t0)
+            target = self.ESTIMATE_CEILING_PCT * (1.0 - math.exp(-elapsed / self.ESTIMATE_TAU_SECONDS))
+        # First-order lag toward `target` -- the actual smoothing step.
+        # Framerate-independent (uses measured dt, not an assumed frame
+        # duration), so it looks identical whether _draw() was triggered
+        # by the normal 30fps tick or by an extra call (e.g. a resize, or
+        # set_progress() firing mid-frame).
+        alpha = 1.0 - math.exp(-dt / self.DISPLAY_EASE_TAU_SECONDS)
+        self._displayed_pct += (target - self._displayed_pct) * alpha
+        return self._displayed_pct
 
     def _tick(self):
         if not self._running:
@@ -1163,7 +1194,23 @@ class MainWindow:
             if k == key:
                 frame.lift()
         if key == "dashboard":
-            self._refresh_dashboard()
+            # UPGRADE (2026-09-03, smoothness): this used to call
+            # _refresh_dashboard() synchronously, right here, before
+            # _show_page even returns -- so clicking "Dashboard" in the
+            # sidebar blocked the whole click handler (nav highlight
+            # update included) until run_history.dashboard_data() finished
+            # reading/parsing run_history.json AND build_graph() finished
+            # its pairwise strategy-similarity scoring (quadratic in the
+            # number of distinct strategies ever tested). With enough run
+            # history that's a real, visible freeze between clicking the
+            # tab and anything on screen changing -- the actual mechanism
+            # behind "choppy when a new tab loads," not just a rendering
+            # style issue. Deferred one tick via .after(1, ...) instead:
+            # the tab switch above (nav highlights, frame.lift()) paints
+            # immediately, and the heavier data load/repaint happens right
+            # after, once the now-visible-but-still-stale frame has
+            # already been drawn to the screen.
+            self.root.after(1, self._refresh_dashboard)
 
     def _configure_styles(self):
         style = ttk.Style(self.root)
@@ -2941,7 +2988,17 @@ class MainWindow:
                 idx = by_name.get(file_info["full_name"])
                 if idx is None:
                     continue
-                label = f"    {file_info['name']}" + ("   (empty)" if file_info["empty"] else "")
+                label = f"    {file_info['name']}"
+                if file_info["empty"]:
+                    label += "   (empty)"
+                elif file_info["rows"] == -1:
+                    # -1 is _quick_row_count's "unknown, it's an archive"
+                    # sentinel (see storage.py) -- flagged here so it
+                    # doesn't just look like a file whose row count failed
+                    # to load. Selecting it still works exactly like any
+                    # other dataset; the archive is opened and its data
+                    # member extracted at import time.
+                    label += "   (archive — extracted on import)"
                 self.dataset_listbox.insert(END, label)
                 if file_info["empty"]:
                     self.dataset_listbox.itemconfig(row, fg=TEXT_DIM)

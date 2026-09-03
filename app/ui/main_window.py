@@ -2693,6 +2693,31 @@ class MainWindow:
         text_widget.yview_scroll(delta * 3, "units")
         return "break"
 
+    def _bind_isolated_wheel(self, widget):
+        """Binds mouse-wheel scrolling directly on `widget` (any Listbox or
+        Text that has its own scrollbar) and returns "break" from the
+        handler (see _generic_text_wheel) so the event stops right there.
+
+        Every tab's content lives inside a page-level scrollable canvas
+        built by _scrollable(), which registers ONE wheel handler via
+        self.root.bind_all(...). bind_all fires on the "all" bindtag, which
+        Tk checks last -- after the widget's own bindings -- but only if
+        nothing earlier in the chain returned "break". Listbox/Text already
+        have built-in class-level scroll bindings that do NOT return
+        "break", so without this, every wheel tick over one of these small
+        boxes was doing BOTH things at once: scrolling the box itself via
+        its own default binding, AND scrolling the entire page underneath
+        it via the bind_all dispatcher -- which is exactly the "small boxes
+        can't scroll separately from the whole page" behavior Owen reported
+        (Evolution Lab's tested-strategies list, leaderboard, log boxes,
+        every Step's output console, etc). Binding directly on the widget
+        and returning "break" here intercepts the event before it can ever
+        reach the page-level dispatcher, so this box scrolls on its own and
+        the page underneath it stays put.
+        """
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(seq, lambda e, w=widget: self._generic_text_wheel(w, e))
+
     # -----------------------------------------------------------------------
     # Tab 1 — Market Data
     # -----------------------------------------------------------------------
@@ -2747,6 +2772,7 @@ class MainWindow:
         )
         scrollbar.pack(side="right", fill="y")
         self.dataset_listbox.config(yscrollcommand=scrollbar.set)
+        self._bind_isolated_wheel(self.dataset_listbox)
         self.dataset_listbox.bind("<<ListboxSelect>>", self._on_dataset_selected)
 
         btn_row = Frame(section, bg=PANEL)
@@ -3253,6 +3279,7 @@ class MainWindow:
         )
         lib_scrollbar.pack(side="right", fill="y")
         self.strategy_library_listbox.config(yscrollcommand=lib_scrollbar.set)
+        self._bind_isolated_wheel(self.strategy_library_listbox)
         # Double-click now opens the same kind of stats+code detail popup
         # the Evolution Lab leaderboard already has (VIEW DETAILS there),
         # instead of immediately loading the strategy into the active
@@ -3382,6 +3409,7 @@ class MainWindow:
         )
         queue_scrollbar.pack(side="right", fill="y")
         self.batch_queue_listbox.config(yscrollcommand=queue_scrollbar.set)
+        self._bind_isolated_wheel(self.batch_queue_listbox)
 
         queue_btn_row = Frame(queue_section, bg=PANEL)
         queue_btn_row.pack(anchor="w", padx=18, pady=(0, 4))
@@ -4016,6 +4044,7 @@ class MainWindow:
         vs = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview, style="T58.Vertical.TScrollbar")
         hs = ttk.Scrollbar(text_frame, orient="horizontal", command=txt.xview)
         txt.config(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        self._bind_isolated_wheel(txt)
         txt.grid(row=0, column=0, sticky="nsew")
         vs.grid(row=0, column=1, sticky="ns")
         hs.grid(row=1, column=0, sticky="ew")
@@ -4217,6 +4246,7 @@ class MainWindow:
         txt = Text(text_frame, wrap="word", bg=PANEL_3, fg=TEXT, font=(MONO, 9), relief="flat", bd=0)
         vs = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview, style="T58.Vertical.TScrollbar")
         txt.config(yscrollcommand=vs.set)
+        self._bind_isolated_wheel(txt)
         txt.grid(row=0, column=0, sticky="nsew")
         vs.grid(row=0, column=1, sticky="ns")
         btn_row = Frame(win, bg=BG)
@@ -5008,6 +5038,7 @@ class MainWindow:
         rule_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.adaptive_rule_listbox.yview, style="T58.Vertical.TScrollbar")
         rule_scroll.pack(side="right", fill="y")
         self.adaptive_rule_listbox.config(yscrollcommand=rule_scroll.set)
+        self._bind_isolated_wheel(self.adaptive_rule_listbox)
 
         rule_btn_row = Frame(adaptive_section, bg=PANEL)
         rule_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
@@ -5243,12 +5274,20 @@ class MainWindow:
         self.refine_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Refinement output", "Live search log.")
+        _refine_output_frame = Frame(output_section, bg=PANEL)
         self.refine_output = Text(
-            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
+            _refine_output_frame, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.refine_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _refine_output_scroll = ttk.Scrollbar(
+            _refine_output_frame, orient="vertical", command=self.refine_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.refine_output.configure(yscrollcommand=_refine_output_scroll.set)
+        self.refine_output.pack(side="left", fill="both", expand=True)
+        _refine_output_scroll.pack(side="right", fill="y")
+        _refine_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.refine_output)
 
         self._last_refinement_result = None
         self._last_refinement_html_path = None
@@ -5490,9 +5529,9 @@ class MainWindow:
             "Live execution log.",
         )
 
+        _output_frame = Frame(output_section, bg=PANEL)
         self.output = Text(
-            output_section,
-            height=18,
+            _output_frame, height=18,
             wrap="word",
             bg=LOG_BG,
             fg=TEXT,
@@ -5503,7 +5542,14 @@ class MainWindow:
             highlightbackground=BORDER,
             font=(MONO, 9),
         )
-        self.output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _output_scroll = ttk.Scrollbar(
+            _output_frame, orient="vertical", command=self.output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.output.configure(yscrollcommand=_output_scroll.set)
+        self.output.pack(side="left", fill="both", expand=True)
+        _output_scroll.pack(side="right", fill="y")
+        _output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.output)
 
         self._last_html_path: Path | None = None
 
@@ -5811,12 +5857,20 @@ class MainWindow:
         self.payout_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Payout Probability output", "Live progress + the funnel table.")
+        _payout_output_frame = Frame(output_section, bg=PANEL)
         self.payout_output = Text(
-            output_section, height=24, wrap="word", bg=LOG_BG, fg=TEXT,
+            _payout_output_frame, height=24, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.payout_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _payout_output_scroll = ttk.Scrollbar(
+            _payout_output_frame, orient="vertical", command=self.payout_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.payout_output.configure(yscrollcommand=_payout_output_scroll.set)
+        self.payout_output.pack(side="left", fill="both", expand=True)
+        _payout_output_scroll.pack(side="right", fill="y")
+        _payout_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.payout_output)
 
         self._last_payout_html_path = None
 
@@ -5993,6 +6047,7 @@ class MainWindow:
         )
         bulk_scroll.pack(side="right", fill="y")
         self.bulk_strategy_listbox.config(yscrollcommand=bulk_scroll.set)
+        self._bind_isolated_wheel(self.bulk_strategy_listbox)
 
         bulk_btn_row = Frame(bulk_section, bg=BG)
         bulk_btn_row.pack(fill="x", padx=18, pady=(0, 12))
@@ -6099,12 +6154,20 @@ class MainWindow:
         self.search_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Search Lab output", "Live funnel log.")
+        _search_output_frame = Frame(output_section, bg=PANEL)
         self.search_output = Text(
-            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
+            _search_output_frame, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.search_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _search_output_scroll = ttk.Scrollbar(
+            _search_output_frame, orient="vertical", command=self.search_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.search_output.configure(yscrollcommand=_search_output_scroll.set)
+        self.search_output.pack(side="left", fill="both", expand=True)
+        _search_output_scroll.pack(side="right", fill="y")
+        _search_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.search_output)
 
         self._last_search_summary = None
         self._last_search_space = None
@@ -6664,11 +6727,19 @@ class MainWindow:
         self._button(button_row, "RUN REGIME SURVIVAL MATRIX", self._regime_matrix_clicked, primary=True).pack(side="left")
 
         output_section = self._section(f, "Result", "Plain-text matrix, single-dimension breakdowns, and any recommended OFF regimes.")
+        _rm_output_frame = Frame(output_section, bg=PANEL)
         self.rm_output = Text(
-            output_section, height=26, wrap="word", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
+            _rm_output_frame, height=26, wrap="word", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
             relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.rm_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _rm_output_scroll = ttk.Scrollbar(
+            _rm_output_frame, orient="vertical", command=self.rm_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.rm_output.configure(yscrollcommand=_rm_output_scroll.set)
+        self.rm_output.pack(side="left", fill="both", expand=True)
+        _rm_output_scroll.pack(side="right", fill="y")
+        _rm_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.rm_output)
 
     def _regime_matrix_clicked(self):
         self.rm_output.delete("1.0", END)
@@ -6744,11 +6815,19 @@ class MainWindow:
         self._button(button_row, "SHOW FAMILY BREAKDOWN", self._family_diversity_clicked, primary=True).pack(side="left")
 
         output_section = self._section(f, "Result", "")
+        _fd_output_frame = Frame(output_section, bg=PANEL)
         self.fd_output = Text(
-            output_section, height=22, wrap="word", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
+            _fd_output_frame, height=22, wrap="word", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
             relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.fd_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _fd_output_scroll = ttk.Scrollbar(
+            _fd_output_frame, orient="vertical", command=self.fd_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.fd_output.configure(yscrollcommand=_fd_output_scroll.set)
+        self.fd_output.pack(side="left", fill="both", expand=True)
+        _fd_output_scroll.pack(side="right", fill="y")
+        _fd_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.fd_output)
 
     def _family_diversity_clicked(self):
         self.fd_output.delete("1.0", END)
@@ -6828,12 +6907,20 @@ class MainWindow:
         self.wfo_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Walk-forward output", "Live progress log.")
+        _wfo_output_frame = Frame(output_section, bg=PANEL)
         self.wfo_output = Text(
-            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
+            _wfo_output_frame, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.wfo_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _wfo_output_scroll = ttk.Scrollbar(
+            _wfo_output_frame, orient="vertical", command=self.wfo_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.wfo_output.configure(yscrollcommand=_wfo_output_scroll.set)
+        self.wfo_output.pack(side="left", fill="both", expand=True)
+        _wfo_output_scroll.pack(side="right", fill="y")
+        _wfo_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.wfo_output)
 
         self._last_wfo_html_path = None
 
@@ -6963,12 +7050,20 @@ class MainWindow:
         self.cpcv_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "CPCV / PBO output", "Live progress log.")
+        _cpcv_output_frame = Frame(output_section, bg=PANEL)
         self.cpcv_output = Text(
-            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            _cpcv_output_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.cpcv_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _cpcv_output_scroll = ttk.Scrollbar(
+            _cpcv_output_frame, orient="vertical", command=self.cpcv_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.cpcv_output.configure(yscrollcommand=_cpcv_output_scroll.set)
+        self.cpcv_output.pack(side="left", fill="both", expand=True)
+        _cpcv_output_scroll.pack(side="right", fill="y")
+        _cpcv_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.cpcv_output)
 
         self._last_cpcv_html_path = None
         self._last_pbo_html_path = None
@@ -7153,12 +7248,20 @@ class MainWindow:
         self.sens_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Sensitivity output", "Live progress log.")
+        _sens_output_frame = Frame(output_section, bg=PANEL)
         self.sens_output = Text(
-            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            _sens_output_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.sens_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _sens_output_scroll = ttk.Scrollbar(
+            _sens_output_frame, orient="vertical", command=self.sens_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.sens_output.configure(yscrollcommand=_sens_output_scroll.set)
+        self.sens_output.pack(side="left", fill="both", expand=True)
+        _sens_output_scroll.pack(side="right", fill="y")
+        _sens_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.sens_output)
 
         self._last_sens_html_path = None
 
@@ -7281,6 +7384,7 @@ class MainWindow:
         leg_scroll = ttk.Scrollbar(legs_frame, orient="vertical", command=self.portfolio_leg_listbox.yview, style="T58.Vertical.TScrollbar")
         leg_scroll.pack(side="right", fill="y")
         self.portfolio_leg_listbox.config(yscrollcommand=leg_scroll.set)
+        self._bind_isolated_wheel(self.portfolio_leg_listbox)
 
         leg_btn_row = Frame(legs_section, bg=PANEL)
         leg_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
@@ -7310,12 +7414,20 @@ class MainWindow:
         self.portfolio_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Portfolio output", "Live progress log.")
+        _portfolio_output_frame = Frame(output_section, bg=PANEL)
         self.portfolio_output = Text(
-            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            _portfolio_output_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.portfolio_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _portfolio_output_scroll = ttk.Scrollbar(
+            _portfolio_output_frame, orient="vertical", command=self.portfolio_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.portfolio_output.configure(yscrollcommand=_portfolio_output_scroll.set)
+        self.portfolio_output.pack(side="left", fill="both", expand=True)
+        _portfolio_output_scroll.pack(side="right", fill="y")
+        _portfolio_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.portfolio_output)
 
         self._last_portfolio_html_path = None
 
@@ -7527,12 +7639,20 @@ class MainWindow:
         self.multiobj_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Multi-objective output", "Live progress log.")
+        _multiobj_output_frame = Frame(output_section, bg=PANEL)
         self.multiobj_output = Text(
-            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            _multiobj_output_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.multiobj_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _multiobj_output_scroll = ttk.Scrollbar(
+            _multiobj_output_frame, orient="vertical", command=self.multiobj_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.multiobj_output.configure(yscrollcommand=_multiobj_output_scroll.set)
+        self.multiobj_output.pack(side="left", fill="both", expand=True)
+        _multiobj_output_scroll.pack(side="right", fill="y")
+        _multiobj_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.multiobj_output)
 
         self._last_multiobj_html_path = None
 
@@ -7636,12 +7756,20 @@ class MainWindow:
         self.wfga_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Walk-forward-aware GA output", "Live progress log.")
+        _wfga_output_frame = Frame(output_section, bg=PANEL)
         self.wfga_output = Text(
-            output_section, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
+            _wfga_output_frame, height=18, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.wfga_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _wfga_output_scroll = ttk.Scrollbar(
+            _wfga_output_frame, orient="vertical", command=self.wfga_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.wfga_output.configure(yscrollcommand=_wfga_output_scroll.set)
+        self.wfga_output.pack(side="left", fill="both", expand=True)
+        _wfga_output_scroll.pack(side="right", fill="y")
+        _wfga_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.wfga_output)
 
         self._last_wfga_html_path = None
 
@@ -7750,6 +7878,7 @@ class MainWindow:
         leg_scroll = ttk.Scrollbar(legs_frame, orient="vertical", command=self.ensemble_leg_listbox.yview, style="T58.Vertical.TScrollbar")
         leg_scroll.pack(side="right", fill="y")
         self.ensemble_leg_listbox.config(yscrollcommand=leg_scroll.set)
+        self._bind_isolated_wheel(self.ensemble_leg_listbox)
 
         leg_btn_row = Frame(legs_section, bg=PANEL)
         leg_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
@@ -7781,12 +7910,20 @@ class MainWindow:
         self.ensemble_progress.pack(fill="x", padx=24, pady=(2, 10))
 
         output_section = self._section(f, "Ensemble output", "Live progress log.")
+        _ensemble_output_frame = Frame(output_section, bg=PANEL)
         self.ensemble_output = Text(
-            output_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            _ensemble_output_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.ensemble_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _ensemble_output_scroll = ttk.Scrollbar(
+            _ensemble_output_frame, orient="vertical", command=self.ensemble_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.ensemble_output.configure(yscrollcommand=_ensemble_output_scroll.set)
+        self.ensemble_output.pack(side="left", fill="both", expand=True)
+        _ensemble_output_scroll.pack(side="right", fill="y")
+        _ensemble_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.ensemble_output)
 
         self._last_ensemble_html_path = None
 
@@ -7985,11 +8122,19 @@ class MainWindow:
         # code text it generates, so it must not appear as a choice here
         # even though "manual" is now a real Strategy Library type.
         self.genstrat_language = LabeledCombo(idea_section, "Language", ["python", "pinescript", "mql5"], "python")
+        _genstrat_idea_frame = Frame(idea_section, bg=PANEL)
         self.genstrat_idea = Text(
-            idea_section, height=6, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            _genstrat_idea_frame, height=6, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
             relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.genstrat_idea.pack(fill="x", padx=18, pady=(4, 12))
+        _genstrat_idea_scroll = ttk.Scrollbar(
+            _genstrat_idea_frame, orient="vertical", command=self.genstrat_idea.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.genstrat_idea.configure(yscrollcommand=_genstrat_idea_scroll.set)
+        self.genstrat_idea.pack(side="left", fill="both", expand=True)
+        _genstrat_idea_scroll.pack(side="right", fill="y")
+        _genstrat_idea_frame.pack(fill="x", padx=18, pady=(4, 12))
+        self._bind_isolated_wheel(self.genstrat_idea)
 
         self._build_ai_assist_section(f, prefix="genstrat_ai")
 
@@ -8022,11 +8167,19 @@ class MainWindow:
 
         output_section = self._section(f, "Generated code", "Nothing has been saved yet -- review it below first.")
         self.genstrat_filename = LabeledEntry(output_section, "Filename (no extension)", "")
+        _genstrat_output_frame = Frame(output_section, bg=PANEL)
         self.genstrat_output = Text(
-            output_section, height=22, wrap="none", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
+            _genstrat_output_frame, height=22, wrap="none", bg=LOG_BG, fg=TEXT, insertbackground=TEXT,
             relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.genstrat_output.pack(fill="both", expand=True, padx=18, pady=(3, 10))
+        _genstrat_output_scroll = ttk.Scrollbar(
+            _genstrat_output_frame, orient="vertical", command=self.genstrat_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.genstrat_output.configure(yscrollcommand=_genstrat_output_scroll.set)
+        self.genstrat_output.pack(side="left", fill="both", expand=True)
+        _genstrat_output_scroll.pack(side="right", fill="y")
+        _genstrat_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 10))
+        self._bind_isolated_wheel(self.genstrat_output)
 
         out_btn_row = Frame(output_section, bg=PANEL)
         out_btn_row.pack(anchor="w", padx=18, pady=(0, 6))
@@ -8207,6 +8360,13 @@ class MainWindow:
         self.evo_mc_sims = LabeledEntry(cfg_section, "Monte Carlo sims per candidate", "1000")
         self.evo_cpcv_top_n = LabeledEntry(cfg_section, "CPCV / PBO pool size (most expensive stage)", "8")
         self.evo_stress_mult = LabeledEntry(cfg_section, "Stress test cost multiplier", "2.0")
+        self.evo_prefilter_max_bars = LabeledEntry(
+            cfg_section,
+            "Pre-filter bars cap (blank = auto; 0 = never cap; large 1-min "
+            "feeds auto-cap the CHEAP pre-filter pass only -- every survivor "
+            "still gets evaluated on the full dataset)",
+            "",
+        )
         self.evo_adaptive_risk_enabled = LabeledCheckbox(
             cfg_section,
             "Enable adaptive, limit-aware position sizing for every candidate this run "
@@ -8220,13 +8380,30 @@ class MainWindow:
             families_frame, text="Families to include (none selected = every family)",
             bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9),
         ).pack(anchor="w")
+        # height=6 -> 10 with a real scrollbar: the family list grew from 11
+        # to 21 (see app.search.strategy_space's "expansion round"), so a
+        # fixed 6-row box with no scrollbar at all used to hide most of the
+        # list with no way to reach it. columnconfigure/rowconfigure below
+        # let the listbox actually grow if the window itself is resized
+        # taller, same pattern as the leaderboard box further down.
+        families_list_frame = Frame(families_frame, bg=PANEL)
+        families_list_frame.pack(fill="both", expand=True, pady=(2, 0))
+        families_list_frame.columnconfigure(0, weight=1)
+        families_list_frame.rowconfigure(0, weight=1)
         self.evo_families_listbox = Listbox(
-            families_frame, height=6, selectmode=EXTENDED, exportselection=False,
+            families_list_frame, height=10, selectmode=EXTENDED, exportselection=False,
             bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
             activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
             font=(MONO, 9),
         )
-        self.evo_families_listbox.pack(fill="x", pady=(2, 0))
+        evo_families_scroll = ttk.Scrollbar(
+            families_list_frame, orient="vertical", command=self.evo_families_listbox.yview,
+            style="T58.Vertical.TScrollbar",
+        )
+        self.evo_families_listbox.config(yscrollcommand=evo_families_scroll.set)
+        self.evo_families_listbox.grid(row=0, column=0, sticky="nsew")
+        evo_families_scroll.grid(row=0, column=1, sticky="ns")
+        self._bind_isolated_wheel(self.evo_families_listbox)
         try:
             for fam in sorted(list_families().keys()):
                 self.evo_families_listbox.insert(END, fam)
@@ -8284,6 +8461,7 @@ class MainWindow:
             lb_frame, orient="vertical", command=self.evo_leaderboard_listbox.yview, style="T58.Vertical.TScrollbar",
         )
         self.evo_leaderboard_listbox.config(yscrollcommand=evo_lb_scrollbar.set)
+        self._bind_isolated_wheel(self.evo_leaderboard_listbox)
         self.evo_leaderboard_listbox.grid(row=0, column=0, sticky="nsew")
         evo_lb_scrollbar.grid(row=0, column=1, sticky="ns")
         self.evo_leaderboard_listbox.bind("<Double-Button-1>", lambda e: self._view_evolution_leader_detail())
@@ -8305,12 +8483,23 @@ class MainWindow:
         tested_btn_row = Frame(tested_section, bg=PANEL)
         tested_btn_row.pack(anchor="w", padx=18, pady=(2, 4))
         self._button(tested_btn_row, "REFRESH", self._refresh_evolution_tested).pack(side="left")
+        tested_list_frame = Frame(tested_section, bg=PANEL)
+        tested_list_frame.pack(fill="both", expand=True, padx=18, pady=(2, 12))
+        tested_list_frame.columnconfigure(0, weight=1)
+        tested_list_frame.rowconfigure(0, weight=1)
         self.evo_tested_listbox = Listbox(
-            tested_section, height=10, exportselection=False, bg=PANEL_3, fg=TEXT,
+            tested_list_frame, height=10, exportselection=False, bg=PANEL_3, fg=TEXT,
             activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
             font=(MONO, 9),
         )
-        self.evo_tested_listbox.pack(fill="x", padx=18, pady=(2, 12))
+        evo_tested_scroll = ttk.Scrollbar(
+            tested_list_frame, orient="vertical", command=self.evo_tested_listbox.yview,
+            style="T58.Vertical.TScrollbar",
+        )
+        self.evo_tested_listbox.config(yscrollcommand=evo_tested_scroll.set)
+        self.evo_tested_listbox.grid(row=0, column=0, sticky="nsew")
+        evo_tested_scroll.grid(row=0, column=1, sticky="ns")
+        self._bind_isolated_wheel(self.evo_tested_listbox)
 
         log_section = self._section(
             f, "Live log + hypothesis journal",
@@ -8326,6 +8515,7 @@ class MainWindow:
             log_frame, orient="vertical", command=self.evo_log_text.yview, style="T58.Vertical.TScrollbar",
         )
         self.evo_log_text.config(yscrollcommand=evo_log_scrollbar.set)
+        self._bind_isolated_wheel(self.evo_log_text)
         self.evo_log_text.pack(side="left", fill="both", expand=True)
         evo_log_scrollbar.pack(side="right", fill="y")
 
@@ -8403,6 +8593,8 @@ class MainWindow:
         selected_families = [self.evo_families_listbox.get(i) for i in self.evo_families_listbox.curselection()] or None
         max_gen_raw = self.evo_max_generations.get_str().strip()
         max_generations = int(max_gen_raw) if max_gen_raw.isdigit() else None
+        prefilter_bars_raw = self.evo_prefilter_max_bars.get_str().strip()
+        prefilter_max_bars = int(prefilter_bars_raw) if prefilter_bars_raw.isdigit() else None
 
         cfg = EvolutionConfig(
             population_size=self.evo_population.get_int(60),
@@ -8414,6 +8606,7 @@ class MainWindow:
             stress_cost_multiplier=self.evo_stress_mult.get_float(2.0),
             max_generations=max_generations,
             adaptive_risk_enabled=self.evo_adaptive_risk_enabled.var.get(),
+            prefilter_max_bars=prefilter_max_bars,
         )
         self.evo_log_text.delete("1.0", END)
         self._evolution_runner = EvolutionRunner(df, risk, rules, cfg, progress_cb=self._evo_log)
@@ -8622,6 +8815,7 @@ class MainWindow:
         )
         vs = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview, style="T58.Vertical.TScrollbar")
         txt.config(yscrollcommand=vs.set)
+        self._bind_isolated_wheel(txt)
         txt.grid(row=0, column=0, sticky="nsew")
         vs.grid(row=0, column=1, sticky="ns")
         txt.insert("1.0", "\n".join(lines))
@@ -8816,12 +9010,20 @@ class MainWindow:
         self.fullpipeline_verdict_label.pack(anchor="w", fill="x", padx=18, pady=(2, 10))
 
         output_section = self._section(f, "Full Pipeline output", "Live progress log.")
+        _fullpipeline_output_frame = Frame(output_section, bg=PANEL)
         self.fullpipeline_output = Text(
-            output_section, height=20, wrap="word", bg=LOG_BG, fg=TEXT,
+            _fullpipeline_output_frame, height=20, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.fullpipeline_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _fullpipeline_output_scroll = ttk.Scrollbar(
+            _fullpipeline_output_frame, orient="vertical", command=self.fullpipeline_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.fullpipeline_output.configure(yscrollcommand=_fullpipeline_output_scroll.set)
+        self.fullpipeline_output.pack(side="left", fill="both", expand=True)
+        _fullpipeline_output_scroll.pack(side="right", fill="y")
+        _fullpipeline_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.fullpipeline_output)
 
         self._last_fullpipeline_html_path = None
 
@@ -9053,16 +9255,24 @@ class MainWindow:
             "\"is this good\".",
             emphasize=True,
         )
+        _ra_question_frame = Frame(question_section, bg=PANEL)
         self.ra_question = Text(
-            question_section, height=4, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            _ra_question_frame, height=4, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
             relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
         )
+        _ra_question_scroll = ttk.Scrollbar(
+            _ra_question_frame, orient="vertical", command=self.ra_question.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.ra_question.configure(yscrollcommand=_ra_question_scroll.set)
+        self.ra_question.pack(side="left", fill="both", expand=True)
+        _ra_question_scroll.pack(side="right", fill="y")
         self.ra_question.insert(
             "1.0",
             "Is this strategy robust, or does its edge depend on a fragile parameter or a "
             "specific market regime? What's the most promising next thing to test?",
         )
-        self.ra_question.pack(fill="x", padx=18, pady=(4, 12))
+        _ra_question_frame.pack(fill="x", padx=18, pady=(4, 12))
+        self._bind_isolated_wheel(self.ra_question)
         self.ra_max_steps = LabeledEntry(question_section, "Max tool-calling steps", 6)
 
         self._build_ai_assist_section(f, prefix="ra_ai")
@@ -9101,12 +9311,20 @@ class MainWindow:
         self.ra_answer_label.pack(anchor="w", fill="x", padx=18, pady=(2, 12))
 
         output_section = self._section(f, "Agent transcript", "Thought / Action / Observation, one step at a time.")
+        _ra_output_frame = Frame(output_section, bg=PANEL)
         self.ra_output = Text(
-            output_section, height=22, wrap="word", bg=LOG_BG, fg=TEXT,
+            _ra_output_frame, height=22, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.ra_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _ra_output_scroll = ttk.Scrollbar(
+            _ra_output_frame, orient="vertical", command=self.ra_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.ra_output.configure(yscrollcommand=_ra_output_scroll.set)
+        self.ra_output.pack(side="left", fill="both", expand=True)
+        _ra_output_scroll.pack(side="right", fill="y")
+        _ra_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.ra_output)
 
         loop_section = self._section(
             f, "Closed Research Loop (Ollama)",
@@ -9120,17 +9338,25 @@ class MainWindow:
             "re-run a strategy whose Strategy DNA exactly matches a pattern that already failed earlier "
             "in the SAME run.",
         )
+        _loop_initial_idea_frame = Frame(loop_section, bg=PANEL)
         self.loop_initial_idea = Text(
-            loop_section, height=3, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
+            _loop_initial_idea_frame, height=3, wrap="word", bg=PANEL_3, fg=TEXT, insertbackground=TEXT,
             relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
         )
+        _loop_initial_idea_scroll = ttk.Scrollbar(
+            _loop_initial_idea_frame, orient="vertical", command=self.loop_initial_idea.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.loop_initial_idea.configure(yscrollcommand=_loop_initial_idea_scroll.set)
+        self.loop_initial_idea.pack(side="left", fill="both", expand=True)
+        _loop_initial_idea_scroll.pack(side="right", fill="y")
         Label(loop_section, text="Starting hypothesis", bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9)).pack(
             anchor="w", padx=18, pady=(2, 0),
         )
         self.loop_initial_idea.insert(
             "1.0", "A trend-following strategy using a higher-timeframe bias filter and a volatility-based stop.",
         )
-        self.loop_initial_idea.pack(fill="x", padx=18, pady=(2, 10))
+        _loop_initial_idea_frame.pack(fill="x", padx=18, pady=(2, 10))
+        self._bind_isolated_wheel(self.loop_initial_idea)
         self.loop_iterations = LabeledEntry(loop_section, "Iterations", 5)
         self.loop_keep_threshold = LabeledEntry(loop_section, "Prop Survival Score needed to KEEP", 40)
         self.loop_mc_sims = LabeledEntry(loop_section, "Monte Carlo sims per iteration", 500)
@@ -9151,12 +9377,20 @@ class MainWindow:
         self.loop_summary_label.pack(anchor="w", fill="x", padx=18, pady=(2, 12))
 
         loop_output_section = self._section(f, "Research Loop log", "Iteration-by-iteration progress.")
+        _loop_output_frame = Frame(loop_output_section, bg=PANEL)
         self.loop_output = Text(
-            loop_output_section, height=22, wrap="word", bg=LOG_BG, fg=TEXT,
+            _loop_output_frame, height=22, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.loop_output.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _loop_output_scroll = ttk.Scrollbar(
+            _loop_output_frame, orient="vertical", command=self.loop_output.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.loop_output.configure(yscrollcommand=_loop_output_scroll.set)
+        self.loop_output.pack(side="left", fill="both", expand=True)
+        _loop_output_scroll.pack(side="right", fill="y")
+        _loop_output_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.loop_output)
 
     def _log_research_loop(self, msg: str):
         self.loop_output.insert(END, msg + "\n")
@@ -9548,12 +9782,20 @@ class MainWindow:
         self.ft_journal_tree.pack(fill="x", padx=18, pady=(2, 12))
 
         log_section = self._section(f, "Live log", "")
+        _ft_log_frame = Frame(log_section, bg=PANEL)
         self.ft_log = Text(
-            log_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            _ft_log_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.ft_log.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _ft_log_scroll = ttk.Scrollbar(
+            _ft_log_frame, orient="vertical", command=self.ft_log.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.ft_log.configure(yscrollcommand=_ft_log_scroll.set)
+        self.ft_log.pack(side="left", fill="both", expand=True)
+        _ft_log_scroll.pack(side="right", fill="y")
+        _ft_log_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.ft_log)
 
     def _ft_refresh_strategies(self):
         items = list_saved_strategies(None)
@@ -10196,6 +10438,7 @@ class MainWindow:
         )
         dl_scrollbar.pack(side="right", fill="y")
         self.dl_accounts_listbox.config(yscrollcommand=dl_scrollbar.set)
+        self._bind_isolated_wheel(self.dl_accounts_listbox)
         self.dl_accounts_listbox.bind("<<ListboxSelect>>", self._dl_on_account_selected)
 
         list_btn_row = Frame(accounts_section, bg=PANEL)
@@ -10323,12 +10566,20 @@ class MainWindow:
         self.dl_journal_tree.pack(fill="x", padx=18, pady=(2, 12))
 
         log_section = self._section(f, "Live log", "")
+        _dl_log_frame = Frame(log_section, bg=PANEL)
         self.dl_log = Text(
-            log_section, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
+            _dl_log_frame, height=16, wrap="word", bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, font=(MONO, 9),
         )
-        self.dl_log.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        _dl_log_scroll = ttk.Scrollbar(
+            _dl_log_frame, orient="vertical", command=self.dl_log.yview, style="T58.Vertical.TScrollbar",
+        )
+        self.dl_log.configure(yscrollcommand=_dl_log_scroll.set)
+        self.dl_log.pack(side="left", fill="both", expand=True)
+        _dl_log_scroll.pack(side="right", fill="y")
+        _dl_log_frame.pack(fill="both", expand=True, padx=18, pady=(3, 16))
+        self._bind_isolated_wheel(self.dl_log)
 
         self._dl_accounts: list = []
         self._dl_editing_id: str | None = None

@@ -77,7 +77,7 @@ from app.reports.validation_reports import (
     generate_portfolio_report, generate_sensitivity_report, generate_walk_forward_report,
     generate_walkforward_ga_report,
 )
-from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
+from app.search.batch_runner import SearchCancelled, SearchStageConfig, promote_champion, run_search
 from app.search.search_report import generate_search_report
 from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
 from app.strategy.base import StrategyError
@@ -969,7 +969,7 @@ class MainWindow:
             ("prop", "", "03  Prop Rules", self.tab_prop, NEON_CYAN),
             ("risk", "", "04  Risk", self.tab_risk, NEON_CYAN),
             ("run", "", "05  Run & Report", self.tab_run, NEON_CYAN),
-            ("payout", "", "Payout Probability", self.tab_payout, NEON_CYAN),
+            ("payout", "", "05a  Payout Probability", self.tab_payout, NEON_CYAN),
             ("refine", "", "06  Refinement", self.tab_refine, NEON_CYAN),
             ("search", "", "07  Search Lab", self.tab_search, NEON_CYAN),
 
@@ -980,7 +980,7 @@ class MainWindow:
             ("portfolio", "", "11  Portfolio", self.tab_portfolio, BLUE),
             ("multiobj", "", "12  Multi-Objective", self.tab_multiobj, BLUE),
             ("wfga", "", "13  Walk-Forward GA", self.tab_wfga, BLUE),
-            ("regimematrix", "", "Regime Survival Matrix", self.tab_regime_matrix, BLUE),
+            ("regimematrix", "", "13a  Regime Survival Matrix", self.tab_regime_matrix, BLUE),
 
             (None, None, "FINDING AN EDGE", None, None),
             ("ensemble", "", "14  Ensemble", self.tab_ensemble, NEON_MAGENTA),
@@ -997,7 +997,7 @@ class MainWindow:
             ("livemarket", "", "Live Market", self.tab_livemarket, NEON_CYAN),
 
             (None, None, "AI RESEARCH", None, None),
-            ("researchagent", "", "18  Research Agent", self.tab_researchagent, NEON_MAGENTA),
+            ("researchagent", "", "16  Research Agent", self.tab_researchagent, NEON_MAGENTA),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -2343,12 +2343,15 @@ class MainWindow:
             "Backtest → Prop Simulation → Monte Carlo → Report."
         )
         numstep(1, "Click 05 RUN & REPORT, set the number of Monte Carlo simulations (10,000 is a good default).")
-        numstep(2, "Click RUN FULL PIPELINE on this tab, then OPEN HTML REPORT once it finishes.")
+        numstep(2, "Click RUN BACKTEST & REPORT on this tab, then OPEN HTML REPORT once it finishes.")
         warn(
-            "This tab's button is also labeled RUN FULL PIPELINE, but it is NOT the same as the 15 FULL "
-            "PIPELINE tab below — this one just runs your strategy once, as-is. The 15 FULL PIPELINE tab "
+            "This tab's button used to be labeled RUN FULL PIPELINE too, which made it easy to confuse "
+            "with the 15 FULL PIPELINE tab below — it's now called RUN BACKTEST & REPORT to make the "
+            "difference obvious: this one just runs your strategy once, as-is. The 15 FULL PIPELINE tab "
             "(Step 9 in this guide) automatically searches for a better configuration and validates it out-"
-            "of-sample before giving you a verdict. For a first pass, most people skip straight to Step 9."
+            "of-sample before giving you a verdict. For a first pass, most people skip straight to Step 9. "
+            "If you're testing several strategies at once, use the batch queue on 02 Strategy instead of "
+            "either single-strategy button."
         )
         body("A few things this report checks automatically, every single run:")
         bullet("Lookahead check — re-runs the strategy on data cut off right after a sample of its own real "
@@ -2589,7 +2592,7 @@ class MainWindow:
         )
         rule()
 
-        h1("AI RESEARCH — 18 Research Agent")
+        h1("AI RESEARCH — 16 Research Agent")
         body(
             "Ask a local Ollama model to investigate the strategy configured on Steps 01-04. It can call "
             "run_backtest, run_prop_simulation, run_monte_carlo, run_walk_forward, run_regime_analysis, "
@@ -5368,8 +5371,12 @@ class MainWindow:
         self._page_header(
             f,
             "05 / Run & Report",
-            "Run Full Pipeline",
-            "Backtest → Prop Simulation → Monte Carlo → Report.",
+            "Run Backtest & Report",
+            "Backtest → Prop Simulation → Monte Carlo → Report. This runs ONE strategy, once, "
+            "with no GA search -- for batch-testing several queued strategies at once, or for the "
+            "full walk-forward-aware GA search (baseline -> GA -> re-validated Monte Carlo -> "
+            "out-of-sample check -> holdout check -> verdict), use RUN FULL PIPELINE (BATCH) on "
+            "02 Strategy's batch queue, or 15 Full Pipeline for a single strategy.",
         )
 
         section = self._section(
@@ -5393,7 +5400,7 @@ class MainWindow:
 
         self._button(
             button_row,
-            "RUN FULL PIPELINE",
+            "RUN BACKTEST & REPORT",
             self._run_clicked,
             primary=True,
         ).pack(side="left")
@@ -5405,6 +5412,17 @@ class MainWindow:
         )
         self.open_report_btn.config(state="disabled")
         self.open_report_btn.pack(side="left", padx=8)
+
+        batch_row = Frame(f, bg=BG)
+        batch_row.pack(fill="x", padx=24, pady=(0, 10))
+        Label(
+            batch_row, text="Testing more than one strategy at once?", bg=BG, fg=TEXT_MUTED,
+            font=_safe_font(8),
+        ).pack(side="left")
+        self._button(
+            batch_row, "GO TO BATCH QUEUE (02 Strategy)",
+            lambda: self._show_page("strategy"),
+        ).pack(side="left", padx=8)
 
         self.progress = NeuralProgress(f)
         self.progress.pack(fill="x", padx=24, pady=(2, 10))
@@ -5698,7 +5716,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "Payout Probability",
+            "05a / Payout Probability",
             "Full-Lifecycle Survival Simulator",
             "Goes beyond a single pass-probability number: simulates thousands of complete account "
             "lifecycles (Start -> Evaluation -> Funded -> Payout #1 -> Payout #2 -> ... -> "
@@ -5998,6 +6016,10 @@ class MainWindow:
 
         self._button(button_row, "RUN SEARCH LAB", self._search_run_clicked, primary=True).pack(side="left")
 
+        self.stop_search_btn = self._button(button_row, "STOP", self._search_stop_clicked)
+        self.stop_search_btn.config(state="disabled")
+        self.stop_search_btn.pack(side="left", padx=8)
+
         self.open_search_report_btn = self._button(
             button_row, "OPEN LEADERBOARD", self._open_search_report,
         )
@@ -6035,6 +6057,7 @@ class MainWindow:
         self._last_search_risk = None
         self._last_search_rules = None
         self._last_champion_html_path = None
+        self._search_cancel_event = threading.Event()
 
     def _on_search_mode_changed(self):
         mode = self._SEARCH_MODE_LABELS.get(self.search_mode.get_str())
@@ -6177,6 +6200,9 @@ class MainWindow:
             self.promote_champion_btn.config(state="disabled")
             self.open_champion_report_btn.config(state="disabled")
             self.search_progress.start(10)
+            # The bulk backtest loop isn't cancellable mid-strategy (each one
+            # is quick), so STOP stays disabled for this mode -- it's only
+            # meaningful for the long-running Stage 1-5 GA search below.
             threading.Thread(target=self._run_bulk_backtest_pipeline, daemon=True).start()
             return
 
@@ -6184,8 +6210,21 @@ class MainWindow:
         self.open_search_report_btn.config(state="disabled")
         self.promote_champion_btn.config(state="disabled")
         self.open_champion_report_btn.config(state="disabled")
+        self._search_cancel_event.clear()
+        self.stop_search_btn.config(state="normal")
         self.search_progress.start(10)
         threading.Thread(target=self._search_run_pipeline, daemon=True).start()
+
+    def _search_stop_clicked(self):
+        """STOP for the Stage 1-5 GA search. Sets the shared cancel event,
+        which run_search() checks between candidates in every stage -- it
+        doesn't kill mid-flight worker processes, but it stops the run from
+        starting any further candidates and shuts the pool down instead of
+        grinding through everything still queued. Any candidates already
+        scored before the stop are kept in the results DB, not thrown away."""
+        self._search_cancel_event.set()
+        self.stop_search_btn.config(state="disabled")
+        self._log_search("\nStopping... (finishing the candidates already in flight, no new ones will start)")
 
     def _run_bulk_backtest_pipeline(self):
         """Runs every uploaded strategy file through the exact same
@@ -6314,6 +6353,7 @@ class MainWindow:
             self._log_search("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.search_progress.stop()
+            self.stop_search_btn.config(state="disabled")
 
     def _search_run_pipeline(self):
         try:
@@ -6386,6 +6426,7 @@ class MainWindow:
             summary = run_search(
                 df, risk, rules, space, stage_cfg, db_path=db_path,
                 instrument=instrument, timeframe="unknown", progress_cb=self._log_search,
+                cancel_event=self._search_cancel_event,
             )
 
             report_paths = generate_search_report(
@@ -6425,6 +6466,12 @@ class MainWindow:
             for k, p in report_paths.items():
                 self._log_search(f"  {k}: {p}")
 
+        except SearchCancelled:
+            self._log_search(
+                "\nSearch Lab stopped. Candidates already scored before the stop are still "
+                "saved in the results DB, even though no leaderboard report was generated "
+                "for this (incomplete) run."
+            )
         except StrategySpaceError as exc:
             self._log_search(f"\nSearch space error: {exc}")
         except PairDataError as exc:
@@ -6533,7 +6580,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "Regime Survival Matrix",
+            "13a / Regime Survival Matrix",
             "Regime Survival Matrix",
             "Classifies every bar on trend, volatility, session, and market environment, "
             "then attributes THIS strategy's own trades to whichever regime was active at "
@@ -8909,7 +8956,7 @@ class MainWindow:
             self.fullpipeline_progress.stop()
 
     # -----------------------------------------------------------------------
-    # Tab 18 — AI Research Agent (T58 AI Research Engine)
+    # Tab 16 — AI Research Agent (T58 AI Research Engine)
     #
     # The "research analyst" upgrade to AI Assist: instead of a single
     # request/response call (numeric parameter suggestions, or a one-shot
@@ -8930,7 +8977,7 @@ class MainWindow:
         f = self._scrollable(self.tab_researchagent)
         self._page_header(
             f,
-            "18 / AI Research",
+            "16 / AI Research",
             "AI Research Agent",
             "Ask a local Ollama model to investigate the strategy configured in Steps 01-04. "
             "It can call run_backtest, run_prop_simulation, run_monte_carlo, run_walk_forward, "

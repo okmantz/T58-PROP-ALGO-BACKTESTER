@@ -59,10 +59,16 @@ from app.optimize.walkforward_ga import run_walkforward_aware_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
 from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipeline
 from app.orchestration.quick_optimize import QuickOptimizeConfig, run_quick_optimize
+from app.orchestration.resource_guard import (
+    HEAVY_JOB_GUARD, JOB_EVOLUTION_LAB, JOB_FULL_PIPELINE, JOB_SEARCH_LAB, JOB_SPEED_RUN,
+)
+from app.orchestration.speed_run import SpeedRunConfig, SpeedRunResult, run_speed_run
+from app.orchestration.speed_run import _rank_key as _speedrun_rank_key
 from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioError, run_portfolio_backtest
 from app.prop.simulator import PropRules, simulate_account
 from app.prop.survival_engine import PropSurvivalConfig, ResetEconomics, run_prop_survival_analysis
 from app.reports.generator import generate_full_report
+from app.reports.crash_log import install_thread_excepthook, log_crash
 from app.reports.refinement_report import generate_refinement_report
 from app.reports.survival_report import generate_survival_report
 from app.reports.validation_reports import (
@@ -133,8 +139,18 @@ PAYOUT_DIR = BASE_DIR / "reports" / "payout_probability"
 PAYOUT_DIR.mkdir(parents=True, exist_ok=True)
 REGIME_DIR = BASE_DIR / "reports" / "regime_matrix"
 REGIME_DIR.mkdir(parents=True, exist_ok=True)
+SPEEDRUN_DIR = BASE_DIR / "reports" / "speed_run"
+SPEEDRUN_DIR.mkdir(parents=True, exist_ok=True)
+# run_speed_run() itself writes each validated candidate's Full Pipeline
+# report into output_dir / "speed_run" -- see app.orchestration.speed_run.
+SPEEDRUN_REPORTS_DIR = SPEEDRUN_DIR / "speed_run"
+SPEEDRUN_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+# Belt-and-suspenders alongside run_web.py's own call (this module can also
+# be run directly via `python -m app.web.server`, which never goes through
+# run_web.py) -- idempotent either way. See app.reports.crash_log.
+install_thread_excepthook()
 
 
 def resolve_strategy_source(mode: str, form, files) -> tuple[str, str]:
@@ -986,10 +1002,13 @@ def _run_search_job(
             job["report_html"] = f"/search_reports/{report_paths['html'].name}"
             job["report_json"] = f"/search_reports/{report_paths['json'].name}"
     except Exception as exc:  # noqa: BLE001 -- a search job must fail visibly on the status page, not crash a thread silently
+        log_crash("Search Lab (web)", exc=exc)
         with _SEARCH_JOBS_LOCK:
             job = _SEARCH_JOBS[job_id]
             job["done"] = True
             job["error"] = str(exc)
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_SEARCH_LAB)
 
 
 # ---------------------------------------------------------------------------
@@ -1223,10 +1242,13 @@ def _run_fullpipeline_job(
             job["report_html"] = f"/full_pipeline_reports/{Path(result.report_paths['html']).name}"
             job["report_json"] = f"/full_pipeline_reports/{Path(result.report_paths['json']).name}"
     except Exception as exc:  # noqa: BLE001 -- must surface on the status page, not crash the thread silently
+        log_crash("Full Pipeline (web)", exc=exc)
         with _FULLPIPELINE_JOBS_LOCK:
             job = _FULLPIPELINE_JOBS[job_id]
             job["done"] = True
             job["error"] = f"Unexpected error: {exc}"
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_FULL_PIPELINE)
 
 
 @app.route("/full-pipeline")
@@ -1247,9 +1269,21 @@ def full_pipeline_form():
 @app.route("/full-pipeline/start", methods=["POST"])
 def full_pipeline_start():
     form = request.form
+    if not HEAVY_JOB_GUARD.try_acquire(JOB_FULL_PIPELINE):
+        return render_template(
+            "full_pipeline.html",
+            error=(
+                f"{HEAVY_JOB_GUARD.active_name} is already running on this server. Running more than "
+                f"one heavy job (Search Lab / Evolution Lab / Full Pipeline / Speed Run) at the same "
+                f"time can exhaust available memory. Wait for it to finish before starting Full Pipeline."
+            ),
+            stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+            fitness_metrics=FITNESS_METRICS,
+        ), 409
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_FULL_PIPELINE)
             return render_template("full_pipeline.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
 
         strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
@@ -1320,8 +1354,11 @@ def full_pipeline_start():
         return redirect(url_for("full_pipeline_job", job_id=job_id))
 
     except StrategyError as exc:
+        HEAVY_JOB_GUARD.release(JOB_FULL_PIPELINE)
         return render_template("full_pipeline.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_FULL_PIPELINE)
+        log_crash("Full Pipeline (web, start)", exc=exc)
         return render_template("full_pipeline.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 500
 
 
@@ -2612,9 +2649,23 @@ def evolution_start():
     with _EVOLUTION_LOCK:
         if _EVOLUTION_RUNNER is not None and _EVOLUTION_RUNNER.is_running:
             return redirect(url_for("evolution_form"))
+    if not HEAVY_JOB_GUARD.try_acquire(JOB_EVOLUTION_LAB):
+        return render_template(
+            "evolution.html",
+            error=(
+                f"{HEAVY_JOB_GUARD.active_name} is already running on this server. Running more than "
+                f"one of Search Lab / Evolution Lab / Full Pipeline / Speed Run at the same time can "
+                f"exhaust available memory (each spawns its own worker processes, each holding a full "
+                f"copy of the loaded data). Wait for it to finish, or stop it, before starting Evolution Lab."
+            ),
+            stored_datasets=list_stored_datasets(),
+            families=[{"name": n, "description": family_description(n)} for n in list_families()],
+            running=False,
+        ), 409
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_EVOLUTION_LAB)
             return render_template("evolution.html", error=dataset_error, stored_datasets=list_stored_datasets(), families=[{"name": n, "description": family_description(n)} for n in list_families()], running=False), 400
 
         risk = RiskConfig(initial_balance=float(form.get("initial_balance", 100000) or 100000))
@@ -2636,6 +2687,8 @@ def evolution_start():
             _EVOLUTION_RUNNER.start()
         return redirect(url_for("evolution_form"))
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_EVOLUTION_LAB)
+        log_crash("Evolution Lab (web)", exc=exc)
         return render_template("evolution.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), families=[{"name": n, "description": family_description(n)} for n in list_families()], running=False), 500
 
 
@@ -2719,6 +2772,13 @@ def evolution_status():
     if runner is None:
         return jsonify({"running": False, "started": False, "log": [], "leaderboard": [], "journal": []})
     status = runner.status()
+    if not status["running"]:
+        # Covers both a deliberate stop and the runner's own thread exiting
+        # on its own (finished, or crashed) -- either way the heavy-job
+        # slot must free up so another tab/route can start. Harmless if
+        # some other job already holds/released it (release() is a no-op
+        # unless this name is the current holder).
+        HEAVY_JOB_GUARD.release(JOB_EVOLUTION_LAB)
     leaderboard = [r.to_checkpoint_dict() for r in runner.leaderboard]
     return jsonify({
         "started": True,
@@ -2865,9 +2925,22 @@ def search_form():
 @app.route("/search/start", methods=["POST"])
 def search_start():
     form = request.form
+    if not HEAVY_JOB_GUARD.try_acquire(JOB_SEARCH_LAB):
+        return render_template(
+            "search.html",
+            error=(
+                f"{HEAVY_JOB_GUARD.active_name} is already running on this server. Running more than "
+                f"one heavy job (Search Lab / Evolution Lab / Full Pipeline / Speed Run) at the same "
+                f"time can exhaust available memory. Wait for it to finish before starting Search Lab."
+            ),
+            stored_datasets=list_stored_datasets(),
+            families=[{"name": n, "description": family_description(n)} for n in list_families()],
+            saved_strategies_json=_saved_strategies_json(),
+        ), 409
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_SEARCH_LAB)
             return render_template(
                 "search.html", error=dataset_error, stored_datasets=list_stored_datasets(),
                 families=[{"name": n, "description": family_description(n)} for n in list_families()],
@@ -2931,18 +3004,22 @@ def search_start():
         return redirect(url_for("search_job", job_id=job_id))
 
     except StrategySpaceError as exc:
+        HEAVY_JOB_GUARD.release(JOB_SEARCH_LAB)
         return render_template(
             "search.html", error=str(exc), stored_datasets=list_stored_datasets(),
             families=[{"name": n, "description": family_description(n)} for n in list_families()],
             saved_strategies_json=_saved_strategies_json(),
         ), 400
     except StrategyError as exc:
+        HEAVY_JOB_GUARD.release(JOB_SEARCH_LAB)
         return render_template(
             "search.html", error=str(exc), stored_datasets=list_stored_datasets(),
             families=[{"name": n, "description": family_description(n)} for n in list_families()],
             saved_strategies_json=_saved_strategies_json(),
         ), 400
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_SEARCH_LAB)
+        log_crash("Search Lab (web, start)", exc=exc)
         return render_template(
             "search.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(),
             families=[{"name": n, "description": family_description(n)} for n in list_families()],
@@ -3045,6 +3122,194 @@ def serve_search_report(filename):
 @app.route("/search_reports_champion/<job_id>/<path:filename>")
 def serve_search_champion_report(job_id, filename):
     return send_from_directory(SEARCH_DIR / "champion" / job_id, filename)
+
+
+# ---------------------------------------------------------------------------
+# Speed Run -- "I have almost no time left, find me anything that works."
+# One button, no strategy to bring in: chains a wide multi-family discovery
+# search straight into concurrent Full Pipeline validation of the top
+# survivors, then reports whichever one is best. Same background-job/poll
+# shape as Full Pipeline above -- see app.orchestration.speed_run for the
+# actual chained-phases logic, which this route just wires up to the web UI
+# the same way the desktop Speed Run tab wires it up to Tkinter.
+# ---------------------------------------------------------------------------
+
+_SPEEDRUN_JOBS: dict[str, dict] = {}
+_SPEEDRUN_JOBS_LOCK = threading.Lock()
+
+
+def _speedrun_job_log(job_id: str, msg: str) -> None:
+    with _SPEEDRUN_JOBS_LOCK:
+        job = _SPEEDRUN_JOBS.get(job_id)
+        if job is not None:
+            job["log"].append(msg)
+
+
+def _run_speedrun_job(
+    job_id: str, df, risk: RiskConfig, rules: PropRules, cfg: SpeedRunConfig, active_label: str,
+) -> None:
+    try:
+        result = run_speed_run(
+            df, risk, rules, SPEEDRUN_DIR, cfg,
+            progress_cb=lambda msg: _speedrun_job_log(job_id, msg),
+            instrument=active_label,
+        )
+        with _SPEEDRUN_JOBS_LOCK:
+            job = _SPEEDRUN_JOBS[job_id]
+            job["done"] = True
+            job["result"] = result
+    except Exception as exc:  # noqa: BLE001 -- must surface on the status page, not crash the thread silently
+        log_crash("Speed Run (web)", exc=exc)
+        with _SPEEDRUN_JOBS_LOCK:
+            job = _SPEEDRUN_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_SPEED_RUN)
+
+
+@app.route("/speed-run")
+def speed_run_form():
+    return render_template(
+        "speed_run.html", stored_datasets=list_stored_datasets(), fitness_metrics=FITNESS_METRICS,
+    )
+
+
+@app.route("/speed-run/start", methods=["POST"])
+def speed_run_start():
+    form = request.form
+    if not HEAVY_JOB_GUARD.try_acquire(JOB_SPEED_RUN):
+        return render_template(
+            "speed_run.html",
+            error=(
+                f"{HEAVY_JOB_GUARD.active_name} is already running on this server. Running more than "
+                f"one heavy job (Search Lab / Evolution Lab / Full Pipeline / Speed Run) at the same "
+                f"time can exhaust available memory -- this is the same failure mode that can freeze "
+                f"or crash the desktop app. Wait for it to finish before starting Speed Run."
+            ),
+            stored_datasets=list_stored_datasets(), fitness_metrics=FITNESS_METRICS,
+        ), 409
+    try:
+        df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
+        if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_SPEED_RUN)
+            return render_template(
+                "speed_run.html", error=dataset_error, stored_datasets=list_stored_datasets(),
+                fitness_metrics=FITNESS_METRICS,
+            ), 400
+
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000)),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0)),
+            pip_size=float(form.get("pip_size", 0.0001)),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000)),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8)),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5)),
+            max_drawdown_pct=float(form.get("max_dd", 10)),
+        )
+        cfg = SpeedRunConfig(
+            max_candidates=int(form.get("max_candidates", 1200) or 1200),
+            stage1_top_n=int(form.get("stage1_top_n", 24) or 24),
+            ga_population=int(form.get("ga_population", 8) or 8),
+            ga_generations=int(form.get("ga_generations", 3) or 3),
+            top_k_to_validate=int(form.get("top_k_to_validate", 3) or 3),
+            max_concurrent_validations=int(form.get("max_concurrent_validations", 2) or 2),
+            validation_folds=int(form.get("validation_folds", 3) or 3),
+            validation_final_mc_sims=int(form.get("validation_final_mc_sims", 3000) or 3000),
+            fitness_metric=form.get("fitness_metric", "eval_pass_probability"),
+            save_winner_to_library=form.get("save_to_library") == "on",
+            random_seed=int(form.get("random_seed", 42) or 42),
+        )
+
+        job_id = uuid.uuid4().hex[:12]
+        initial_log = [f"Loaded {len(df)} bars from {active_label}."]
+        if import_note:
+            initial_log.append(import_note)
+        with _SPEEDRUN_JOBS_LOCK:
+            _SPEEDRUN_JOBS[job_id] = {
+                "log": initial_log, "done": False, "error": None, "result": None,
+                "started_at": time.time(), "instrument": active_label,
+            }
+        thread = threading.Thread(
+            target=_run_speedrun_job, args=(job_id, df, risk, rules, cfg, active_label), daemon=True,
+        )
+        thread.start()
+        return redirect(url_for("speed_run_job", job_id=job_id))
+
+    except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_SPEED_RUN)
+        log_crash("Speed Run (web, start)", exc=exc)
+        return render_template(
+            "speed_run.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(),
+            fitness_metrics=FITNESS_METRICS,
+        ), 500
+
+
+@app.route("/speed-run/job/<job_id>")
+def speed_run_job(job_id):
+    with _SPEEDRUN_JOBS_LOCK:
+        job = _SPEEDRUN_JOBS.get(job_id)
+    if job is None:
+        return render_template("speed_run_job.html", job_id=job_id, not_found=True), 404
+    return render_template("speed_run_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/speed-run/job/<job_id>/status.json")
+def speed_run_job_status(job_id):
+    with _SPEEDRUN_JOBS_LOCK:
+        job = _SPEEDRUN_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+
+    result: SpeedRunResult | None = job.get("result")
+    summary = None
+    if result is not None:
+        winner = None
+        if result.winner is not None and result.winner.pipeline_result is not None:
+            pr = result.winner.pipeline_result
+            winner = {
+                "candidate_id": result.winner.candidate_id,
+                "family": result.winner.family,
+                "verdict": pr.verdict,
+                "eval_pass_probability": pr.final_mc.evaluation_pass_probability,
+                "first_payout_probability": pr.final_mc.first_payout_probability,
+                "saved_library_note": pr.saved_library_note,
+                "report_html": f"/speed_run_reports/{Path(pr.report_paths['html']).name}" if pr.report_paths.get("html") else None,
+            }
+        candidates = []
+        for r in sorted(result.candidates, key=_speedrun_rank_key):
+            if r.pipeline_result is not None:
+                pr = r.pipeline_result
+                candidates.append({
+                    "candidate_id": r.candidate_id, "family": r.family, "verdict": pr.verdict,
+                    "eval_pass_probability": pr.final_mc.evaluation_pass_probability,
+                    "first_payout_probability": pr.final_mc.first_payout_probability,
+                    "report_html": f"/speed_run_reports/{Path(pr.report_paths['html']).name}" if pr.report_paths.get("html") else None,
+                })
+            else:
+                candidates.append({
+                    "candidate_id": r.candidate_id, "family": r.family, "verdict": None,
+                    "eval_pass_probability": None, "first_payout_probability": None, "report_html": None,
+                })
+        summary = {
+            "winner": winner,
+            "winner_reason": result.winner_reason,
+            "elapsed_seconds": result.elapsed_seconds,
+            "candidates": candidates,
+        }
+
+    return jsonify({
+        "found": True, "done": job["done"], "error": job["error"], "log": job["log"],
+        "instrument": job.get("instrument"), "summary": summary,
+    })
+
+
+@app.route("/speed_run_reports/<path:filename>")
+def serve_speedrun_report(filename):
+    return send_from_directory(SPEEDRUN_REPORTS_DIR, filename)
 
 
 def main():

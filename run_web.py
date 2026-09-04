@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import multiprocessing
 
+from app.reports.crash_log import install_thread_excepthook
 from app.web.launcher import run
 
 if __name__ == "__main__":
@@ -25,4 +26,9 @@ if __name__ == "__main__":
     # and without freeze_support() each re-launch falls through to main()
     # again instead of running as a worker.
     multiprocessing.freeze_support()
+    # Catches any exception that kills a background job thread (Evolution
+    # Lab, Full Pipeline, Speed Run, Search Lab jobs all run on one) and
+    # writes it to data/logs/crash_log.txt immediately, independent of the
+    # Flask job's in-memory log. See app.reports.crash_log.
+    install_thread_excepthook()
     run()

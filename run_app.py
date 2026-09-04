@@ -25,8 +25,15 @@ from __future__ import annotations
 import multiprocessing
 
 from app.main import main
+from app.reports.crash_log import install_thread_excepthook
 
 if __name__ == "__main__":
+    # Catches any exception that kills a background thread (Evolution Lab,
+    # Full Pipeline, Speed Run, Search Lab all run on one) and writes it to
+    # data/logs/crash_log.txt immediately -- independent of the GUI, so a
+    # crash that also takes the whole process down (e.g. out-of-memory)
+    # still leaves a record. See app.reports.crash_log's module docstring.
+    install_thread_excepthook()
     # REQUIRED for the packaged .exe: Search Lab (app/search/batch_runner.py)
     # spawns worker processes with concurrent.futures.ProcessPoolExecutor.
     # On Windows, a frozen/PyInstaller build has no real `fork()` -- every

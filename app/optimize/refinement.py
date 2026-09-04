@@ -69,13 +69,26 @@ CODE_EXTENSIONS = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}
 
 # Human-readable labels for the fitness-metric dropdown in the UI. Keys
 # here are the exact strings accepted by RefinementConfig.fitness_metric.
+#
+# Most of these metrics (eval_pass_probability, prop_guide_score,
+# composite_prop_score, first_payout_probability, expected_payout) are only
+# meaningful if you're actually being scored against a prop firm's
+# evaluation/funded-account rules (see app.prop.simulator.PropRules) -- they
+# read PropRules and the Monte Carlo account simulation to score candidates.
+#
+# "net_profit" is the odd one out: compute_fitness() below reads it straight
+# off the backtest's own statistics and never touches PropRules or the MC
+# account simulation at all. That makes it the right choice for long-term /
+# buy-and-hold-style retail trading where there is no prop firm evaluation to
+# pass -- you just want the configuration that made the most money over the
+# full test period, full stop.
 FITNESS_METRICS: dict[str, str] = {
-    "eval_pass_probability": "Eval Pass Probability -- reach target before hitting a limit (recommended)",
+    "eval_pass_probability": "Eval Pass Probability -- reach target before hitting a limit (recommended for prop firms)",
     "prop_guide_score": "Prop-Oriented Guide Score",
     "composite_prop_score": "Composite Prop Score",
     "first_payout_probability": "First Payout Probability",
     "expected_payout": "Expected Payout ($)",
-    "net_profit": "Net Profit ($)",
+    "net_profit": "Long-Term Net Profit ($) -- for long-term trading, no prop firm",
     "profit_factor": "Profit Factor",
     "sharpe_ratio": "Sharpe Ratio",
 }

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Optimize — T58 Prop Algo Backtester</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<style>
+  .t58-method-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .t58-method-card {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+    padding: 16px; text-decoration: none; color: var(--text); display: flex; flex-direction: column; gap: 6px;
+    transition: all var(--dur-base) var(--ease);
+  }
+  .t58-method-card:hover { border-color: var(--teal); transform: translateY(-2px); }
+  .t58-method-card .eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); font-weight: 700; }
+  .t58-method-card h3 { margin: 2px 0 0; font-size: 15px; }
+  .t58-method-card p { margin: 0; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+  .t58-recommended {
+    background: linear-gradient(160deg, var(--panel-2), var(--panel-elevated));
+    border: 1px solid rgba(var(--teal-rgb), .3); border-radius: var(--radius-lg);
+    padding: 20px; margin-bottom: 16px; text-align: center;
+  }
+  .t58-recommended .eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--text-dim); font-weight: 700; }
+  .t58-recommended h2 { margin: 6px 0 4px; font-size: 20px; border: none; text-transform: none; letter-spacing: normal; color: var(--text); }
+  .t58-recommended p { margin: 0 0 14px; font-size: 12px; color: var(--text-muted); }
+</style>
+</head>
+<body>
+{% set active_page = 'optimize_hub' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+
+<div class="t58-page-header">
+  <h1>Optimize</h1>
+  <p>
+    {% if current_strategy %}
+    Choose how to optimize <b>{{ current_strategy.strategy_name }}</b> ({{ current_strategy.instrument }}).
+    {% else %}
+    Pick an optimization method below -- every one of these is still its own full page with its own settings, this just helps pick between them.
+    {% endif %}
+  </p>
+</div>
+
+<div class="t58-recommended">
+  <div class="eyebrow">Recommended default</div>
+  <h2>&#9889; Full Pipeline</h2>
+  <p>Runs search, refinement, and out-of-sample validation together in one pass. The safest single button if you're not sure which method to reach for.</p>
+  <a class="t58-btn primary" href="/full-pipeline">Run Full Pipeline &rarr;</a>
+</div>
+
+<div class="t58-card">
+  <h2>Or pick a specific method</h2>
+  <div class="t58-method-grid">
+    <a class="t58-method-card" href="/quick-optimize">
+      <div class="eyebrow">Fastest</div>
+      <h3>Quick Optimize</h3>
+      <p>Auto-tunes one strategy's own parameters toward pass/win-rate/payout targets. The lightest-weight option.</p>
+    </a>
+    <a class="t58-method-card" href="/search">
+      <div class="eyebrow">Broadest</div>
+      <h3>Search Lab</h3>
+      <p>Generates and filters hundreds of strategy variations across a large parameter space, then refines and validates the best ones.</p>
+    </a>
+    <a class="t58-method-card" href="/evolution">
+      <div class="eyebrow">Evolutionary</div>
+      <h3>Evolution Lab (GA)</h3>
+      <p>A genetic algorithm evolves parameter sets across generations rather than sampling a fixed grid.</p>
+    </a>
+    <a class="t58-method-card" href="/multi-objective">
+      <div class="eyebrow">Multi-goal</div>
+      <h3>Multi-Objective</h3>
+      <p>Optimizes profit, drawdown, and consistency together instead of collapsing them into one fitness number, and shows the trade-off frontier between them.</p>
+    </a>
+    <a class="t58-method-card" href="/refine">
+      <div class="eyebrow">Focused</div>
+      <h3>Iterative Refinement</h3>
+      <p>Repeated rounds of local parameter search around a strategy you already like, rather than exploring broadly from scratch.</p>
+    </a>
+  </div>
+</div>
+
+<div class="t58-card">
+  <h2>After optimizing</h2>
+  <p style="font-size:12px;color:var(--text-muted);margin:0 0 10px;">
+    Once you have a result you like, head to Validate to check it isn't overfit.
+  </p>
+  <a class="t58-btn secondary" href="/validate">Go to Validate &rarr;</a>
+</div>
+
+</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,160 @@
+/* ==========================================================================
+   T58 JOB / PROGRESS PAGES
+   Shared visual layer for every "<x>_job.html" page (Search, CPCV, WFO,
+   WFGA, Sensitivity, Multi-Objective, Speed Run, Refine, Full Pipeline,
+   Quick Optimize, Generate Strategies, Research Agent). These pages poll a
+   status.json endpoint while a long-running job executes, so this is the
+   "AI quant engine at work" moment -- it should look alive.
+
+   Loaded together with theme.css (for the color/spacing variables); this
+   file only adds the layout + component rules specific to job pages. Every
+   selector below matches an id/class the page's own <script> already reads
+   or sets -- nothing here renames anything, so no polling logic changes.
+   ========================================================================== */
+
+body { max-width: none; }
+
+header {
+  padding: 14px 18px; border-bottom: 1px solid var(--border);
+  background: var(--glass-bg); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+}
+header h1 { font-size: 15px; margin: 0; font-weight: 700; letter-spacing: .01em; }
+header h1 .mark {
+  display: inline-flex; width: 20px; height: 20px; border-radius: 6px; margin-right: 8px;
+  background: linear-gradient(135deg, var(--teal), var(--violet)); vertical-align: middle;
+}
+nav { display: flex; gap: 14px; padding: 0; }
+nav a {
+  color: var(--text-muted); font-size: 12px; text-decoration: none; font-weight: 600;
+  padding: 6px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  transition: all var(--dur-fast) var(--ease);
+}
+nav a:hover { color: var(--text); border-color: var(--border-light); background: var(--panel-2); }
+
+main { padding: 18px 16px 40px; max-width: 760px; margin: 0 auto; }
+
+.card {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 16px; margin-bottom: 14px; animation: t58-fade-up 240ms var(--ease);
+}
+.card h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted);
+  margin: 0 0 10px; display: flex; align-items: center; gap: 8px;
+}
+.card p.help { font-size: 12px; color: var(--text-muted); margin: 0 0 10px; line-height: 1.5; }
+
+/* ---- "Engine running" header treatment ----
+   #status-title carries the spinner + label while a job is in flight; once
+   the JS flips it to "...complete"/"...failed" it just reads as a normal
+   card heading, so no extra classes are required from the templates. */
+#status-title { position: relative; }
+.spinner {
+  display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border-light);
+  border-top-color: var(--teal); border-radius: 50%; animation: t58-spin 0.8s linear infinite;
+  vertical-align: middle; margin-right: 10px;
+  box-shadow: 0 0 8px rgba(var(--teal-rgb), .5);
+}
+/* Indeterminate progress bar -- purely decorative "engine active" signal,
+   shown only while .spinner is visible (i.e. job still running). */
+#log { position: relative; }
+.card:has(.spinner:not([style*="display: none"])) #log::before {
+  content: ""; display: block; height: 6px; border-radius: 999px; background: var(--panel-3);
+  border: 1px solid var(--border); overflow: hidden; margin-bottom: 10px;
+}
+
+#log {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-md);
+  padding: 12px; font-family: ui-monospace, Menlo, "SF Mono", monospace;
+  font-size: 12px; color: var(--text-muted); max-height: 280px; overflow-y: auto; white-space: pre-wrap;
+  line-height: 1.6;
+}
+
+.error {
+  background: rgba(var(--coral-rgb), 0.10); border: 1px solid rgba(var(--coral-rgb), 0.35);
+  color: var(--coral); padding: 12px 14px; border-radius: var(--radius-md); margin-bottom: 14px; font-size: 13px;
+}
+.notice, .status-ok {
+  color: var(--teal);
+}
+.status-err { color: var(--coral); }
+.note { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
+.status-msg { font-size: 13px; margin-top: 8px; }
+
+/* ---- Result stat grid ---- */
+.headline { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+.stat {
+  background: var(--panel-3); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px;
+  transition: transform var(--dur-base) var(--ease), border-color var(--dur-base) var(--ease);
+}
+.stat:hover { transform: translateY(-2px); border-color: var(--border-light); }
+.stat .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; }
+.stat .value { font-size: 18px; font-weight: 700; margin-top: 4px; color: var(--text); }
+
+/* ---- Verdict banner ---- */
+.verdict-banner {
+  font-size: 15px; font-weight: 700; padding: 14px; border-radius: var(--radius-md);
+  margin-bottom: 10px; text-align: center; border: 1px solid transparent;
+}
+.verdict-yes { background: rgba(var(--teal-rgb), 0.12); color: var(--teal); border-color: rgba(var(--teal-rgb), 0.35); }
+.verdict-no  { background: rgba(var(--coral-rgb), 0.12); color: var(--coral); border-color: rgba(var(--coral-rgb), 0.35); }
+
+/* ---- Badges (pass/fail/infeasible) ---- */
+.badge {
+  font-size: 10px; padding: 2px 8px; border-radius: 999px; font-weight: 700; letter-spacing: .02em;
+  background: var(--panel-3); color: var(--text-muted); border: 1px solid var(--border);
+}
+.badge.pass { background: rgba(var(--teal-rgb), 0.12); color: var(--teal); border-color: rgba(var(--teal-rgb), 0.35); }
+.badge.fail, .badge.infeasible { background: rgba(var(--coral-rgb), 0.12); color: var(--coral); border-color: rgba(var(--coral-rgb), 0.35); }
+
+/* ---- Links list ---- */
+.links a {
+  display: inline-flex; align-items: center; gap: 4px; color: var(--teal); font-size: 13px;
+  margin-top: 6px; margin-right: 14px; text-decoration: none; font-weight: 600;
+}
+.links a:hover { text-decoration: underline; }
+
+/* ---- Tables ---- */
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+table th, table td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--border); }
+table th { color: var(--text-muted); text-transform: uppercase; font-size: 10px; letter-spacing: .04em; }
+table.candidates th, table.candidates td { padding: 6px 4px; }
+tr.failed td:first-child { border-left: 3px solid var(--coral); opacity: 0.7; }
+
+/* ---- Buttons ---- */
+button, .promote-btn, .save-btn {
+  font-family: inherit; cursor: pointer; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-light); background: var(--panel-3); color: var(--text);
+  transition: all var(--dur-fast) var(--ease);
+}
+button:hover, .promote-btn:hover, .save-btn:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
+.promote-btn { font-size: 11px; padding: 5px 10px; }
+.save-btn {
+  width: 100%; padding: 13px; font-size: 15px; font-weight: 700; margin-top: 10px;
+  background: var(--violet); border-color: var(--violet); color: #0d0820;
+  box-shadow: 0 0 18px rgba(var(--violet-rgb), 0.30);
+}
+.save-btn:disabled { opacity: .5; box-shadow: none; }
+
+/* ---- Inputs (Generate Strategies job page has a rename field) ---- */
+input[type=text] {
+  width: 100%; padding: 10px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border-light);
+  background: var(--panel-3); color: var(--text); font-size: 14px;
+}
+input[type=text]:focus { outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(var(--teal-rgb), 0.15); }
+
+/* ---- Research Agent step trace ---- */
+.card.step { border-left: 2px solid var(--violet); padding-left: 12px; }
+.step .thought { font-size: 13px; color: var(--text); margin-bottom: 4px; }
+.step .action { font-size: 12px; color: var(--violet); font-family: ui-monospace, Menlo, monospace; margin-bottom: 4px; }
+.step .observation {
+  font-size: 12px; color: var(--text-muted); font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap;
+  background: var(--bg); border-radius: var(--radius-sm); padding: 8px; max-height: 200px; overflow-y: auto;
+  border: 1px solid var(--border);
+}
+.final-answer {
+  background: rgba(var(--teal-rgb), 0.10); border: 1px solid rgba(var(--teal-rgb), 0.35); color: var(--text);
+  padding: 16px; border-radius: var(--radius-md); font-size: 14px; line-height: 1.6; white-space: pre-wrap;
+}

@@ -77,6 +77,7 @@ from app.reports.validation_reports import (
     generate_sensitivity_report, generate_walk_forward_report, generate_walkforward_ga_report,
 )
 from app.reports import run_history
+from app.reports import strategy_state
 from app.scoring.t58_scorecard import score_from_results
 from app.search.batch_runner import SearchStageConfig, promote_champion, run_search
 from app.search.family_diversity import render_family_report, summarize_family_performance
@@ -443,10 +444,22 @@ def data_alpaca_forget():
 
 @app.route("/dashboard")
 def dashboard():
+    current = strategy_state.get_current_strategy()
+    checklist = None
+    score = None
+    if current:
+        checklist = strategy_state.get_checklist(current["strategy_name"], current["instrument"])
+        score = strategy_state.robustness_score(current["strategy_name"], current["instrument"])
     return render_template(
         "dashboard.html",
         data=run_history.dashboard_data(),
         dataset_groups=list_datasets_by_instrument(),
+        current_strategy=current,
+        checklist=checklist,
+        robustness=score,
+        validation_labels=strategy_state.VALIDATION_LABELS,
+        validation_hrefs=strategy_state.VALIDATION_HREFS,
+        validation_kinds=strategy_state.VALIDATION_KINDS,
     )
 
 
@@ -455,6 +468,57 @@ def api_dashboard_data():
     """JSON feed the dashboard page polls to refresh live, without a full
     page reload, whenever a run finishes (desktop, web, or CLI)."""
     return jsonify(run_history.dashboard_data())
+
+
+@app.route("/current-strategy/set", methods=["POST"])
+def set_current_strategy():
+    """Explicit only -- the person picks a strategy off the Dashboard
+    scorecard (or the Champion card) and marks it current. Nothing here
+    infers a current strategy from just running a backtest, so a stray
+    one-off test never silently hijacks the checklist."""
+    form = request.form
+    name = (form.get("strategy_name") or "").strip()
+    instrument = (form.get("instrument") or "").strip()
+    timeframe = (form.get("timeframe") or "").strip()
+    if name and instrument:
+        strategy_state.set_current_strategy(name, instrument, timeframe)
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/current-strategy/clear", methods=["POST"])
+def clear_current_strategy():
+    strategy_state.clear_current_strategy()
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/optimize")
+def optimize_hub():
+    """Guided picker for the OPTIMIZE stage -- every method underneath is
+    still its own full page (nothing lost), this just answers "which one
+    should I use" before sending the person on to it."""
+    current = strategy_state.get_current_strategy()
+    return render_template("optimize_hub.html", active_page="optimize_hub", current_strategy=current)
+
+
+@app.route("/validate")
+def validate_hub():
+    """Guided checklist for the VALIDATE stage, built entirely from data
+    already recorded by CPCV / WFO / WFGA / Sensitivity / Regime Matrix --
+    nothing here re-runs or duplicates those tools, it just aggregates what
+    they've already found for whichever strategy is marked current."""
+    current = strategy_state.get_current_strategy()
+    checklist = None
+    score = None
+    if current:
+        checklist = strategy_state.get_checklist(current["strategy_name"], current["instrument"])
+        score = strategy_state.robustness_score(current["strategy_name"], current["instrument"])
+    return render_template(
+        "validate_hub.html", active_page="validate_hub", current_strategy=current,
+        checklist=checklist, robustness=score,
+        validation_labels=strategy_state.VALIDATION_LABELS,
+        validation_hrefs=strategy_state.VALIDATION_HREFS,
+        validation_kinds=strategy_state.VALIDATION_KINDS,
+    )
 
 
 @app.route("/strategies/<strategy_type>/<path:filename>")
@@ -1440,6 +1504,7 @@ def _wfo_job_log(job_id: str, msg: str) -> None:
 def _run_wfo_job(
     job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig,
     n_folds: int, window_mode: str, train_frac: float, embargo_bars: int, refine_cfg: RefinementConfig,
+    strategy_name: str = "", instrument: str = "",
 ) -> None:
     try:
         result = run_walk_forward_optimization(
@@ -1448,12 +1513,18 @@ def _run_wfo_job(
             progress_cb=lambda msg: _wfo_job_log(job_id, msg),
         )
         paths = generate_walk_forward_report(WFO_DIR, result, basename=f"walk_forward_opt_{job_id}")
+        report_html = f"/wfo_reports/{Path(paths['html']).name}"
         with _WFO_JOBS_LOCK:
             job = _WFO_JOBS[job_id]
             job["done"] = True
             job["result"] = result
-            job["report_html"] = f"/wfo_reports/{Path(paths['html']).name}"
+            job["report_html"] = report_html
             job["report_json"] = f"/wfo_reports/{Path(paths['json']).name}"
+        eff = getattr(result, "out_of_sample_efficiency", None)
+        summary = f"OOS efficiency {eff:.2f}" if eff is not None else f"{n_folds} folds completed"
+        # No strict pass/fail verdict is computed by this tool -- passed=None
+        # records that it *ran*, without inventing a threshold it doesn't set.
+        strategy_state.record_validation(strategy_name, instrument, "wfo", passed=None, summary=summary, report_html=report_html)
     except RefinementError as exc:
         with _WFO_JOBS_LOCK:
             job = _WFO_JOBS[job_id]
@@ -1519,6 +1590,7 @@ def wfo_start():
                 int(form.get("n_folds", 5) or 5), form.get("window_mode", "rolling"),
                 float(form.get("train_frac", 0.6) or 0.6), int(form.get("embargo_bars", 0) or 0), refine_cfg,
             ),
+            kwargs={"strategy_name": getattr(strategy, "name", "Strategy"), "instrument": active_label},
             daemon=True,
         )
         thread.start()
@@ -1717,6 +1789,7 @@ def _wfga_job_log(job_id: str, msg: str) -> None:
 def _run_wfga_job(
     job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig,
     refine_cfg: RefinementConfig, n_folds: int, window_mode: str, train_frac: float,
+    strategy_name: str = "", instrument: str = "",
 ) -> None:
     try:
         result = run_walkforward_aware_refinement(
@@ -1724,12 +1797,16 @@ def _run_wfga_job(
             train_frac=train_frac, progress_cb=lambda msg: _wfga_job_log(job_id, msg),
         )
         paths = generate_walkforward_ga_report(WFGA_DIR, result, basename=f"walkforward_ga_{job_id}")
+        report_html = f"/wfga_reports/{Path(paths['html']).name}"
         with _WFGA_JOBS_LOCK:
             job = _WFGA_JOBS[job_id]
             job["done"] = True
             job["result"] = result
-            job["report_html"] = f"/wfga_reports/{Path(paths['html']).name}"
+            job["report_html"] = report_html
             job["report_json"] = f"/wfga_reports/{Path(paths['json']).name}"
+        gap = getattr(result, "overfitting_gap", None)
+        summary = f"overfitting gap {gap:.2f}" if gap is not None else f"{n_folds} folds, walk-forward-aware GA"
+        strategy_state.record_validation(strategy_name, instrument, "wfga", passed=None, summary=summary, report_html=report_html)
     except RefinementError as exc:
         with _WFGA_JOBS_LOCK:
             job = _WFGA_JOBS[job_id]
@@ -1794,6 +1871,7 @@ def wfga_start():
                 job_id, df, strategy, risk, rules, mc_cfg, refine_cfg,
                 int(form.get("n_folds", 4) or 4), form.get("window_mode", "rolling"), float(form.get("train_frac", 0.6) or 0.6),
             ),
+            kwargs={"strategy_name": getattr(strategy, "name", "Strategy"), "instrument": active_label},
             daemon=True,
         )
         thread.start()
@@ -2021,6 +2099,11 @@ def regime_matrix_run():
             return render_template("regime_matrix.html", **ctx(
                 error="Not enough bars in this dataset to classify regimes reliably -- try a longer history.",
             )), 400
+
+        strategy_state.record_validation(
+            getattr(strategy, "name", "Strategy"), active_label, "regime_matrix",
+            passed=None, summary=f"{len(result.cells)} regime cell(s) analyzed",
+        )
 
         return render_template("regime_matrix.html", **ctx(result={
             "dataset": active_label,
@@ -2290,7 +2373,7 @@ def _cpcv_job_log(job_id: str, msg: str) -> None:
             job["log"].append(msg)
 
 
-def _run_cpcv_job(job_id: str, df, strategy, risk: RiskConfig, n_groups: int, n_test_groups: int, embargo_frac: float, metric: str, robustness_threshold: float, max_paths: int, prop_rules=None) -> None:
+def _run_cpcv_job(job_id: str, df, strategy, risk: RiskConfig, n_groups: int, n_test_groups: int, embargo_frac: float, metric: str, robustness_threshold: float, max_paths: int, prop_rules=None, strategy_name: str = "", instrument: str = "") -> None:
     try:
         _cpcv_job_log(job_id, f"Running CPCV: {n_groups} groups, {n_test_groups} held out per path, metric={metric}...")
         result = run_cpcv(
@@ -2300,12 +2383,17 @@ def _run_cpcv_job(job_id: str, df, strategy, risk: RiskConfig, n_groups: int, n_
         )
         _cpcv_job_log(job_id, f"Done: {result.n_paths} paths evaluated.")
         paths = generate_cpcv_report(CPCV_DIR, result, basename=f"cpcv_{job_id}")
+        report_html = f"/cpcv_reports/{Path(paths['html']).name}"
         with _CPCV_JOBS_LOCK:
             job = _CPCV_JOBS[job_id]
             job["done"] = True
             job["result"] = result
-            job["report_html"] = f"/cpcv_reports/{Path(paths['html']).name}"
+            job["report_html"] = report_html
             job["report_json"] = f"/cpcv_reports/{Path(paths['json']).name}"
+        strategy_state.record_validation(
+            strategy_name, instrument, "cpcv",
+            passed=bool(result.is_robust), summary=f"{result.n_paths} paths evaluated", report_html=report_html,
+        )
     except CPCVError as exc:
         with _CPCV_JOBS_LOCK:
             job = _CPCV_JOBS[job_id]
@@ -2352,6 +2440,7 @@ def cpcv_start():
                 float(form.get("robustness_threshold", 0.5) or 0.5), int(form.get("max_paths", 30) or 30),
                 prop_rules,
             ),
+            kwargs={"strategy_name": getattr(strategy, "name", "Strategy"), "instrument": active_label},
             daemon=True,
         )
         thread.start()
@@ -2410,18 +2499,25 @@ def _sens_job_log(job_id: str, msg: str) -> None:
             job["log"].append(msg)
 
 
-def _run_sensitivity_job(job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig, metric: str, pct_range: float, n_steps: int, max_params: int) -> None:
+def _run_sensitivity_job(job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, mc_cfg: MonteCarloConfig, metric: str, pct_range: float, n_steps: int, max_params: int, strategy_name: str = "", instrument: str = "") -> None:
     try:
         _sens_job_log(job_id, f"Sweeping up to {max_params} tunable parameter(s), {n_steps} steps each, metric={metric}...")
         results = compute_1d_sensitivity(df, strategy, risk, rules, mc_cfg, metric=metric, pct_range=pct_range, n_steps=n_steps, max_params=max_params)
         _sens_job_log(job_id, f"Done: swept {len(results)} parameter(s).")
         paths = generate_sensitivity_report(SENSITIVITY_DIR, results, basename=f"sensitivity_{job_id}")
+        report_html = f"/sensitivity_reports/{Path(paths['html']).name}"
         with _SENS_JOBS_LOCK:
             job = _SENS_JOBS[job_id]
             job["done"] = True
             job["results"] = results
-            job["report_html"] = f"/sensitivity_reports/{Path(paths['html']).name}"
+            job["report_html"] = report_html
             job["report_json"] = f"/sensitivity_reports/{Path(paths['json']).name}"
+        # This tool is diagnostic (flags cliffs vs. stable plateaus per
+        # parameter) rather than pass/fail -- passed=None records that it ran.
+        strategy_state.record_validation(
+            strategy_name, instrument, "sensitivity",
+            passed=None, summary=f"{len(results)} parameter(s) swept", report_html=report_html,
+        )
     except RefinementError as exc:
         with _SENS_JOBS_LOCK:
             job = _SENS_JOBS[job_id]
@@ -2463,6 +2559,7 @@ def sensitivity_start():
                 job_id, df, strategy, risk, rules, mc_cfg, form.get("metric", "profit_factor"),
                 float(form.get("pct_range", 0.5) or 0.5), int(form.get("n_steps", 9) or 9), int(form.get("max_params", 8) or 8),
             ),
+            kwargs={"strategy_name": getattr(strategy, "name", "Strategy"), "instrument": active_label},
             daemon=True,
         )
         thread.start()

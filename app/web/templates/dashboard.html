@@ -23,6 +23,127 @@
   <p>Live stats across every strategy run through the app -- desktop, web, and Search Lab all feed this.</p>
 </div>
 
+<!-- ---- Champion Strategy ---- -->
+<div class="t58-champion">
+  <div class="eyebrow">Current champion &mdash; highest Sharpe of all strategies on record</div>
+  {% if data.best %}
+  <div class="title-row">
+    <h3>{{ data.best.strategy_name }}</h3>
+    <span class="t58-status {{ 'validated' if data.best.single_run_passed else 'testing' }}">
+      {{ 'Validated' if data.best.single_run_passed else 'Testing' }}
+    </span>
+  </div>
+  <div class="metrics">
+    <div class="metric"><div class="num t58-glow-violet">{{ "%.2f"|format(data.best.sharpe_ratio) }}</div><div class="lbl">Sharpe</div></div>
+    <div class="metric"><div class="num">{{ "%.1f"|format(data.best.win_rate) }}%</div><div class="lbl">Win rate</div></div>
+    <div class="metric"><div class="num">{{ "%.1f"|format(data.best.max_drawdown_pct) }}%</div><div class="lbl">Max DD</div></div>
+    <div class="metric"><div class="num" style="color:{{ 'var(--teal)' if data.best.net_profit >= 0 else 'var(--coral)' }};">${{ "{:,.0f}".format(data.best.net_profit) }}</div><div class="lbl">Net P/L</div></div>
+  </div>
+  <div class="metrics" style="margin-top:10px;">
+    <div class="metric"><div class="num t58-glow-teal">{{ "%.1f"|format(data.best.eval_pass_probability) }}%</div><div class="lbl">Pass probability</div></div>
+    <div class="metric"><div class="num">${{ "{:,.0f}".format(data.best.expected_payout) }}</div><div class="lbl">Expected payout</div></div>
+    <div class="metric"><div class="num {{ 't58-glow-coral' if data.best.risk_of_ruin_pct >= 10 else '' }}">{{ "%.1f"|format(data.best.risk_of_ruin_pct) }}%</div><div class="lbl">Risk of ruin</div></div>
+  </div>
+  {% set next_stage_href = '/cpcv' if data.best.single_run_passed else '/search' %}
+  {% set next_stage_label = 'Continue to Validate' if data.best.single_run_passed else 'Continue to Optimize' %}
+  <div class="actions">
+    <a class="t58-btn primary" href="{{ next_stage_href }}">{{ next_stage_label }} &rarr;</a>
+    {% if data.best.report_html %}
+    <a class="t58-btn secondary" href="/reports/{{ data.best.report_html.split('/')[-1] }}" target="_blank">View report</a>
+    {% endif %}
+    <a class="t58-btn ghost" href="/forward-test">Forward test</a>
+    {% if not current_strategy or current_strategy.strategy_name != data.best.strategy_name or current_strategy.instrument != data.best.instrument %}
+    <form method="post" action="/current-strategy/set" style="display:inline;">
+      <input type="hidden" name="strategy_name" value="{{ data.best.strategy_name }}">
+      <input type="hidden" name="instrument" value="{{ data.best.instrument }}">
+      <input type="hidden" name="timeframe" value="{{ data.best.timeframe }}">
+      <button type="submit" class="t58-btn ghost">Track as current strategy</button>
+    </form>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="title-row"><h3 style="color:var(--text-dim);font-weight:500;">No strategy tested yet</h3></div>
+  <div class="t58-champion-empty">Run your first backtest and your best strategy by Sharpe will take the podium here.</div>
+  <div class="actions">
+    <a class="t58-btn primary" href="/">Run a backtest</a>
+    <a class="t58-btn secondary" href="/generate-strategies">Generate a strategy (AI)</a>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ---- Current Strategy & live validation checklist ---- -->
+{% if current_strategy %}
+<div class="t58-card">
+  <h2>Current strategy &mdash; validation checklist</h2>
+  <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+    <div style="font-size:14px;font-weight:600;">{{ current_strategy.strategy_name }} &middot; {{ current_strategy.instrument }}</div>
+    <div style="font-size:12px;color:var(--text-muted);">{{ robustness.ran_count }}/{{ robustness.total_count }} checks run
+      {% if robustness.decided_count %} &middot; {{ robustness.pct_passed_of_decided }}% passed (of {{ robustness.decided_count }} with a verdict){% endif %}
+    </div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    {% for kind in validation_kinds %}
+    {% set check = checklist[kind] %}
+    <span class="t58-status {{ 'validated' if check.passed == true else ('rejected' if check.passed == false else ('optimized' if check.ran else 'draft')) }}">
+      {{ validation_labels[kind] }}
+    </span>
+    {% endfor %}
+  </div>
+  <div class="actions" style="margin-top:12px;">
+    <a class="t58-btn secondary" href="/validate">Open Validate &rarr;</a>
+    <form method="post" action="/current-strategy/clear" style="display:inline;">
+      <button type="submit" class="t58-btn ghost sm">Stop tracking</button>
+    </form>
+  </div>
+</div>
+{% else %}
+<div class="t58-card">
+  <h2>Current strategy &mdash; validation checklist</h2>
+  <div class="t58-empty">No strategy marked current yet. Click <b>Track as current strategy</b> above, or <b>Set as current</b> on any row in the scorecard below, to start tracking its validation checklist here.</div>
+</div>
+{% endif %}
+
+<!-- ---- Workflow shortcuts ---- -->
+<div class="t58-card">
+  <h2>Your workflow</h2>
+  <div class="t58-pipeline">
+    <a class="step" href="/generate-strategies"><span class="n">01</span><span class="t">Generate</span></a>
+    <span class="arrow">&rarr;</span>
+    <a class="step" href="/"><span class="n">02</span><span class="t">Backtest</span></a>
+    <span class="arrow">&rarr;</span>
+    <a class="step" href="/search"><span class="n">03</span><span class="t">Optimize</span></a>
+    <span class="arrow">&rarr;</span>
+    <a class="step" href="/cpcv"><span class="n">04</span><span class="t">Validate</span></a>
+    <span class="arrow">&rarr;</span>
+    <a class="step" href="/portfolio"><span class="n">05</span><span class="t">Portfolio</span></a>
+    <span class="arrow">&rarr;</span>
+    <a class="step" href="/forward-test"><span class="n">06</span><span class="t">Forward test</span></a>
+    <span class="arrow">&rarr;</span>
+    <a class="step" href="/deploy-live"><span class="n">07</span><span class="t">Deploy live</span></a>
+  </div>
+</div>
+
+<!-- ---- Hero KPIs ---- -->
+<div class="t58-grid cols-4" id="stat-cards">
+  <div class="t58-hero-stat">
+    <div class="label">Strategies tested</div>
+    <div class="value" id="stat-total" data-animate-to="{{ data.total_strategies }}">0</div>
+  </div>
+  <div class="t58-hero-stat">
+    <div class="label">Eval pass rate</div>
+    <div class="value {{ 't58-glow-teal' if data.pass_rate >= 50 else 't58-glow-coral' }}" id="stat-pass-rate" data-animate-to="{{ data.pass_rate }}" data-decimals="1" data-suffix="%">0%</div>
+    <div class="bar"><span style="width:{{ data.pass_rate }}%;"></span></div>
+  </div>
+  <div class="t58-hero-stat">
+    <div class="label">Best Sharpe</div>
+    <div class="value t58-glow-violet" id="stat-sharpe">{{ "%.2f"|format(data.best.sharpe_ratio) if data.best else "--" }}</div>
+  </div>
+  <div class="t58-hero-stat">
+    <div class="label">Leader</div>
+    <div class="value" style="font-size:16px;" id="stat-leader">{{ data.best.strategy_name if data.best else "--" }}</div>
+  </div>
+</div>
+
 <div class="t58-card">
   <h2>Market data library -- data/raw, grouped by instrument</h2>
   {% if dataset_groups %}
@@ -52,25 +173,6 @@
   {% endif %}
 </div>
 
-<div class="t58-grid cols-4" id="stat-cards">
-  <div class="t58-stat">
-    <div class="label">Strategies tested</div>
-    <div class="value" id="stat-total">{{ data.total_strategies }}</div>
-  </div>
-  <div class="t58-stat">
-    <div class="label">Eval pass rate</div>
-    <div class="value {{ 't58-glow-teal' if data.pass_rate >= 50 else 't58-glow-coral' }}" id="stat-pass-rate">{{ data.pass_rate }}%</div>
-  </div>
-  <div class="t58-stat">
-    <div class="label">Best Sharpe</div>
-    <div class="value t58-glow-violet" id="stat-sharpe">{{ "%.2f"|format(data.best.sharpe_ratio) if data.best else "--" }}</div>
-  </div>
-  <div class="t58-stat">
-    <div class="label">Leader</div>
-    <div class="value" style="font-size:15px;" id="stat-leader">{{ data.best.strategy_name if data.best else "--" }}</div>
-  </div>
-</div>
-
 <div class="t58-card">
   <h2>Strategy universe</h2>
   <div id="universe-graph"></div>
@@ -95,7 +197,7 @@
       <thead>
         <tr>
           <th>Strategy</th><th>Instrument</th><th>Trades</th><th>Net P/L</th>
-          <th>Win %</th><th>Sharpe</th><th>Max DD</th><th>Runs</th><th>Result</th><th></th>
+          <th>Win %</th><th>Sharpe</th><th>Max DD</th><th>Runs</th><th>Result</th><th>Current</th><th></th>
         </tr>
       </thead>
       <tbody>
@@ -110,6 +212,18 @@
           <td>{{ "%.1f"|format(s.max_drawdown_pct) }}%</td>
           <td>{{ s.run_count }}</td>
           <td><span class="t58-pill {{ 'pass' if s.single_run_passed else 'fail' }}">{{ 'pass' if s.single_run_passed else 'fail' }}</span></td>
+          <td>
+            {% if current_strategy and current_strategy.strategy_name == s.strategy_name and current_strategy.instrument == s.instrument %}
+            <span class="t58-status validated">&#9733; Current</span>
+            {% else %}
+            <form method="post" action="/current-strategy/set" style="margin:0;">
+              <input type="hidden" name="strategy_name" value="{{ s.strategy_name }}">
+              <input type="hidden" name="instrument" value="{{ s.instrument }}">
+              <input type="hidden" name="timeframe" value="{{ s.timeframe }}">
+              <button type="submit" class="t58-btn ghost sm">Set as current</button>
+            </form>
+            {% endif %}
+          </td>
           <td>{% if s.report_html %}<a href="/reports/{{ s.report_html.split('/')[-1] }}" target="_blank">report &rarr;</a>{% endif %}</td>
         </tr>
         {% endfor %}

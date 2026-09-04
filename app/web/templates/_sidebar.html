@@ -3,85 +3,138 @@
     <div class="mark">T5</div>
     <div>
       <div class="name">T58 Trading</div>
-      <div class="sub">Prop Algo Backtester</div>
+      <div class="sub">Prop Algo Lab</div>
     </div>
   </div>
 
-  <a href="/dashboard" class="t58-nav-item {{ 'active' if active_page == 'dashboard' else '' }}">
-    <span class="t58-nav-icon">&#9635;</span><span class="label">Dashboard</span>
+  <a href="/dashboard" class="t58-nav-item top-level {{ 'active' if active_page == 'dashboard' else '' }}">
+    <span class="t58-nav-icon">&#8962;</span><span class="label">Dashboard</span>
   </a>
 
   <div class="t58-nav-divider"></div>
+  <div class="t58-nav-section-label">Strategy Lab</div>
 
-  <a href="/speed-run" class="t58-nav-item {{ 'active' if active_page == 'speed_run' else '' }}">
-    <span class="t58-nav-icon">&#9889;</span><span class="label">&#9889; Speed run</span>
-  </a>
+  {% set create_pages   = ['speed_run', 'generate_strategies', 'research_agent'] %}
+  {% set test_pages     = ['run', 'payout_probability'] %}
+  {% set optimize_pages = ['optimize_hub', 'search', 'refine', 'full_pipeline', 'quick_optimize', 'multi_objective', 'evolution'] %}
+  {% set validate_pages = ['validate_hub', 'wfo', 'wfga', 'cpcv', 'sensitivity', 'regime_matrix'] %}
+  {% set champion_pages = ['family_diversity', 'ensemble', 'portfolio'] %}
+
+  <!-- (1) Create -->
+  <details class="t58-nav-group" {{ 'open' if active_page in create_pages else '' }}>
+    <summary><span class="t58-num">&#9312;</span> Create <span class="chev">&#9656;</span></summary>
+    <div class="t58-nav-group-items">
+      <a href="/speed-run" class="t58-nav-item {{ 'active' if active_page == 'speed_run' else '' }}">
+        <span class="t58-nav-icon">&#9889;</span><span class="label">Speed run</span>
+      </a>
+      <a href="/generate-strategies" class="t58-nav-item {{ 'active' if active_page == 'generate_strategies' else '' }}">
+        <span class="t58-nav-icon">&#10038;</span><span class="label">Generate strategies (AI)</span>
+      </a>
+      <a href="/research-agent" class="t58-nav-item {{ 'active' if active_page == 'research_agent' else '' }}">
+        <span class="t58-nav-icon">&#9737;</span><span class="label">Research agent</span>
+      </a>
+    </div>
+  </details>
+
+  <!-- (2) Test -->
+  <details class="t58-nav-group" {{ 'open' if active_page in test_pages else '' }}>
+    <summary><span class="t58-num">&#9313;</span> Test <span class="chev">&#9656;</span></summary>
+    <div class="t58-nav-group-items">
+      <a href="/" class="t58-nav-item {{ 'active' if active_page == 'run' else '' }}">
+        <span class="t58-nav-icon">&#9654;</span><span class="label">Run &amp; report</span>
+      </a>
+      <a href="/payout-probability" class="t58-nav-item {{ 'active' if active_page == 'payout_probability' else '' }}">
+        <span class="t58-nav-icon">&#9878;</span><span class="label">Payout probability</span>
+      </a>
+    </div>
+  </details>
+
+  <!-- (3) Optimize -->
+  <details class="t58-nav-group" {{ 'open' if active_page in optimize_pages else '' }}>
+    <summary><span class="t58-num">&#9314;</span> Optimize <span class="chev">&#9656;</span></summary>
+    <div class="t58-nav-group-items">
+      <a href="/optimize" class="t58-nav-item {{ 'active' if active_page == 'optimize_hub' else '' }}" style="font-weight:600;">
+        <span class="t58-nav-icon">&#8981;</span><span class="label">Overview / picker</span>
+      </a>
+      <a href="/search" class="t58-nav-item {{ 'active' if active_page == 'search' else '' }}">
+        <span class="t58-nav-icon">&#9636;</span><span class="label">Search lab</span>
+      </a>
+      <a href="/refine" class="t58-nav-item {{ 'active' if active_page == 'refine' else '' }}">
+        <span class="t58-nav-icon">&#9851;</span><span class="label">Iterative refinement</span>
+      </a>
+      <a href="/full-pipeline" class="t58-nav-item {{ 'active' if active_page == 'full_pipeline' else '' }}">
+        <span class="t58-nav-icon">&#9889;</span><span class="label">Full pipeline</span>
+      </a>
+      <a href="/quick-optimize" class="t58-nav-item {{ 'active' if active_page == 'quick_optimize' else '' }}">
+        <span class="t58-nav-icon">&#9889;</span><span class="label">Quick optimize</span>
+      </a>
+      <a href="/multi-objective" class="t58-nav-item {{ 'active' if active_page == 'multi_objective' else '' }}">
+        <span class="t58-nav-icon">&#10022;</span><span class="label">Multi-objective</span>
+      </a>
+      <a href="/evolution" class="t58-nav-item {{ 'active' if active_page == 'evolution' else '' }}">
+        <span class="t58-nav-icon">&#9860;</span><span class="label">Evolution lab (GA)</span>
+      </a>
+    </div>
+  </details>
+
+  <!-- (4) Validate -->
+  <details class="t58-nav-group" {{ 'open' if active_page in validate_pages else '' }}>
+    <summary><span class="t58-num">&#9315;</span> Validate <span class="chev">&#9656;</span></summary>
+    <div class="t58-nav-group-items">
+      <a href="/validate" class="t58-nav-item {{ 'active' if active_page == 'validate_hub' else '' }}" style="font-weight:600;">
+        <span class="t58-nav-icon">&#8981;</span><span class="label">Overview / checklist</span>
+      </a>
+      <a href="/walk-forward-opt" class="t58-nav-item {{ 'active' if active_page == 'wfo' else '' }}">
+        <span class="t58-nav-icon">&#8635;</span><span class="label">Walk-forward opt</span>
+      </a>
+      <a href="/walk-forward-ga" class="t58-nav-item {{ 'active' if active_page == 'wfga' else '' }}">
+        <span class="t58-nav-icon">&#8635;</span><span class="label">Walk-forward GA</span>
+      </a>
+      <a href="/cpcv" class="t58-nav-item {{ 'active' if active_page == 'cpcv' else '' }}">
+        <span class="t58-nav-icon">&#8862;</span><span class="label">CPCV</span>
+      </a>
+      <a href="/sensitivity" class="t58-nav-item {{ 'active' if active_page == 'sensitivity' else '' }}">
+        <span class="t58-nav-icon">&#8862;</span><span class="label">Sensitivity</span>
+      </a>
+      <a href="/regime-matrix" class="t58-nav-item {{ 'active' if active_page == 'regime_matrix' else '' }}">
+        <span class="t58-nav-icon">&#9737;</span><span class="label">Regime survival matrix</span>
+      </a>
+    </div>
+  </details>
+
+  <!-- (5) Champion -->
+  <details class="t58-nav-group" {{ 'open' if active_page in champion_pages else '' }}>
+    <summary><span class="t58-num">&#9316;</span> Champion <span class="chev">&#9656;</span></summary>
+    <div class="t58-nav-group-items">
+      <a href="/portfolio" class="t58-nav-item {{ 'active' if active_page == 'portfolio' else '' }}">
+        <span class="t58-nav-icon">&#9707;</span><span class="label">Multi-asset portfolio</span>
+      </a>
+      <a href="/ensemble" class="t58-nav-item {{ 'active' if active_page == 'ensemble' else '' }}">
+        <span class="t58-nav-icon">&#9707;</span><span class="label">Multi-strategy ensemble</span>
+      </a>
+      <a href="/family-diversity" class="t58-nav-item {{ 'active' if active_page == 'family_diversity' else '' }}">
+        <span class="t58-nav-icon">&#10038;</span><span class="label">Family diversity</span>
+      </a>
+    </div>
+  </details>
 
   <div class="t58-nav-divider"></div>
+  <div class="t58-nav-section-label">Deployment</div>
 
-  <a href="/" class="t58-nav-item {{ 'active' if active_page == 'run' else '' }}">
-    <span class="t58-nav-icon">&#9654;</span><span class="label">Run &amp; report</span>
-  </a>
-  <a href="/payout-probability" class="t58-nav-item {{ 'active' if active_page == 'payout_probability' else '' }}">
-    <span class="t58-nav-icon">&#9878;</span><span class="label">Payout probability</span>
-  </a>
-  <a href="/search" class="t58-nav-item {{ 'active' if active_page == 'search' else '' }}">
-    <span class="t58-nav-icon">&#9636;</span><span class="label">Search lab</span>
-  </a>
-  <a href="/refine" class="t58-nav-item {{ 'active' if active_page == 'refine' else '' }}">
-    <span class="t58-nav-icon">&#9851;</span><span class="label">Iterative refinement</span>
-  </a>
-  <a href="/full-pipeline" class="t58-nav-item {{ 'active' if active_page == 'full_pipeline' else '' }}">
-    <span class="t58-nav-icon">&#9889;</span><span class="label">Full pipeline</span>
-  </a>
-  <a href="/walk-forward-opt" class="t58-nav-item {{ 'active' if active_page == 'wfo' else '' }}">
-    <span class="t58-nav-icon">&#8635;</span><span class="label">Walk-forward opt</span>
-  </a>
-  <a href="/multi-objective" class="t58-nav-item {{ 'active' if active_page == 'multi_objective' else '' }}">
-    <span class="t58-nav-icon">&#10022;</span><span class="label">Multi-objective</span>
-  </a>
-  <a href="/walk-forward-ga" class="t58-nav-item {{ 'active' if active_page == 'wfga' else '' }}">
-    <span class="t58-nav-icon">&#8635;</span><span class="label">Walk-forward GA</span>
-  </a>
-  <a href="/portfolio" class="t58-nav-item {{ 'active' if active_page == 'portfolio' else '' }}">
-    <span class="t58-nav-icon">&#9707;</span><span class="label">Multi-asset portfolio</span>
-  </a>
-  <a href="/regime-matrix" class="t58-nav-item {{ 'active' if active_page == 'regime_matrix' else '' }}">
-    <span class="t58-nav-icon">&#9737;</span><span class="label">Regime survival matrix</span>
-  </a>
-  <a href="/family-diversity" class="t58-nav-item {{ 'active' if active_page == 'family_diversity' else '' }}">
-    <span class="t58-nav-icon">&#10038;</span><span class="label">Family diversity</span>
-  </a>
-  <a href="/ensemble" class="t58-nav-item {{ 'active' if active_page == 'ensemble' else '' }}">
-    <span class="t58-nav-icon">&#9707;</span><span class="label">Multi-strategy ensemble</span>
-  </a>
-  <a href="/cpcv" class="t58-nav-item {{ 'active' if active_page == 'cpcv' else '' }}">
-    <span class="t58-nav-icon">&#8862;</span><span class="label">CPCV</span>
-  </a>
-  <a href="/sensitivity" class="t58-nav-item {{ 'active' if active_page == 'sensitivity' else '' }}">
-    <span class="t58-nav-icon">&#8862;</span><span class="label">Sensitivity</span>
-  </a>
-  <a href="/evolution" class="t58-nav-item {{ 'active' if active_page == 'evolution' else '' }}">
-    <span class="t58-nav-icon">&#9860;</span><span class="label">Evolution lab</span>
-  </a>
-  <a href="/quick-optimize" class="t58-nav-item {{ 'active' if active_page == 'quick_optimize' else '' }}">
-    <span class="t58-nav-icon">&#9889;</span><span class="label">Quick optimize</span>
-  </a>
-  <a href="/generate-strategies" class="t58-nav-item {{ 'active' if active_page == 'generate_strategies' else '' }}">
-    <span class="t58-nav-icon">&#10038;</span><span class="label">Generate strategies (AI)</span>
-  </a>
-  <a href="/research-agent" class="t58-nav-item {{ 'active' if active_page == 'research_agent' else '' }}">
-    <span class="t58-nav-icon">&#9737;</span><span class="label">Research agent</span>
-  </a>
+  <!-- (6) Forward Test -->
   <a href="/forward-test" class="t58-nav-item {{ 'active' if active_page == 'forward_test' else '' }}">
-    <span class="t58-nav-icon">&#9711;</span><span class="label">Forward test (MT5)</span>
+    <span class="t58-num">&#9317;</span><span class="label">Forward test (MT5)</span>
   </a>
+  <!-- (7) Deploy -->
   <a href="/deploy-live" class="t58-nav-item {{ 'active' if active_page == 'deploy_live' else '' }}">
-    <span class="t58-nav-icon">&#9888;</span><span class="label">Deploy live</span>
+    <span class="t58-num">&#9318;</span><span class="label">Deploy live</span>
   </a>
+  <!-- (8) Monitor -->
   <a href="/live-market" class="t58-nav-item {{ 'active' if active_page == 'live_market' else '' }}">
-    <span class="t58-nav-icon">&#9679;</span><span class="label">Live market</span>
+    <span class="t58-num">&#9319;</span><span class="label">Monitor (live market)</span>
   </a>
 
   <div class="t58-nav-spacer"></div>
 </div>
+
+<script src="/static/t58-chrome.js" defer></script>

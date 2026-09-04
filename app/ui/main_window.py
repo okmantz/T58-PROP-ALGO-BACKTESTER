@@ -159,27 +159,35 @@ DEFAULT_MANUAL_STRATEGY = {
 # without threading a theme object through thousands of call sites.
 # ---------------------------------------------------------------------------
 THEMES = {
+    # UPGRADE (Sep 2026 UI pass): core semantic colors realigned to the
+    # exact same palette as the web app's theme.css, so opening either
+    # build feels like the same product (same brand teal/violet/coral/
+    # amber, same background/panel/border/text ramps). Only the core
+    # brand colors moved -- BLUE, METAL/METAL_BRIGHT, and the decorative
+    # NEON_* dashboard-tile set are unchanged (they have no equivalent in
+    # the web palette and changing them risked clashing with the existing
+    # glow/KPI rendering for no real consistency gain).
     "dark": {
-        "BG": "#08090C",
-        "PANEL": "#131720",          # lifted slightly off BG so cards read as elevated surfaces
-        "PANEL_2": "#171B25",
-        "PANEL_3": "#1E232E",
-        "PANEL_HOVER": "#242A37",    # hover state for interactive surfaces (buttons, rows)
-        "BORDER": "#272C38",
-        "BORDER_LIGHT": "#3D4453",
-        "TEXT": "#E9EBEF",
-        "TEXT_MUTED": "#8D94A3",
-        "TEXT_DIM": "#5C6472",
+        "BG": "#05070A",             # == web --bg
+        "PANEL": "#0D1017",          # == web --panel
+        "PANEL_2": "#10141C",        # == web --panel-2
+        "PANEL_3": "#151A24",        # == web --panel-3
+        "PANEL_HOVER": "#1B212C",    # hover state for interactive surfaces (buttons, rows)
+        "BORDER": "#1C2230",         # == web --border
+        "BORDER_LIGHT": "#2A3242",   # == web --border-light
+        "TEXT": "#E7EBF2",           # == web --text
+        "TEXT_MUTED": "#8A93A6",     # == web --text-muted
+        "TEXT_DIM": "#5B6478",       # == web --text-dim
         "METAL": "#B8BDC5",
         "METAL_BRIGHT": "#E7E9ED",
-        "LOG_BG": "#0B0D10",         # background for the monospace live-log/output Text widgets
-        "GREEN": "#3ED685",
-        "RED": "#F0596A",
+        "LOG_BG": "#070A0E",         # background for the monospace live-log/output Text widgets
+        "GREEN": "#35E0B0",          # == web --teal -- pass/validated/success everywhere
+        "RED": "#FF6F6F",            # == web --coral -- fail/danger/destructive everywhere
         "BLUE": "#6FA8FF",
-        "AMBER": "#D9A441",
-        "ACCENT": "#7C6FFF",
-        "ACCENT_HOVER": "#9089FF",
-        "ACCENT_DIM": "#332E5C",     # low-opacity-style accent for subtle fills/left-bars
+        "AMBER": "#F0B429",          # == web --amber -- warning everywhere
+        "ACCENT": "#8B7CFF",         # == web --violet -- primary brand accent
+        "ACCENT_HOVER": "#A79CFF",
+        "ACCENT_DIM": "#2B2850",     # low-opacity-style accent for subtle fills/left-bars
         "ACCENT_INK": "#0C0A16",     # near-black used as text on top of the bright accent
         # Neon accent set -- used for the glowing card borders / ring progress /
         # per-metric coloring on the Dashboard tab, matching the neon-dark
@@ -194,26 +202,26 @@ THEMES = {
         "NEON_AMBER": "#FFB547",
     },
     "light": {
-        "BG": "#F4F5F7",
-        "PANEL": "#FFFFFF",
-        "PANEL_2": "#F1F2F5",
-        "PANEL_3": "#E7E9EE",
-        "PANEL_HOVER": "#DCE0E8",
-        "BORDER": "#D9DCE3",
-        "BORDER_LIGHT": "#C3C8D1",
-        "TEXT": "#14161B",
-        "TEXT_MUTED": "#565D6B",
-        "TEXT_DIM": "#8B909C",
+        "BG": "#F5F7FA",             # == web light --bg
+        "PANEL": "#FFFFFF",          # == web light --panel
+        "PANEL_2": "#FFFFFF",        # == web light --panel-2
+        "PANEL_3": "#EEF2F6",        # == web light --panel-3
+        "PANEL_HOVER": "#E3E8EF",
+        "BORDER": "#DDE3EA",         # == web light --border
+        "BORDER_LIGHT": "#C9D2DB",   # == web light --border-light
+        "TEXT": "#101820",           # == web light --text
+        "TEXT_MUTED": "#52616C",     # == web light --text-muted
+        "TEXT_DIM": "#7C8894",       # == web light --text-dim
         "METAL": "#6B7280",
         "METAL_BRIGHT": "#2F333B",
         "LOG_BG": "#FBFBFC",
-        "GREEN": "#0E9B5E",
-        "RED": "#D23B52",
+        "GREEN": "#0F9F78",          # == web light --teal
+        "RED": "#E0453F",            # == web light --coral
         "BLUE": "#2C64D6",
-        "AMBER": "#A66A16",
-        "ACCENT": "#5B4CE0",
-        "ACCENT_HOVER": "#4739C9",
-        "ACCENT_DIM": "#E4E1FA",
+        "AMBER": "#B8790F",          # == web light --amber
+        "ACCENT": "#6C58EF",         # == web light --violet
+        "ACCENT_HOVER": "#5A46D6",
+        "ACCENT_DIM": "#E7E3FB",
         "ACCENT_INK": "#FFFFFF",
         # Same decorative role as the dark theme's neon set, deliberately
         # darkened/desaturated from true neon so they stay legible as text
@@ -1030,49 +1038,55 @@ class MainWindow:
         # letter-spaced) instead of a bare line -- every group is named
         # rather than just visually separated, which is what actually
         # makes a long list like this read as organized instead of messy.
+        #
+        # UPGRADE (Sep 2026 UI pass): regrouped around the user's journey
+        # (Create -> Test -> Optimize -> Validate -> Champion -> Forward
+        # Test -> Deploy -> Monitor) instead of one flat "WORKFLOW" list --
+        # same idea as the web app's sidebar regroup, same 8 stage names,
+        # every existing key/frame/builder untouched (this is purely which
+        # section a tab is listed under, its label text, and its accent
+        # color -- nothing about what a tab does changed).
         self._nav_items = [
             (None, None, "OVERVIEW", None, None),
             ("dashboard", "", "Dashboard", self.tab_dashboard, NEON_VIOLET),
             ("manual", "", "User Manual", self.tab_manual, METAL_BRIGHT),
 
-            (None, None, "DEADLINE MODE", None, None),
-            ("speedrun", "", "\u26a1 SPEED RUN", self.tab_speedrun, RED),
+            (None, None, "\u2460 CREATE", None, None),
+            ("strategy", "", "Strategy Builder", self.tab_strategy, NEON_VIOLET),
+            ("speedrun", "", "\u26a1 Speed Run", self.tab_speedrun, NEON_VIOLET),
+            ("genstrat", "", "Generate Strategies (AI)", self.tab_genstrat, NEON_VIOLET),
+            ("researchagent", "", "Research Agent", self.tab_researchagent, NEON_VIOLET),
 
-            (None, None, "WORKFLOW", None, None),
-            ("data", "", "01  Data", self.tab_data, NEON_CYAN),
-            ("strategy", "", "02  Strategy", self.tab_strategy, NEON_CYAN),
-            ("prop", "", "03  Prop Rules", self.tab_prop, NEON_CYAN),
-            ("risk", "", "04  Risk", self.tab_risk, NEON_CYAN),
-            ("run", "", "05  Run & Report", self.tab_run, NEON_CYAN),
-            ("payout", "", "05a  Payout Probability", self.tab_payout, NEON_CYAN),
-            ("refine", "", "06  Refinement", self.tab_refine, NEON_CYAN),
-            ("search", "", "07  Search Lab", self.tab_search, NEON_CYAN),
+            (None, None, "\u2461 TEST", None, None),
+            ("data", "", "1  Market Data", self.tab_data, NEON_CYAN),
+            ("prop", "", "2  Prop-Firm Rules", self.tab_prop, NEON_CYAN),
+            ("risk", "", "3  Risk & Execution", self.tab_risk, NEON_CYAN),
+            ("run", "", "4  Run & Report", self.tab_run, NEON_CYAN),
+            ("payout", "", "Payout Probability", self.tab_payout, NEON_CYAN),
 
-            (None, None, "VALIDATION LAB", None, None),
-            ("wfo", "", "08  Walk-Forward Opt", self.tab_wfo, BLUE),
-            ("cpcv", "", "09  CPCV / PBO", self.tab_cpcv, BLUE),
-            ("sensitivity", "", "10  Sensitivity", self.tab_sensitivity, BLUE),
-            ("portfolio", "", "11  Portfolio", self.tab_portfolio, BLUE),
-            ("multiobj", "", "12  Multi-Objective", self.tab_multiobj, BLUE),
-            ("wfga", "", "13  Walk-Forward GA", self.tab_wfga, BLUE),
-            ("regimematrix", "", "13a  Regime Survival Matrix", self.tab_regime_matrix, BLUE),
+            (None, None, "\u2462 OPTIMIZE", None, None),
+            ("refine", "", "Iterative Refinement", self.tab_refine, BLUE),
+            ("search", "", "Search Lab", self.tab_search, BLUE),
+            ("multiobj", "", "Multi-Objective", self.tab_multiobj, BLUE),
+            ("evolution", "", "Evolution Lab (GA)", self.tab_evolution, BLUE),
+            ("fullpipeline", "", "Full Pipeline (all-in-one)", self.tab_fullpipeline, BLUE),
 
-            (None, None, "FINDING AN EDGE", None, None),
-            ("ensemble", "", "14  Ensemble", self.tab_ensemble, NEON_MAGENTA),
-            ("genstrat", "", "Generate Strategies (AI)", self.tab_genstrat, NEON_MAGENTA),
-            ("evolution", "", "Evolution Lab", self.tab_evolution, NEON_MAGENTA),
+            (None, None, "\u2463 VALIDATE", None, None),
+            ("wfo", "", "Walk-Forward Opt", self.tab_wfo, NEON_AMBER),
+            ("wfga", "", "Walk-Forward GA", self.tab_wfga, NEON_AMBER),
+            ("cpcv", "", "CPCV / PBO", self.tab_cpcv, NEON_AMBER),
+            ("sensitivity", "", "Sensitivity", self.tab_sensitivity, NEON_AMBER),
+            ("regimematrix", "", "Regime Survival Matrix", self.tab_regime_matrix, NEON_AMBER),
+
+            (None, None, "\u2464 CHAMPION", None, None),
+            ("portfolio", "", "Multi-Asset Portfolio", self.tab_portfolio, NEON_MAGENTA),
+            ("ensemble", "", "Multi-Strategy Ensemble", self.tab_ensemble, NEON_MAGENTA),
             ("familydiversity", "", "Family Diversity", self.tab_family_diversity, NEON_MAGENTA),
 
-            (None, None, "ALL-IN-ONE", None, None),
-            ("fullpipeline", "", "15  Full Pipeline", self.tab_fullpipeline, NEON_AMBER),
-
-            (None, None, "LIVE TRADING", None, None),
-            ("forwardtest", "", "Live Demo Test", self.tab_forwardtest, NEON_LIME),
-            ("deploylive", "", "Deploy Live", self.tab_deploylive, RED),
-            ("livemarket", "", "Live Market", self.tab_livemarket, NEON_CYAN),
-
-            (None, None, "AI RESEARCH", None, None),
-            ("researchagent", "", "16  Research Agent", self.tab_researchagent, NEON_MAGENTA),
+            (None, None, "DEPLOYMENT", None, None),
+            ("forwardtest", "", "\u2465 Forward Test (MT5)", self.tab_forwardtest, NEON_LIME),
+            ("deploylive", "", "\u2466 Deploy Live", self.tab_deploylive, RED),
+            ("livemarket", "", "\u2467 Monitor (Live Market)", self.tab_livemarket, NEON_CYAN),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -2315,14 +2329,14 @@ class MainWindow:
             "words don't mean anything yet, skip down to the FULL WALKTHROUGH below -- it "
             "explains every one of these in plain terms."
         )
-        numstep(1, "01 DATA — import a CSV, or fetch data with a free Alpaca key, then select it.")
-        numstep(2, "02 STRATEGY — pick Manual / Python / PineScript / MQL5 and set it up.")
-        numstep(3, "03 PROP RULES — enter your prop firm's account size, targets, and drawdown rules.")
-        numstep(4, "04 RISK — set your risk per trade and starting balance (defaults are fine to start).")
-        numstep(5, "15 FULL PIPELINE — click RUN FULL PIPELINE and read the READY / MARGINAL / NOT READY verdict.")
+        numstep(1, "TEST → Market Data — import a CSV, or fetch data with a free Alpaca key, then select it.")
+        numstep(2, "CREATE → Strategy Builder — pick Manual / Python / PineScript / MQL5 and set it up.")
+        numstep(3, "TEST → Prop-Firm Rules — enter your prop firm's account size, targets, and drawdown rules.")
+        numstep(4, "TEST → Risk & Execution — set your risk per trade and starting balance (defaults are fine to start).")
+        numstep(5, "OPTIMIZE → Full Pipeline — click RUN FULL PIPELINE and read the READY / MARGINAL / NOT READY verdict.")
         tip(
-            "That's it. Steps 06-14 (Refinement, Search Lab, Validation Lab, Ensemble) are all "
-            "optional extra tools for later — you do not need them for a first pass."
+            "That's it. Everything under OPTIMIZE, VALIDATE, and CHAMPION in the sidebar is all "
+            "optional extra tooling for later — you do not need it for a first pass."
         )
         rule()
 
@@ -2331,13 +2345,14 @@ class MainWindow:
         # -------------------------------------------------------------
         h1("FULL WALKTHROUGH (STEP BY STEP)")
         body(
-            "Follow these in order the first time. Every tab is numbered in the sidebar on "
-            "the left in the same order as this guide."
+            "Follow these in order the first time. The sidebar groups tabs by stage (Create, Test, "
+            "Optimize, Validate, Champion, Forward Test, Deploy, Monitor) rather than one long numbered "
+            "list -- this walkthrough still goes in a sensible first-pass order regardless of section."
         )
 
-        h2("STEP 1 — Import your market data (01 DATA)")
+        h2("STEP 1 — Import your market data (TEST → Market Data)")
         body("The backtester needs historical price candles (open/high/low/close/volume) before anything else can run.")
-        numstep(1, "Click 01 DATA in the sidebar.")
+        numstep(1, "Click Market Data in the sidebar (under TEST).")
         numstep(2, "If you already have a CSV file of price data, click IMPORT CSV(S) and select it.")
         substep("A CSV needs columns for timestamp, open, high, low, and close (volume is optional). Headers are "
                 "auto-detected — 'time'/'date', 'o'/'open', etc. all work.")
@@ -2357,20 +2372,20 @@ class MainWindow:
         numstep(1, "Go to alpaca.markets and sign up for a free account (choose Paper Trading, not a live account).")
         numstep(2, "In the Alpaca dashboard, generate an API Key ID and a Secret Key (usually under 'API Keys' "
                     "or 'Paper Trading' settings).")
-        numstep(3, "Back in this app, on the 01 DATA tab, paste both into the 'Fetch data from Alpaca' section.")
+        numstep(3, "Back in this app, on the Market Data tab (under TEST), paste both into the 'Fetch data from Alpaca' section.")
         numstep(4, "Click TEST CONNECTION to confirm the keys work.")
         numstep(5, "Choose an asset class, symbol, and timeframe, then click FETCH & SAVE. It's saved locally as "
                     "a CSV, so you only need to fetch it once.")
         tip("Your keys are saved locally on this computer so you don't have to re-enter them every time.")
         rule()
 
-        h2("STEP 2 — Build or upload a strategy (02 STRATEGY)")
+        h2("STEP 2 — Build or upload a strategy (CREATE → Strategy Builder)")
         body("This is the trading logic that will be tested against your data. Four options:")
         bullet("MANUAL — a visual, no-code builder: pick indicators and entry/exit conditions from dropdowns.")
         bullet("PYTHON — upload your own .py strategy file, or load one from the built-in Strategy Library.")
         bullet("PINESCRIPT — upload a TradingView-style .pine strategy (a supported subset of syntax).")
         bullet("MQL5 — upload a MetaTrader .mq5 Expert Advisor (a supported subset of syntax).")
-        numstep(1, "Click 02 STRATEGY and pick one of the four buttons at the top.")
+        numstep(1, "Click Strategy Builder (under CREATE) and pick one of the four buttons at the top.")
         numstep(2, "MANUAL: fill in the visual builder — indicators, then entry/exit rules, then a stop-loss/"
                     "take-profit. PYTHON/PINESCRIPT/MQL5: upload a file, or load a saved one from the Strategy Library.")
         tip(
@@ -2399,7 +2414,7 @@ class MainWindow:
         bullet("OPEN LIBRARY FOLDER / EXPORT LIBRARY AS ZIP — for backing up or moving your library by hand.")
         rule()
 
-        h2("STEP 3 — Enter your prop firm's rules (03 PROP RULES)")
+        h2("STEP 3 — Enter your prop firm's rules (TEST → Prop-Firm Rules)")
         body(
             "These numbers come straight from your prop firm's rulebook — check their FAQ/PDF, since getting "
             "this wrong makes every result downstream meaningless."
@@ -2410,7 +2425,7 @@ class MainWindow:
         bullet("Optional: payout threshold/cap/frequency, minimum trading days, position size limits.")
         rule()
 
-        h2("STEP 4 — Set risk & execution (04 RISK)")
+        h2("STEP 4 — Set risk & execution (TEST → Risk & Execution)")
         body("Position sizing, trading costs, and execution assumptions used by the backtest engine.")
         bullet("Initial balance, risk mode (percent of equity vs fixed), and risk per trade.")
         bullet("Spread/slippage/commission — leave at realistic defaults unless your broker publishes different numbers.")
@@ -2429,7 +2444,7 @@ class MainWindow:
                "06 Refinement, Quick Optimize, and Evolution Lab all have their own enable checkbox for it.")
         rule()
 
-        h2("STEP 5 — Run a single backtest (05 RUN & REPORT)")
+        h2("STEP 5 — Run a single backtest (TEST → Run & Report)")
         body(
             "This runs your strategy exactly as configured, once, and produces one HTML report: "
             "Backtest → Prop Simulation → Monte Carlo → Report."
@@ -2469,7 +2484,7 @@ class MainWindow:
         )
         rule()
 
-        h2("STEP 6 — Iterative Refinement (06 Refinement, optional)")
+        h2("STEP 6 — Iterative Refinement (OPTIMIZE → Iterative Refinement, optional)")
         body(
             "A genetic-algorithm-style parameter search: re-runs your strategy many times with mutated "
             "parameters on the SAME historical data, keeps the best-performing configurations each round, "
@@ -2480,7 +2495,7 @@ class MainWindow:
             "02 Strategy without retyping any parameter by hand.")
         rule()
 
-        h2("STEP 7 — Search Lab (07 Search Lab, optional)")
+        h2("STEP 7 — Search Lab (OPTIMIZE → Search Lab, optional)")
         body(
             "Generates and tests many strategy variations at once instead of one at a time: a fast filter "
             "narrows thousands of candidates down to a shortlist, the same Iterative Refinement engine tunes "
@@ -2489,16 +2504,16 @@ class MainWindow:
             "were tried) decides what actually survives."
         )
         tip(
-            "Run a search here first, then check the Family Diversity tab (under FINDING AN EDGE below) to "
+            "Run a search here first, then check the Family Diversity tab (under CHAMPION) to "
             "see which whole hypothesis families — trend, breakout, mean reversion, liquidity sweep, and so "
             "on — actually held up, not just which single candidate scored highest."
         )
         rule()
 
-        h1("VALIDATION LAB (steps 08-13, plus Regime Survival Matrix) — optional deeper robustness checks")
+        h1("VALIDATE — Walk-Forward, CPCV, Sensitivity, Walk-Forward GA, Regime Survival Matrix — optional deeper robustness checks")
         body(
-            "Everything in this group is optional and can be safely skipped on a first pass — the 15 Full "
-            "Pipeline tab below already runs a solid, automated version of search and out-of-sample "
+            "Everything in this group is optional and can be safely skipped on a first pass — the OPTIMIZE → Full "
+            "Pipeline tab already runs a solid, automated version of search and out-of-sample "
             "validation on its own. Come back here once you have a strategy worth digging into further."
         )
         h2("08 — Walk-Forward Optimization")
@@ -2523,7 +2538,7 @@ class MainWindow:
             "steps — the sign of a knife-edge parameter rather than a real, stable plateau. Can also produce "
             "a 2D heatmap for a chosen pair of parameters, since two can interact even when each looks fine alone."
         )
-        h2("11 — Multi-Asset Portfolio")
+        h2("11 — Multi-Asset Portfolio (now under CHAMPION, not this section)")
         body(
             "Applies the strategy configured on Step 2 to every instrument you list, computes the "
             "correlation matrix of their daily returns, re-weights each instrument's risk (correlated "
@@ -2532,7 +2547,7 @@ class MainWindow:
         )
         tip("ADD LEG FROM LIBRARY lets a portfolio combine genuinely different saved strategies, not just "
             "one strategy run across several instruments.")
-        h2("12 — Multi-Objective Optimization")
+        h2("12 — Multi-Objective Optimization (now under OPTIMIZE, not this section)")
         body(
             "Runs a real NSGA-II search across several objectives at once (e.g. Sharpe, max drawdown, "
             "eval-pass probability) instead of collapsing them into one weighted score the way Iterative "
@@ -2554,8 +2569,8 @@ class MainWindow:
         )
         rule()
 
-        h1("FINDING AN EDGE (14 Ensemble, Generate Strategies, Evolution Lab, Family Diversity)")
-        h2("14 — Multi-Strategy Ensemble")
+        h1("CHAMPION, CREATE & OPTIMIZE — Ensemble, Generate Strategies, Evolution Lab, Family Diversity (split across those three sections)")
+        h2("Multi-Strategy Ensemble (CHAMPION)")
         body(
             "The mirror case of Portfolio: several DIFFERENT strategies combined on the SAME instrument, "
             "instead of one strategy across several instruments. Two modes: Blend keeps every strategy "
@@ -2563,7 +2578,7 @@ class MainWindow:
             "Portfolio's own math); Vote combines every strategy's signal into one entry, taken only once "
             "enough of them agree on direction."
         )
-        h2("Generate Strategies (AI)")
+        h2("Generate Strategies (AI) (CREATE)")
         body(
             "Drafts a NEW strategy's source code from a plain-language idea, using a local Ollama model — "
             "grounded in whatever papers you've dropped into the research/ folder and in your own best-"
@@ -2572,7 +2587,7 @@ class MainWindow:
             "way through the normal backtest -> validation ladder like anything else — nothing runs "
             "automatically."
         )
-        h2("Evolution Lab")
+        h2("Evolution Lab (OPTIMIZE)")
         body(
             "Natural-selection-based strategy discovery: each generation generates a fresh population of "
             "strategies across every hypothesis family, runs them through pre-filter -> robustness -> "
@@ -2587,7 +2602,7 @@ class MainWindow:
                     "+ code) and PROMOTE TO STRATEGY LIBRARY once you find one worth keeping.")
         tip("Every candidate evaluated (not just the winners) is logged, so later generations' journal "
             "entries can say what's historically worked before, not just what this generation found.")
-        h2("Family Diversity")
+        h2("Family Diversity (CHAMPION)")
         body(
             "Groups the most recent Search Lab run's candidates by hypothesis family (trend following, "
             "breakout, mean reversion, liquidity sweep, momentum, VWAP, opening range, market structure, "
@@ -2596,7 +2611,7 @@ class MainWindow:
         )
         rule()
 
-        h2("STEP 9 — Run the Full Pipeline (15 FULL PIPELINE) — the recommended one-button path")
+        h2("STEP 9 — Run the Full Pipeline (OPTIMIZE → Full Pipeline) — the recommended one-button path")
         body(
             "This is the fastest way to get a trustworthy answer: it backtests your strategy as given, "
             "automatically searches for a configuration that generalizes (scored only on data it wasn't "
@@ -2622,7 +2637,7 @@ class MainWindow:
         )
         rule()
 
-        h2("STEP 10 — Live Demo Test on a real broker feed (LIVE TRADING → Live Demo Test)")
+        h2("STEP 10 — Forward Test on a real broker feed (FORWARD TEST → Forward Test (MT5))")
         body(
             "Once a strategy looks good in the Full Pipeline, this deploys it to a free MetaTrader 5 (MT5) "
             "demo account so you can watch it trade forward against real, live broker prices — still no real "
@@ -2653,7 +2668,7 @@ class MainWindow:
         )
         rule()
 
-        h2("STEP 11 — Deploy Live (LIVE TRADING → Deploy Live) — real money, read this first")
+        h2("STEP 11 — Deploy Live (DEPLOY → Deploy Live) — real money, read this first")
         warn(
             "This is NOT the same as Live Demo Test. An account connected here trades with real capital in a "
             "live or funded prop-firm account. Confirm your prop firm actually permits automated/EA trading "
@@ -2676,7 +2691,7 @@ class MainWindow:
         )
         rule()
 
-        h2("STEP 12 — Live Market (LIVE TRADING → Live Market)")
+        h2("STEP 12 — Monitor the live market (MONITOR → Live Market)")
         body(
             "A live-updating candlestick chart for any symbol — live via MT5 if connected, delayed via Alpaca "
             "if you've saved keys, or a steady replay of a local CSV if neither is available. Pick a source, "
@@ -2684,9 +2699,9 @@ class MainWindow:
         )
         rule()
 
-        h1("AI RESEARCH — 16 Research Agent")
+        h1("CREATE — Research Agent")
         body(
-            "Ask a local Ollama model to investigate the strategy configured on Steps 01-04. It can call "
+            "Ask a local Ollama model to investigate the strategy configured under TEST. It can call "
             "run_backtest, run_prop_simulation, run_monte_carlo, run_walk_forward, run_regime_analysis, "
             "run_parameter_sensitivity, run_cost_stress, compare_strategies, search_research (your research/ "
             "paper library), and search_experiments (this app's own memory of every past strategy test) — "
@@ -2695,14 +2710,14 @@ class MainWindow:
         warn(
             "The agent can only RECOMMEND a next step (e.g. a parameter worth testing) — it has no tool that "
             "edits or applies code, so nothing it suggests ever takes effect until you act on it yourself "
-            "through 06 Refinement / Quick Optimize / 15 Full Pipeline."
+            "through OPTIMIZE → Iterative Refinement / Quick Optimize / Full Pipeline."
         )
         bullet("One-time setup: install Ollama (ollama.com/download), enable it on this tab, and enter the "
                "host/model — everything runs locally, nothing is sent to the cloud.")
         bullet("EMBED RESEARCH LIBRARY — indexes whatever papers you've dropped into the research/ folder so "
-               "the agent (and Generate Strategies, on the FINDING AN EDGE tab) can search them by meaning, "
+               "the agent (and Generate Strategies, under CREATE) can search them by meaning, "
                "not just keyword.")
-        bullet("VIEW LEADERBOARD — every strategy test recorded from 15 Full Pipeline, Quick Optimize, or a "
+        bullet("VIEW LEADERBOARD — every strategy test recorded from OPTIMIZE → Full Pipeline, Quick Optimize, or a "
                "Batch Test, ranked and diffed against its own parent configuration so you can see exactly "
                "what changed between a KEEP and a DISCARD.")
         bullet("RUN RESEARCH LOOP — a closed loop: hypothesis -> Ollama drafts a strategy -> backtest -> "
@@ -2716,14 +2731,14 @@ class MainWindow:
         # -------------------------------------------------------------
         h1("SHORT VERSION — RECAP")
         body("Once you've done the full walkthrough once, this is all you need to remember for next time:")
-        numstep(1, "01 DATA → select or fetch your data.")
-        numstep(2, "02 STRATEGY → pick/build your strategy (or load/optimize one from the Strategy Library).")
-        numstep(3, "03 PROP RULES + 04 RISK → confirm these still match your firm/settings.")
-        numstep(4, "15 FULL PIPELINE → RUN FULL PIPELINE → read the verdict.")
-        numstep(5, "If READY and you want to see it trade live → LIVE TRADING → Live Demo Test (paper) or "
-                    "Deploy Live (real capital, once you're confident).")
+        numstep(1, "TEST → Market Data → select or fetch your data.")
+        numstep(2, "CREATE → Strategy Builder → pick/build your strategy (or load/optimize one from the Strategy Library).")
+        numstep(3, "TEST → Prop-Firm Rules + Risk & Execution → confirm these still match your firm/settings.")
+        numstep(4, "OPTIMIZE → Full Pipeline → RUN FULL PIPELINE → read the verdict.")
+        numstep(5, "If READY and you want to see it trade live → FORWARD TEST → Forward Test (MT5) (paper) or "
+                    "DEPLOY → Deploy Live (real capital, once you're confident).")
         tip(
-            "That's the whole loop. VALIDATION LAB, FINDING AN EDGE, and AI RESEARCH in the sidebar are all "
+            "That's the whole loop. OPTIMIZE, VALIDATE, and CHAMPION in the sidebar are all "
             "there for when you want to dig deeper — none of them are required to get your first result."
         )
 
@@ -2772,7 +2787,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "01 / Market Data",
+            "TEST / Market Data",
             "Market Data",
             "Select historical OHLC data for the backtest. Built-in datasets are "
             "loaded automatically; imported CSVs are stored locally for future sessions.",
@@ -3212,7 +3227,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "02 / Strategy",
+            "CREATE / Strategy",
             "Strategy Configuration",
             "Build a complete strategy visually — no code required — or bring your own "
             "Python / PineScript / MQL5 file.",
@@ -4914,7 +4929,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "03 / Prop Firm Rules",
+            "TEST / Prop-Firm Rules",
             "Prop-Firm Rules",
             "Define the evaluation, drawdown, consistency, payout, and position constraints.",
         )
@@ -5008,7 +5023,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "04 / Risk & Execution",
+            "TEST / Risk & Execution",
             "Risk & Execution",
             "Define position risk, trading frequency, transaction costs, and execution assumptions.",
         )
@@ -5230,7 +5245,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "06 / Iterative Refinement",
+            "OPTIMIZE / Iterative Refinement",
             "Iterative Refinement (Optional)",
             "Genetic-algorithm-style parameter search: re-runs this strategy many times "
             "with mutated parameters on the SAME historical data, keeps the "
@@ -5511,7 +5526,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "05 / Run & Report",
+            "TEST / Run & Report",
             "Run Backtest & Report",
             "Backtest → Prop Simulation → Monte Carlo → Report. This runs ONE strategy, once, "
             "with no GA search -- for batch-testing several queued strategies at once, or for the "
@@ -5864,7 +5879,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "05a / Payout Probability",
+            "TEST / Payout Probability",
             "Full-Lifecycle Survival Simulator",
             "Goes beyond a single pass-probability number: simulates thousands of complete account "
             "lifecycles (Start -> Evaluation -> Funded -> Payout #1 -> Payout #2 -> ... -> "
@@ -6023,7 +6038,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "07 / Search Lab",
+            "OPTIMIZE / Search Lab",
             "Search Lab (Stages 1-5)",
             "Generates and tests many strategy variations at once instead of one at a "
             "time: a fast filter narrows thousands of candidates down to a shortlist, "
@@ -6750,7 +6765,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "13a / Regime Survival Matrix",
+            "VALIDATE / Regime Survival Matrix",
             "Regime Survival Matrix",
             "Classifies every bar on trend, volatility, session, and market environment, "
             "then attributes THIS strategy's own trades to whichever regime was active at "
@@ -6848,7 +6863,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "Strategy Family Diversity",
+            "CHAMPION / Family Diversity",
             "Strategy Family Diversity",
             "Groups the most recent Search Lab run's candidates by hypothesis family "
             "(trend following, breakout, mean reversion, liquidity sweep, momentum, VWAP, "
@@ -6910,7 +6925,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "08 / Validation Lab",
+            "VALIDATE / Walk-Forward Opt",
             "Walk-Forward Optimization",
             "Re-optimizes this strategy fresh on each rolling or anchored fold's "
             "training window using a small GA search, applies the winning "
@@ -7043,7 +7058,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "09 / Validation Lab",
+            "VALIDATE / CPCV & PBO",
             "Combinatorial Purged Cross-Validation & PBO",
             "CPCV stress-tests this strategy across many different combinatorial "
             "train/test partitions of the same data, instead of just one holdout "
@@ -7251,7 +7266,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "10 / Validation Lab",
+            "VALIDATE / Sensitivity",
             "Parameter Sensitivity",
             "Sweeps every tunable numeric parameter across +/- a percentage of its "
             "current value, holding everything else fixed, and flags a 'cliff' "
@@ -7401,7 +7416,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "11 / Validation Lab",
+            "CHAMPION / Multi-Asset Portfolio",
             "Multi-Asset Portfolio",
             "Applies the strategy currently configured on Step 2 to every instrument "
             "listed below, computes the correlation matrix of their daily returns, "
@@ -7645,7 +7660,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "12 / Validation Lab",
+            "OPTIMIZE / Multi-Objective",
             "Multi-Objective Optimization",
             "Runs a real NSGA-II search across several objectives at once (e.g. "
             "Sharpe, max drawdown, eval-pass probability) instead of collapsing "
@@ -7770,7 +7785,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "13 / Validation Lab",
+            "VALIDATE / Walk-Forward GA",
             "Walk-Forward-Aware GA",
             "Same crossover/mutation/tournament-selection GA as Iterative Refinement "
             "(Step 6), but every candidate's fitness is scored ONLY on chained "
@@ -7897,7 +7912,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "14 / Finding an Edge",
+            "CHAMPION / Multi-Strategy Ensemble",
             "Multi-Strategy Ensemble",
             "The mirror case of Step 11's Multi-Asset Portfolio: several DIFFERENT "
             "strategies combined on the SAME instrument, instead of one strategy across "
@@ -8135,7 +8150,7 @@ class MainWindow:
         f = self._scrollable(self.tab_genstrat)
         self._page_header(
             f,
-            "Finding an Edge / AI",
+            "CREATE / Generate Strategies (AI)",
             "Generate Strategies",
             "Drafts a NEW strategy's source code from a plain-language idea, using a local "
             "Ollama model -- grounded in whatever papers you've dropped into the research/ "
@@ -8990,7 +9005,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "15 / All-In-One",
+            "OPTIMIZE / Full Pipeline",
             "Full Pipeline",
             "One button, the whole workflow: backtests the strategy as given, runs "
             "app.optimize.walkforward_ga to search for a configuration that generalizes "
@@ -9296,7 +9311,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "\u26a1 / Deadline Mode",
+            "CREATE / Speed Run",
             "Speed Run",
             "One button: searches EVERY registered strategy family at once for something "
             "that shows an edge, validates the best few candidates through Full Pipeline "
@@ -9585,7 +9600,7 @@ class MainWindow:
         f = self._scrollable(self.tab_researchagent)
         self._page_header(
             f,
-            "16 / AI Research",
+            "CREATE / Research Agent",
             "AI Research Agent",
             "Ask a local Ollama model to investigate the strategy configured in Steps 01-04. "
             "It can call run_backtest, run_prop_simulation, run_monte_carlo, run_walk_forward, "
@@ -9990,7 +10005,7 @@ class MainWindow:
 
         self._page_header(
             f,
-            "16 / Going Live",
+            "FORWARD TEST / Forward Test (MT5)",
             "Live Demo Test (MT5 Demo)",
             "Deploy any Strategy Library strategy to a free MetaTrader 5 demo account and "
             "watch it trade forward, bar by bar, against real broker prices instead of a "
@@ -10421,7 +10436,7 @@ class MainWindow:
         f = self._scrollable(self.tab_livemarket)
         self._page_header(
             f,
-            "17 / Live Market",
+            "MONITOR / Live Market",
             "Live Market",
             "Two ways to see a live-style chart for a symbol. OPEN TRADINGVIEW CHART (recommended) "
             "just opens the real tradingview.com chart for the symbol below in your browser -- no "
@@ -10502,7 +10517,7 @@ class MainWindow:
             status_lines.append("MT5 package: available.")
         else:
             status_lines.append("MT5 package: not available on this platform (Windows + MT5 terminal required).")
-        status_lines.append(f"Alpaca keys saved: {'yes' if has_alpaca else 'no (set them on the 01 DATA tab)'}.")
+        status_lines.append(f"Alpaca keys saved: {'yes' if has_alpaca else 'no (set them on the Market Data tab)'}.")
         status_lines.append(f"Source defaulted to '{default_source}' based on what's actually configured above -- "
                              "switch it manually any time.")
         Label(
@@ -10712,7 +10727,7 @@ class MainWindow:
         f = self._scrollable(self.tab_deploylive)
         self._page_header(
             f,
-            "18 / Going Live For Real",
+            "DEPLOY / Deploy Live",
             "Deploy Live",
             "Connect a validated strategy directly to a real, funded prop-firm account for "
             "automated live trading -- no manual clicking required once it's running.",

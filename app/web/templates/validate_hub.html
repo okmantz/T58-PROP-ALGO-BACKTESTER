@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Validate — T58 Prop Algo Backtester</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<style>
+  .t58-check-row {
+    display: flex; align-items: center; gap: 12px; padding: 12px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .t58-check-row:last-child { border-bottom: none; }
+  .t58-check-row .dot {
+    width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700;
+  }
+  .t58-check-row .dot.pass { background: rgba(var(--teal-rgb),.15); color: var(--teal); border: 1px solid rgba(var(--teal-rgb),.4); }
+  .t58-check-row .dot.fail { background: rgba(var(--coral-rgb),.15); color: var(--coral); border: 1px solid rgba(var(--coral-rgb),.4); }
+  .t58-check-row .dot.ran { background: rgba(var(--violet-rgb),.15); color: var(--violet); border: 1px solid rgba(var(--violet-rgb),.4); }
+  .t58-check-row .dot.pending { background: var(--panel-3); color: var(--text-dim); border: 1px solid var(--border); }
+  .t58-check-row .body { flex: 1; min-width: 0; }
+  .t58-check-row .name { font-size: 14px; font-weight: 600; }
+  .t58-check-row .detail { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .t58-score-ring { display: flex; align-items: center; gap: 16px; margin-bottom: 4px; }
+  .t58-score-ring .num { font-size: 32px; font-weight: 700; }
+  .t58-score-ring .lbl { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; }
+</style>
+</head>
+<body>
+{% set active_page = 'validate_hub' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+
+<div class="t58-page-header">
+  <h1>Validate</h1>
+  <p>Is this strategy actually robust, or did it just get lucky on one backtest? This checklist is built entirely from validation tools you've already run -- nothing here is re-computed or guessed.</p>
+</div>
+
+{% if not current_strategy %}
+<div class="t58-card">
+  <div class="t58-empty">
+    No strategy is marked current yet. Go to the
+    <a href="/dashboard">Dashboard</a>, find a strategy in the scorecard, and click
+    <b>Set as current</b> to start tracking its validation checklist here.
+  </div>
+</div>
+{% else %}
+
+<div class="t58-champion" style="margin-bottom:14px;">
+  <div class="eyebrow">Validating</div>
+  <div class="title-row">
+    <h3>{{ current_strategy.strategy_name }} &middot; {{ current_strategy.instrument }}</h3>
+  </div>
+  <div class="t58-score-ring" style="margin-top:14px;">
+    <div>
+      <div class="num t58-glow-teal">{{ robustness.ran_count }}/{{ robustness.total_count }}</div>
+      <div class="lbl">Checks run</div>
+    </div>
+    {% if robustness.decided_count %}
+    <div>
+      <div class="num {{ 't58-glow-teal' if robustness.pct_passed_of_decided >= 50 else 't58-glow-coral' }}">{{ robustness.pct_passed_of_decided }}%</div>
+      <div class="lbl">Passed (of {{ robustness.decided_count }} with a verdict)</div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="t58-card">
+  <h2>Validation checklist</h2>
+  {% for kind in validation_kinds %}
+  {% set check = checklist[kind] %}
+  <div class="t58-check-row">
+    {% if not check.ran %}
+    <div class="dot pending">&#9675;</div>
+    {% elif check.passed is none %}
+    <div class="dot ran">&#9679;</div>
+    {% elif check.passed %}
+    <div class="dot pass">&#10003;</div>
+    {% else %}
+    <div class="dot fail">&#10005;</div>
+    {% endif %}
+    <div class="body">
+      <div class="name">{{ validation_labels[kind] }}</div>
+      <div class="detail">
+        {% if not check.ran %}
+        Not run yet for this strategy.
+        {% elif check.passed is none %}
+        Ran &mdash; {{ check.summary or "no strict pass/fail verdict for this tool" }}.
+        {% elif check.passed %}
+        Passed &mdash; {{ check.summary }}.
+        {% else %}
+        Did not pass &mdash; {{ check.summary }}.
+        {% endif %}
+        {% if check.report_html %}
+        <a href="{{ check.report_html }}" target="_blank">report &rarr;</a>
+        {% endif %}
+      </div>
+    </div>
+    <a class="t58-btn {{ 'secondary' if check.ran else 'primary' }} sm" href="{{ validation_hrefs[kind] }}">
+      {{ 'Re-run' if check.ran else 'Run' }}
+    </a>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="t58-card">
+  <h2>Once validated</h2>
+  <div class="actions" style="display:flex;gap:8px;flex-wrap:wrap;">
+    <a class="t58-btn secondary" href="/portfolio">Multi-Asset Portfolio</a>
+    <a class="t58-btn secondary" href="/ensemble">Multi-Strategy Ensemble</a>
+    <a class="t58-btn ghost" href="/forward-test">Forward Test &rarr;</a>
+  </div>
+</div>
+
+{% endif %}
+
+</div>
+</div>
+</body>
+</html>

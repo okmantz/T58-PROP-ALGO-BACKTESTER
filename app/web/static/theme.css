@@ -1,25 +1,106 @@
-/* T58 shared theme -- dark, soft neon glow, used by every page.
-   Kept deliberately restrained: glow lives on data (numbers, lines, active
-   nav state), not on every border, so it still reads as a serious trading
-   tool rather than a game UI. */
+/* ==========================================================================
+   T58 DESIGN SYSTEM
+   Shared by every page in the app. Single source of truth for color,
+   spacing, and shell chrome (topbar + sidebar). Page-specific <style>
+   blocks still exist for form layout, but read colors from the variables
+   below rather than hardcoding hex, so a palette/theme change here
+   propagates everywhere.
+
+   Design intent (Sep 2026 UI pass): a trading terminal (Bloomberg x
+   TradingView x Linear), not a collection of admin pages. Neon/glow is a
+   reserved accent for a small set of "this matters" signals -- selected
+   nav, key KPIs, live/running status, primary CTAs -- never a blanket
+   effect on every border or card.
+   ========================================================================== */
 
 :root {
+  color-scheme: dark;
+
+  /* ---- Core palette (dark, default) ---- */
   --bg: #05070a;
+  --bg-1: #05070a;
   --panel: #0d1017;
   --panel-2: #10141c;
   --panel-3: #151a24;
+  --panel-elevated: #141a24;
   --border: #1c2230;
   --border-light: #2a3242;
   --text: #e7ebf2;
   --text-muted: #8a93a6;
   --text-dim: #5b6478;
+
   --teal: #35e0b0;
   --teal-dim: #0f6e56;
+  --teal-rgb: 53, 224, 176;
   --violet: #8b7cff;
   --violet-dim: #3c3489;
+  --violet-rgb: 139, 124, 255;
   --coral: #ff6f6f;
   --coral-dim: #712b13;
+  --coral-rgb: 255, 111, 111;
   --amber: #f0b429;
+  --amber-rgb: 240, 180, 41;
+
+  --success: var(--teal);
+  --warning: var(--amber);
+  --danger: var(--coral);
+  --info: var(--violet);
+
+  /* ---- Design tokens ---- */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.45);
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+
+  --glass-bg: rgba(13, 16, 23, 0.72);
+  --glass-border: rgba(255, 255, 255, 0.06);
+
+  --topbar-h: 52px;
+  --sidebar-w: 240px;
+}
+
+/* ---- Light theme -- a genuinely distinct palette, not an inversion ---- */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f7fa;
+  --bg-1: #eef2f6;
+  --panel: #ffffff;
+  --panel-2: #ffffff;
+  --panel-3: #eef2f6;
+  --panel-elevated: #ffffff;
+  --border: #dde3ea;
+  --border-light: #c9d2db;
+  --text: #101820;
+  --text-muted: #52616c;
+  --text-dim: #7c8894;
+
+  --teal: #0f9f78;
+  --teal-dim: #0a7259;
+  --teal-rgb: 15, 159, 120;
+  --violet: #6c58ef;
+  --violet-dim: #4a3bc4;
+  --violet-rgb: 108, 88, 239;
+  --coral: #e0453f;
+  --coral-dim: #b8352f;
+  --coral-rgb: 224, 69, 63;
+  --amber: #b8790f;
+  --amber-rgb: 184, 121, 15;
+
+  --shadow-sm: 0 1px 2px rgba(16, 24, 32, 0.08);
+  --shadow-md: 0 6px 20px rgba(16, 24, 32, 0.10);
+  --shadow-lg: 0 12px 32px rgba(16, 24, 32, 0.14);
+  --glass-bg: rgba(255, 255, 255, 0.75);
+  --glass-border: rgba(16, 24, 32, 0.08);
 }
 
 * { box-sizing: border-box; }
@@ -29,20 +110,25 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  transition: background var(--dur-base) var(--ease), color var(--dur-base) var(--ease);
 }
+
+a { color: var(--teal); }
 
 .t58-shell { display: flex; min-height: 100vh; }
 
-/* ---- Sidebar ---- */
+/* ==========================================================================
+   SIDEBAR
+   ========================================================================== */
 .t58-sidebar {
-  width: 220px;
+  width: var(--sidebar-w);
   flex-shrink: 0;
   background: var(--panel);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: 16px 10px;
-  gap: 3px;
+  padding: 14px 10px 10px;
+  gap: 2px;
   position: sticky;
   top: 0;
   height: 100vh;
@@ -50,76 +136,348 @@ html, body {
 }
 .t58-brand {
   display: flex; align-items: center; gap: 10px;
-  padding: 6px 10px 16px;
+  padding: 6px 8px 16px;
 }
 .t58-brand .mark {
-  width: 26px; height: 26px; border-radius: 7px;
+  width: 28px; height: 28px; border-radius: 8px;
   background: linear-gradient(135deg, var(--teal), var(--violet));
   color: #04120e; font-weight: 700; font-size: 12px;
   display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 16px rgba(var(--teal-rgb), 0.35);
+  flex-shrink: 0;
 }
-.t58-brand .name { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
-.t58-brand .sub { font-size: 10px; color: var(--text-dim); }
+.t58-brand .name { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+.t58-brand .sub { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; margin-top: 1px; }
 
 .t58-nav-item {
   display: flex; align-items: center; gap: 10px;
-  padding: 9px 10px; border-radius: 8px;
+  padding: 8px 10px; border-radius: var(--radius-sm);
   color: var(--text-muted); text-decoration: none; font-size: 13px;
   border: 1px solid transparent;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .t58-nav-item:hover { background: var(--panel-2); color: var(--text); }
 .t58-nav-item.active {
-  background: rgba(53, 224, 176, 0.08);
-  border-color: rgba(53, 224, 176, 0.35);
+  background: rgba(var(--teal-rgb), 0.10);
+  border-color: rgba(var(--teal-rgb), 0.35);
   color: var(--teal);
-  text-shadow: 0 0 10px rgba(53, 224, 176, 0.35);
+  text-shadow: 0 0 10px rgba(var(--teal-rgb), 0.35);
 }
-.t58-nav-divider { height: 1px; background: var(--border); margin: 10px 6px; }
+.t58-nav-item.top-level { margin-bottom: 4px; font-weight: 600; }
+.t58-nav-divider { height: 1px; background: var(--border); margin: 8px 6px; }
 .t58-nav-spacer { flex: 1; }
-.t58-nav-icon { width: 16px; text-align: center; font-size: 13px; }
+.t58-nav-icon { width: 16px; text-align: center; font-size: 13px; flex-shrink: 0; }
 
-/* ---- Main content ---- */
+/* Collapsible groups, built on native <details> so they work with no JS */
+.t58-nav-group { border: none; margin: 2px 0; }
+.t58-nav-group summary {
+  list-style: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 8px 10px 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--text-dim);
+  user-select: none;
+}
+.t58-nav-group summary::-webkit-details-marker { display: none; }
+.t58-nav-group summary .chev {
+  font-size: 9px; transition: transform var(--dur-base) var(--ease); opacity: .7;
+}
+.t58-nav-group[open] summary .chev { transform: rotate(90deg); }
+.t58-nav-group summary:hover { color: var(--text-muted); }
+.t58-nav-group-items { display: flex; flex-direction: column; gap: 2px; padding-bottom: 4px; }
+
+.t58-nav-section-label {
+  padding: 6px 10px 2px; font-size: 10px; font-weight: 700; letter-spacing: .09em;
+  text-transform: uppercase; color: var(--text-dim);
+}
+.t58-num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; font-size: 13px; color: var(--teal); flex-shrink: 0;
+}
+.t58-nav-item .t58-num { margin-right: 10px; }
+
+/* ==========================================================================
+   TOPBAR (injected by t58-chrome.js into every page that includes the
+   sidebar partial -- see t58-chrome.js for markup)
+   ========================================================================== */
+.t58-topbar {
+  height: var(--topbar-h);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px;
+  margin: -16px -16px 16px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--glass-border);
+  position: sticky; top: 0; z-index: 20;
+}
+.t58-topbar .crumb { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.t58-topbar .crumb b { color: var(--text); font-weight: 600; }
+.t58-topbar .right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.t58-engine-status { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); }
+.t58-engine-status .dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim);
+  box-shadow: none;
+}
+.t58-engine-status.online .dot { background: var(--teal); box-shadow: 0 0 8px rgba(var(--teal-rgb), .8); animation: t58-pulse 2s ease-in-out infinite; }
+.t58-engine-status.offline .dot { background: var(--coral); box-shadow: 0 0 8px rgba(var(--coral-rgb), .8); }
+.t58-theme-toggle {
+  width: 28px; height: 28px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text-muted);
+  cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center;
+  transition: all var(--dur-fast) var(--ease);
+}
+.t58-theme-toggle:hover { color: var(--text); border-color: var(--border-light); }
+
+@media (max-width: 760px) {
+  .t58-topbar { margin: -12px -12px 12px; padding: 0 12px; }
+  .t58-topbar .crumb { font-size: 11px; }
+}
+
+/* ==========================================================================
+   PERSISTENT STAGE STEPPER
+   Renders "CREATE — TEST — OPTIMIZE — VALIDATE — CHAMPION — FORWARD —
+   DEPLOY — MONITOR" under the topbar on every page (injected by
+   t58-chrome.js). Highlights the stage the current URL belongs to and
+   links each stage to its landing page -- it does not claim per-strategy
+   completion (this build has no "current strategy" concept to track that
+   honestly), so stages are shown as a wayfinding trail, not a checklist.
+   ========================================================================== */
+.t58-stepper {
+  display: flex; align-items: center; gap: 2px;
+  padding: 8px 16px 12px; margin: 0 -16px 12px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+}
+.t58-stepper a {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--text-dim); text-decoration: none; white-space: nowrap;
+  padding: 4px 8px; border-radius: 999px;
+  transition: all var(--dur-fast) var(--ease);
+}
+.t58-stepper a:hover { color: var(--text-muted); background: var(--panel-2); }
+.t58-stepper a.current {
+  color: var(--teal); background: rgba(var(--teal-rgb), .10);
+  text-shadow: 0 0 8px rgba(var(--teal-rgb), .4);
+}
+.t58-stepper .sep { color: var(--border-light); font-size: 11px; flex-shrink: 0; }
+@media (max-width: 760px) {
+  .t58-stepper { padding: 6px 12px 10px; margin: 0 -12px 10px; }
+  .t58-stepper a { font-size: 10px; padding: 3px 6px; }
+}
+
+/* ==========================================================================
+   MAIN CONTENT
+   ========================================================================== */
 .t58-main { flex: 1; min-width: 0; padding: 16px; max-width: 1200px; }
 .t58-page-header { margin-bottom: 14px; }
 .t58-page-header h1 { font-size: 18px; margin: 0; }
 .t58-page-header p { margin: 4px 0 0; font-size: 12px; color: var(--text-muted); }
 
-/* ---- Shared card / stat primitives (reused by dashboard + forms) ---- */
+/* ==========================================================================
+   BUTTONS -- a real hierarchy instead of raw <button>/<input type=submit>
+   Existing pages keep working (raw buttons still render, just plainer);
+   apply these classes going forward for the "action, not HTML control" look.
+   ========================================================================== */
+.t58-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  font-family: inherit; font-size: 14px; font-weight: 700;
+  padding: 11px 18px; border-radius: var(--radius-md);
+  border: 1px solid var(--border-light);
+  background: var(--panel-3); color: var(--text);
+  cursor: pointer; text-decoration: none;
+  transition: transform var(--dur-fast) var(--ease), box-shadow var(--dur-base) var(--ease),
+              background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), filter var(--dur-fast) var(--ease);
+}
+.t58-btn:hover { transform: translateY(-1px); border-color: var(--border-light); filter: brightness(1.08); }
+.t58-btn:active { transform: translateY(0); }
+.t58-btn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+.t58-btn.block { width: 100%; }
+.t58-btn.sm { padding: 6px 12px; font-size: 12px; }
+
+.t58-btn.primary {
+  background: var(--teal); border-color: var(--teal); color: #04120e;
+  box-shadow: 0 0 22px rgba(var(--teal-rgb), 0.30);
+}
+.t58-btn.primary:hover { box-shadow: 0 0 28px rgba(var(--teal-rgb), 0.45); }
+
+.t58-btn.secondary {
+  background: transparent; border-color: var(--border-light); color: var(--text);
+}
+
+.t58-btn.ghost {
+  background: transparent; border-color: transparent; color: var(--text-muted);
+}
+.t58-btn.ghost:hover { color: var(--text); background: var(--panel-2); }
+
+.t58-btn.danger {
+  background: var(--coral); border-color: var(--coral); color: #2a0a0a;
+  box-shadow: 0 0 18px rgba(var(--coral-rgb), 0.25);
+}
+
+.t58-btn.live {
+  background: var(--violet); border-color: var(--violet); color: #0d0820;
+  box-shadow: 0 0 18px rgba(var(--violet-rgb), 0.30);
+}
+.t58-btn.live::before { content: "\25CF"; font-size: 9px; }
+
+/* ==========================================================================
+   CARDS / GRIDS / STATS
+   ========================================================================== */
 .t58-card {
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   padding: 14px;
   margin-bottom: 14px;
+  transition: border-color var(--dur-base) var(--ease);
 }
 .t58-card h2 {
   font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
   color: var(--text-muted); margin: 0 0 10px;
 }
+.t58-card.interactive:hover { border-color: var(--border-light); }
+
 .t58-grid { display: grid; gap: 12px; }
 .t58-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .t58-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .t58-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 
-.t58-stat { background: var(--panel-3); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.t58-stat { background: var(--panel-3); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; transition: transform var(--dur-base) var(--ease), border-color var(--dur-base) var(--ease); }
 .t58-stat .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
 .t58-stat .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
-.t58-glow-teal   { color: var(--teal);   text-shadow: 0 0 12px rgba(53,224,176,.45); }
-.t58-glow-violet { color: var(--violet); text-shadow: 0 0 12px rgba(139,124,255,.45); }
-.t58-glow-coral  { color: var(--coral);  text-shadow: 0 0 12px rgba(255,111,111,.45); }
-.t58-glow-amber  { color: var(--amber);  text-shadow: 0 0 12px rgba(240,180,41,.4); }
+
+/* Hero KPI -- bigger, used for dashboard headline numbers */
+.t58-hero-stat {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 16px; position: relative; overflow: hidden;
+  transition: border-color var(--dur-base) var(--ease), transform var(--dur-base) var(--ease);
+}
+.t58-hero-stat:hover { transform: translateY(-2px); border-color: var(--border-light); }
+.t58-hero-stat .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .06em; }
+.t58-hero-stat .value { font-size: 30px; font-weight: 700; margin-top: 6px; line-height: 1.1; }
+.t58-hero-stat .trend { font-size: 11px; margin-top: 6px; color: var(--text-dim); }
+.t58-hero-stat .trend.up { color: var(--teal); }
+.t58-hero-stat .trend.down { color: var(--coral); }
+.t58-hero-stat .bar { height: 4px; border-radius: 2px; background: var(--panel-3); margin-top: 10px; overflow: hidden; }
+.t58-hero-stat .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--teal), var(--violet)); border-radius: 2px; transition: width 700ms var(--ease); }
+
+.t58-glow-teal   { color: var(--teal);   text-shadow: 0 0 12px rgba(var(--teal-rgb),.45); }
+.t58-glow-violet { color: var(--violet); text-shadow: 0 0 12px rgba(var(--violet-rgb),.45); }
+.t58-glow-coral  { color: var(--coral);  text-shadow: 0 0 12px rgba(var(--coral-rgb),.45); }
+.t58-glow-amber  { color: var(--amber);  text-shadow: 0 0 12px rgba(var(--amber-rgb),.4); }
 
 .t58-pill { display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 11px; font-weight: 600; }
-.t58-pill.pass { background: rgba(53,224,176,0.12); color: var(--teal); border: 1px solid rgba(53,224,176,0.35); }
-.t58-pill.fail { background: rgba(255,111,111,0.12); color: var(--coral); border: 1px solid rgba(255,111,111,0.35); }
+.t58-pill.pass { background: rgba(var(--teal-rgb),0.12); color: var(--teal); border: 1px solid rgba(var(--teal-rgb),0.35); }
+.t58-pill.fail { background: rgba(var(--coral-rgb),0.12); color: var(--coral); border: 1px solid rgba(var(--coral-rgb),0.35); }
 
+/* ---- Status language -- a shared vocabulary for strategy lifecycle ---- */
+.t58-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  padding: 3px 9px; border-radius: 999px; border: 1px solid transparent;
+}
+.t58-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.t58-status.draft      { color: var(--text-dim); background: var(--panel-3); border-color: var(--border); }
+.t58-status.draft::before { background: var(--text-dim); }
+.t58-status.testing    { color: var(--amber); background: rgba(var(--amber-rgb),.12); border-color: rgba(var(--amber-rgb),.35); }
+.t58-status.testing::before { background: var(--amber); animation: t58-pulse 1.6s ease-in-out infinite; }
+.t58-status.optimized  { color: var(--violet); background: rgba(var(--violet-rgb),.12); border-color: rgba(var(--violet-rgb),.35); }
+.t58-status.optimized::before { background: var(--violet); }
+.t58-status.validated  { color: var(--teal); background: rgba(var(--teal-rgb),.12); border-color: rgba(var(--teal-rgb),.35); }
+.t58-status.validated::before { background: var(--teal); }
+.t58-status.forward    { color: var(--amber); background: rgba(var(--amber-rgb),.12); border-color: rgba(var(--amber-rgb),.35); }
+.t58-status.forward::before { background: var(--amber); animation: t58-pulse 1.6s ease-in-out infinite; }
+.t58-status.live       { color: #0d0820; background: var(--violet); border-color: var(--violet); }
+.t58-status.live::before { background: #0d0820; animation: t58-pulse 1.2s ease-in-out infinite; }
+.t58-status.rejected   { color: var(--coral); background: rgba(var(--coral-rgb),.12); border-color: rgba(var(--coral-rgb),.35); }
+.t58-status.rejected::before { background: var(--coral); }
+
+/* ==========================================================================
+   CHAMPION CARD
+   ========================================================================== */
+.t58-champion {
+  background: linear-gradient(160deg, var(--panel-2), var(--panel-elevated));
+  border: 1px solid rgba(var(--teal-rgb), 0.25);
+  border-radius: var(--radius-lg);
+  padding: 18px;
+  margin-bottom: 14px;
+  position: relative;
+  overflow: hidden;
+}
+.t58-champion::before {
+  content: ""; position: absolute; inset: -40% -20% auto auto; width: 260px; height: 260px;
+  background: radial-gradient(closest-side, rgba(var(--teal-rgb), 0.16), transparent);
+  pointer-events: none;
+}
+.t58-champion .eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--text-dim); font-weight: 700; }
+.t58-champion .title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
+.t58-champion .title-row h3 { margin: 0; font-size: 18px; }
+.t58-champion .metrics { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; margin-top: 16px; }
+.t58-champion .metric .num { font-size: 20px; font-weight: 700; }
+.t58-champion .metric .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); margin-top: 2px; }
+.t58-champion .actions { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+.t58-champion-empty { color: var(--text-dim); font-size: 13px; }
+
+/* ==========================================================================
+   PIPELINE / WORKFLOW STEPPER (dashboard navigation aid)
+   ========================================================================== */
+.t58-pipeline { display: flex; align-items: stretch; gap: 4px; overflow-x: auto; padding: 2px; }
+.t58-pipeline a.step {
+  flex: 1; min-width: 108px; text-decoration: none; color: var(--text-muted);
+  background: var(--panel-3); border: 1px solid var(--border); border-radius: var(--radius-md);
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 2px;
+  transition: all var(--dur-fast) var(--ease);
+}
+.t58-pipeline a.step:hover { border-color: var(--teal); color: var(--text); transform: translateY(-2px); }
+.t58-pipeline a.step .n { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
+.t58-pipeline a.step .t { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 2px; }
+.t58-pipeline .arrow { align-self: center; color: var(--text-dim); font-size: 14px; flex-shrink: 0; }
+
+/* ==========================================================================
+   LIVE / RUNNING ENGINE PANEL (used by job-theme.css too)
+   ========================================================================== */
+.t58-engine-panel { position: relative; }
+.t58-engine-panel .head { display: flex; align-items: center; gap: 8px; }
+.t58-engine-panel .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 10px rgba(var(--teal-rgb),.8); animation: t58-pulse 1.4s ease-in-out infinite; flex-shrink: 0; }
+.t58-progress { height: 8px; border-radius: 999px; background: var(--panel-3); overflow: hidden; margin: 10px 0; border: 1px solid var(--border); }
+.t58-progress.indeterminate > span {
+  display: block; height: 100%; width: 40%; border-radius: 999px;
+  background: linear-gradient(90deg, transparent, var(--teal), var(--violet), transparent);
+  animation: t58-indeterminate 1.6s linear infinite;
+}
+
+/* ==========================================================================
+   TABLE
+   ========================================================================== */
 .t58-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .t58-table th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .t58-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); }
+.t58-table tr { transition: background var(--dur-fast) var(--ease); }
 .t58-table tr:hover td { background: var(--panel-3); }
 .t58-table a { color: var(--teal); text-decoration: none; }
 
 .t58-empty { color: var(--text-dim); font-size: 13px; padding: 18px 4px; text-align: center; }
+
+/* ---- Glass utility (nav overlays, floating controls, modals) ---- */
+.t58-glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--glass-border);
+}
+
+/* ==========================================================================
+   ANIMATIONS
+   ========================================================================== */
+@keyframes t58-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@keyframes t58-indeterminate { 0% { transform: translateX(-120%); } 100% { transform: translateX(360%); } }
+@keyframes t58-shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+@keyframes t58-spin { to { transform: rotate(360deg); } }
+@keyframes t58-fade-up { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.t58-fade-in { animation: t58-fade-up 240ms var(--ease); }
 
 /* Mobile: collapse the sidebar into a top bar */
 @media (max-width: 760px) {
@@ -134,6 +492,10 @@ html, body {
   .t58-nav-spacer { display: none; }
   .t58-nav-item span.label { display: none; }
   .t58-nav-item { padding: 8px 10px; }
+  .t58-nav-group { display: flex; }
+  .t58-nav-group summary { display: none; }
+  .t58-nav-group-items { flex-direction: row; }
   .t58-main { max-width: 100%; }
   .t58-grid.cols-4, .t58-grid.cols-3 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  .t58-champion .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); }
 }

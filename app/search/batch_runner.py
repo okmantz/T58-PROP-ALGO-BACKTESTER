@@ -172,23 +172,31 @@ class SearchStageConfig:
     #
     # Hard floor, checked BEFORE the expensive part of Stage 3 (full-fidelity
     # Monte Carlo, the lookahead detector, walk-forward, and parameter-
-    # neighborhood robustness all run once each per candidate). A candidate
-    # that already can't clear this floor on a single plain backtest has no
-    # chance of clearing Stage 3 overall -- Stage 2's GA/surrogate refinement
-    # already optimizes toward the Stage 3 fitness metric, but it can still
-    # hand forward a candidate that regressed on ONE of these floor checks
-    # while improving on the metric it was actually selecting on (e.g. a
-    # config that raised eval_pass_probability slightly while quietly
-    # dropping below the minimum trade count). Every candidate killed here
-    # is a full Monte Carlo run (`full_mc_sims`, by default 3000 paths) that
-    # was never spent on a doomed strategy. Defaults intentionally mirror
-    # Stage 1's own floor (same shape of check, same failure modes) rather
-    # than being stricter, since Stage 2 already re-optimized past Stage 1's
-    # bar once -- this exists to catch regressions and edge cases, not to
-    # duplicate Stage 1's filtering work.
+    # neighborhood robustness all run once each per candidate).
+    #
+    # FIX (2026-09-04): this used to default to the exact same bar as Stage
+    # 1 (min_trades=20, profit_factor>=1.05, net_profit>0 required) and was
+    # applied to a PLAIN full-dataset backtest. But Stage 2's GA doesn't
+    # optimize for full-dataset raw profit factor -- it optimizes chained
+    # out-of-sample fitness (stage_cfg.fitness_metric, "eval_pass_probability"
+    # by default: a Monte-Carlo/prop-rules-aware score computed on folded
+    # OOS slices). A genome the GA legitimately selected for a strong
+    # chained-OOS eval-pass score can easily land under 1.05 profit factor,
+    # or even net-negative, on a single plain full-dataset backtest -- those
+    # are two different numbers computed two different ways, not a
+    # regression. Re-applying Stage 1's exact bar here silently discarded
+    # candidates Stage 2 had already found real signal in, before Monte
+    # Carlo -- the stage that actually scores the metric being optimized for
+    # -- ever got to see them. Loosened to a genuine "protect against
+    # wasting a full Monte Carlo run on something catastrophically broken"
+    # floor: net profit is no longer required pre-MC (a candidate with a
+    # small full-dataset loss but a real out-of-sample edge deserves its
+    # Monte Carlo run), and the profit-factor floor is low enough to only
+    # catch configs that are actually broken, not merely below Stage 1's bar.
     stage3_min_trades: int = 20
-    stage3_min_profit_factor: float = 1.05
+    stage3_min_profit_factor: float = 0.85
     stage3_max_drawdown_buffer_mult: float = 1.5
+    stage3_require_positive_net: bool = False
 
     full_mc_sims: int = 3000
     walk_forward_folds: int = 4
@@ -403,15 +411,16 @@ def _stage3_task(candidate_id: str, spec: dict, cfg: dict) -> dict:
     if not _passes_stage1_filters(
         stats,
         min_trades=cfg.get("stage3_min_trades", 20),
-        min_profit_factor=cfg.get("stage3_min_profit_factor", 1.05),
+        min_profit_factor=cfg.get("stage3_min_profit_factor", 0.85),
         max_dd_limit=prop_rules.max_drawdown_pct * cfg.get("stage3_max_drawdown_buffer_mult", 1.5),
+        require_positive_net=cfg.get("stage3_require_positive_net", False),
     ):
         return {
             **base, "statistics": stats,
             "error": (
                 "failed Stage 3 early-kill floor (min_trades="
                 f"{cfg.get('stage3_min_trades', 20)}, min_profit_factor="
-                f"{cfg.get('stage3_min_profit_factor', 1.05):.2f}, "
+                f"{cfg.get('stage3_min_profit_factor', 0.85):.2f}, "
                 f"max_drawdown<={prop_rules.max_drawdown_pct * cfg.get('stage3_max_drawdown_buffer_mult', 1.5):.1f}%)"
                 " -- skipped before Monte Carlo/walk-forward/robustness."
             ),
@@ -769,6 +778,7 @@ def run_search(
                 "stage3_min_trades": stage_cfg.stage3_min_trades,
                 "stage3_min_profit_factor": stage_cfg.stage3_min_profit_factor,
                 "stage3_max_drawdown_buffer_mult": stage_cfg.stage3_max_drawdown_buffer_mult,
+                "stage3_require_positive_net": stage_cfg.stage3_require_positive_net,
                 "walk_forward_folds": stage_cfg.walk_forward_folds,
                 "walk_forward_metric": stage_cfg.walk_forward_metric,
                 "walk_forward_min_efficiency": stage_cfg.walk_forward_min_efficiency,

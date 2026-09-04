@@ -66,6 +66,7 @@ from app.backtest.engine import run_backtest, run_holdout_comparison
 from app.backtest.risk import RiskConfig
 from app.backtest.statistics import compute_cost_ladder
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
+from app.orchestration.resource_guard import safe_worker_count
 from app.optimize.parameter_space import RefinementError
 from app.optimize.refinement import RefinementConfig, compute_fitness, run_iterative_refinement
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
@@ -567,6 +568,23 @@ def run_search(
     t0 = time.time()
     workers = stage_cfg.workers or max(os.cpu_count() or 2, 1)
     workers = max(1, min(workers, len(space.candidates)))
+    # Each worker process below loads its OWN full copy of `df` (see
+    # _init_worker) -- on a large dataset (e.g. years of 1-minute bars),
+    # os.cpu_count() workers each holding a full copy can exhaust system
+    # memory well before it exhausts CPU, especially if another heavy job
+    # (Evolution Lab, Full Pipeline) is ALSO running at the same time. Cap
+    # to what's actually safe given this dataset's size and currently
+    # available memory rather than trusting the caller's/CPU count blindly.
+    # See app.orchestration.resource_guard for the full rationale.
+    safe_workers = safe_worker_count(df, requested=workers, max_candidates_in_flight=len(space.candidates))
+    if safe_workers < workers:
+        log(
+            f"Reducing worker processes from {workers} to {safe_workers} -- {len(df):,} bars is "
+            f"large enough that {workers} full copies of it (one per worker) would risk exhausting "
+            f"available memory. Install 'psutil' for a more precise estimate; for now this uses a "
+            f"conservative fallback."
+        )
+    workers = safe_workers
 
     db = ResultsDB(db_path)
     db.create_run(run_id, space.mode, space.family, instrument, timeframe, len(space.candidates), asdict(stage_cfg))

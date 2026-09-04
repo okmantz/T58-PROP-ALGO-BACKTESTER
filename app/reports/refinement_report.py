@@ -33,7 +33,7 @@ FITNESS_METRIC_LABELS = {
     "eval_pass_probability": "Evaluation Pass Probability (%)",
     "first_payout_probability": "First Payout Probability (%)",
     "expected_payout": "Expected Payout ($)",
-    "net_profit": "Net Profit ($)",
+    "net_profit": "Long-Term Net Profit ($) -- no prop firm",
     "profit_factor": "Profit Factor",
     "sharpe_ratio": "Sharpe Ratio",
 }

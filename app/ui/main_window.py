@@ -62,6 +62,9 @@ from app.optimize.refinement import FITNESS_METRICS, RefinementConfig, run_itera
 from app.optimize.multi_objective import DEFAULT_OBJECTIVES, MultiObjectiveConfig, OBJECTIVE_DIRECTIONS, run_multi_objective_refinement
 from app.optimize.walkforward_ga import run_walkforward_aware_refinement
 from app.orchestration.batch_test import BatchTestItem, run_batch_test
+from app.orchestration.resource_guard import (
+    HEAVY_JOB_GUARD, JOB_EVOLUTION_LAB, JOB_FULL_PIPELINE, JOB_SEARCH_LAB, JOB_SPEED_RUN,
+)
 from app.orchestration.speed_run import SpeedRunConfig, SpeedRunResult, run_speed_run
 from app.orchestration.speed_run import _rank_key as _speedrun_rank_key
 from app.orchestration.full_pipeline import (
@@ -71,6 +74,7 @@ from app.portfolio.portfolio import InstrumentLeg, PortfolioConfig, PortfolioErr
 from app.prop.simulator import PropRules, simulate_account
 from app.prop.survival_engine import PropSurvivalConfig, ResetEconomics, run_prop_survival_analysis
 from app.reports.generator import generate_full_report
+from app.reports.crash_log import log_crash
 from app.reports import run_history
 from app.reports.refinement_report import generate_refinement_report
 from app.reports.survival_report import generate_survival_report
@@ -869,10 +873,43 @@ class MainWindow:
         new_theme = "light" if CURRENT_THEME == "dark" else "dark"
         current_page = getattr(self, "active_page", "dashboard")
         apply_theme(new_theme)
+        try:
+            _apply_dark_titlebar(self.root)
+        except Exception:
+            pass
         for child in self.root.winfo_children():
             child.destroy()
         self._build_ui()
         self._show_page(current_page)
+
+    def _try_start_heavy_job(self, name: str) -> bool:
+        """Acquires app.orchestration.resource_guard.HEAVY_JOB_GUARD for
+        one of the multi-worker-process jobs (Search Lab, Evolution Lab,
+        Full Pipeline, Speed Run) before starting it. Each of these
+        independently spawns up to os.cpu_count() worker processes, each
+        holding its own full copy of the loaded market data in memory --
+        running more than one of them at the same time (e.g. leaving
+        Evolution Lab running overnight, then also starting Full Pipeline
+        and Speed Run on top of it) is exactly the kind of memory pileup
+        that can freeze/crash the whole machine, not just this app. Returns
+        False (and shows a clear warning naming the job already running)
+        if another heavy job is already active; the caller should not
+        proceed in that case."""
+        if HEAVY_JOB_GUARD.try_acquire(name):
+            return True
+        messagebox.showwarning(
+            "Another heavy job is running",
+            f"{HEAVY_JOB_GUARD.active_name} is already running. Running more than one of "
+            f"Search Lab / Evolution Lab / Full Pipeline / Speed Run at the same time can "
+            f"exhaust your machine's memory (each spawns its own worker processes, each "
+            f"holding a full copy of the loaded data) and has been known to freeze the whole "
+            f"desktop. Please wait for it to finish, or click its STOP button, before "
+            f"starting {name}.",
+        )
+        return False
+
+    def _release_heavy_job(self, name: str) -> None:
+        HEAVY_JOB_GUARD.release(name)
 
     def _build_ui(self):
         self.root.configure(bg=BG)
@@ -6334,6 +6371,8 @@ class MainWindow:
             threading.Thread(target=self._run_bulk_backtest_pipeline, daemon=True).start()
             return
 
+        if not self._try_start_heavy_job(JOB_SEARCH_LAB):
+            return
         self.search_output.delete("1.0", END)
         self.open_search_report_btn.config(state="disabled")
         self.promote_champion_btn.config(state="disabled")
@@ -6622,10 +6661,13 @@ class MainWindow:
                 "crashed hard -- try lowering 'Parallel workers' on this tab, or "
                 "reducing the candidate pool / population size."
             )
-        except Exception:
+            log_crash("Search Lab (BrokenProcessPool)")
+        except Exception as exc:
             self._log_search("\nUnexpected error:\n" + traceback.format_exc())
+            log_crash("Search Lab", exc=exc)
         finally:
             self.search_progress.stop()
+            self._release_heavy_job(JOB_SEARCH_LAB)
 
     def _promote_search_champion_clicked(self):
         summary = self._last_search_summary
@@ -8577,6 +8619,8 @@ class MainWindow:
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data file in 01 Data before starting the Evolution Lab.")
             return
+        if not self._try_start_heavy_job(JOB_EVOLUTION_LAB):
+            return
 
         from app.evolution.engine import EvolutionConfig, EvolutionRunner
 
@@ -8586,6 +8630,7 @@ class MainWindow:
                 result = import_csv(p)
                 if not result.is_valid:
                     messagebox.showerror("Import error", f"{os.path.basename(p)}:\n" + "\n".join(result.errors))
+                    self._release_heavy_job(JOB_EVOLUTION_LAB)
                     return
                 per_file_results.append(result)
             if len(per_file_results) == 1:
@@ -8594,6 +8639,7 @@ class MainWindow:
                 df, _labels = merge_multi_timeframe([r.dataframe for r in per_file_results])
         except Exception as exc:
             messagebox.showerror("Could not load data", str(exc))
+            self._release_heavy_job(JOB_EVOLUTION_LAB)
             return
 
         risk = self._build_risk_config()
@@ -8932,6 +8978,12 @@ class MainWindow:
                 self.root.after(4000, self._refresh_evolution_tested)
             except Exception:
                 pass
+        else:
+            # Covers both a deliberate STOP and the runner's own thread
+            # exiting on its own (finished, or crashed -- see engine.py's
+            # _run_loop finally block) -- either way the heavy-job slot
+            # must free up so another tab can start.
+            self._release_heavy_job(JOB_EVOLUTION_LAB)
 
     def _build_full_pipeline_tab(self):
         f = self._scrollable(self.tab_fullpipeline)
@@ -9134,6 +9186,8 @@ class MainWindow:
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
             return
+        if not self._try_start_heavy_job(JOB_FULL_PIPELINE):
+            return
         self.fullpipeline_output.delete("1.0", END)
         self.fullpipeline_verdict_label.config(text="Running...", fg=TEXT_DIM)
         self.fullpipeline_progress.start(10)
@@ -9216,11 +9270,13 @@ class MainWindow:
         except RefinementError as exc:
             self._log_fullpipeline(f"\nFull Pipeline error: {exc}")
             self.fullpipeline_verdict_label.config(text="Failed -- see log.", fg=RED)
-        except Exception:
+        except Exception as exc:
             self._log_fullpipeline("\nUnexpected error:\n" + traceback.format_exc())
             self.fullpipeline_verdict_label.config(text="Failed -- see log.", fg=RED)
+            log_crash("Full Pipeline", exc=exc)
         finally:
             self.fullpipeline_progress.stop()
+            self._release_heavy_job(JOB_FULL_PIPELINE)
 
     # -----------------------------------------------------------------------
     # Speed Run — "I have almost no time left, find me anything that
@@ -9412,6 +9468,8 @@ class MainWindow:
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
             return
+        if not self._try_start_heavy_job(JOB_SPEED_RUN):
+            return
         self.speedrun_output.delete("1.0", END)
         self.speedrun_candidates_listbox.delete(0, END)
         self._speedrun_candidates_cache = []
@@ -9496,12 +9554,14 @@ class MainWindow:
 
             self._log_speedrun(f"\n{result.winner_reason}")
             self._log_speedrun(f"\nDone in {result.elapsed_seconds / 60:.1f} minute(s).")
-        except Exception:
+        except Exception as exc:
             self._log_speedrun("\nUnexpected error:\n" + traceback.format_exc())
             self.speedrun_verdict_label.config(text="Failed -- see log.", fg=RED)
+            log_crash("Speed Run", exc=exc)
         finally:
             self.speedrun_progress.stop()
             self.stop_speedrun_btn.config(state="disabled")
+            self._release_heavy_job(JOB_SPEED_RUN)
 
     # -----------------------------------------------------------------------
     # Tab 16 — AI Research Agent (T58 AI Research Engine)
@@ -11442,11 +11502,83 @@ def _force_dwm_composition(root: Tk) -> None:
         pass  # cosmetic mitigation only -- never let this block launch
 
 
+def _hex_to_colorref(hex_color: str) -> int:
+    """Windows COLORREF is 0x00BBGGRR -- the reverse byte order from a
+    normal #RRGGBB hex string."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b << 16) | (g << 8) | r
+
+
+def _apply_dark_titlebar(root: Tk) -> None:
+    """Recolors the native Windows title bar to match this app's own
+    dark theme instead of Windows' default -- reported as "that ugly
+    blue banner at the top" (Windows renders an unthemed window's
+    title bar using the user's OS accent color, which is bright blue
+    on most default installs; it has nothing to do with anything this
+    app draws, since Tkinter has no built-in way to touch native
+    window chrome at all). DWM (Desktop Window Manager) is the only
+    thing that draws that bar, so this reaches it directly via
+    ctypes -- there is no Tkinter API for this.
+
+    Two DWM window attributes, applied independently so a Windows
+    version missing one still benefits from the other:
+      DWMWA_USE_IMMERSIVE_DARK_MODE (20) -- switches the caption to
+        Windows' own dark-mode caption style (dark background, light
+        text). Supported since Windows 10 build 18985 and all of
+        Windows 11.
+      DWMWA_CAPTION_COLOR (35) -- Windows 11 (build 22000+) only --
+        sets the EXACT caption color, so the title bar matches this
+        app's current theme color (BG) instead of Windows' generic
+        dark gray. On a Windows 10 build that lacks this attribute,
+        DwmSetWindowAttribute simply returns an error for this call
+        (caught below) and the immersive-dark-mode call above still
+        replaces the blue bar with a dark one.
+
+    Re-run this after a theme toggle (see MainWindow._toggle_theme) so
+    switching to Light mode also lightens the title bar to match.
+    No-op (silently caught) on macOS/Linux, and never blocks launch or
+    a theme toggle if any of this fails -- purely cosmetic."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        GA_ROOT = 2
+        hwnd = user32.GetAncestor(wintypes.HWND(root.winfo_id()), GA_ROOT)
+        if not hwnd:
+            return
+
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_CAPTION_COLOR = 35
+
+        prefer_dark = ctypes.c_int(1 if CURRENT_THEME == "dark" else 0)
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(prefer_dark), ctypes.sizeof(prefer_dark),
+        )
+        try:
+            color = ctypes.c_int(_hex_to_colorref(BG))
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_CAPTION_COLOR, ctypes.byref(color), ctypes.sizeof(color),
+            )
+        except Exception:
+            pass  # DWMWA_CAPTION_COLOR unsupported on this Windows build -- dark mode above still applied
+    except Exception:
+        pass  # cosmetic only -- never let this block launch or a theme toggle
+
+
 def launch():
     _make_dpi_aware()
     root = Tk()
     _apply_tk_scaling(root)
     _force_dwm_composition(root)
+    _apply_dark_titlebar(root)
     root.withdraw()  # hidden while the real window builds, splash covers that gap
     splash = None
     try:

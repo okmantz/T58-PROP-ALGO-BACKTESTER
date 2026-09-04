@@ -1,4 +1,4 @@
-# T58 Trading — Prop Algo Backtester
+# T58 Trading — Quant Backtester
 
 The one-stop shop for taking a trading idea from "here's a script" to
 "here's a validated, prop-firm-ready strategy" — without leaving one app.

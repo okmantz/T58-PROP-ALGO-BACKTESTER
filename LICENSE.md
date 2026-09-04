@@ -1,4 +1,4 @@
-# T58 Prop Algo Backtester — Proprietary License
+# T58 Quant Algo Backtester — Proprietary License
 
 Copyright (c) 2026 Owen Mantz [T58 Trading]. All rights reserved.
 

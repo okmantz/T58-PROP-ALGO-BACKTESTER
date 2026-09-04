@@ -11392,10 +11392,61 @@ def _apply_tk_scaling(root: Tk) -> None:
         pass
 
 
+def _force_dwm_composition(root: Tk) -> None:
+    """Root-causing the reported "white/black streaks while scrolling or
+    switching pages" on Windows.
+
+    This app's tab-switch is 18 full-page Frames all `.place()`-d over
+    each other at the identical (0,0,1,1) rectangle within one parent,
+    switched via `.lift()` (see `_scrollable`'s own docstring on that
+    pattern), and its scrollable tabs embed a live Frame full of real
+    child widgets inside a Canvas (`canvas.create_window(...)` in
+    `_scrollable`), scrolled via `yview_scroll`. Both operations move or
+    restack large areas of REAL native child windows, not just redrawn
+    pixels on a single canvas surface. A plain (non-composited) Tk
+    top-level on Windows is drawn directly via GDI with no back buffer:
+    when the screen refreshes mid-restack or mid-scroll -- easy to hit
+    on a page with several widgets/canvases -- the previous frame's
+    leftover pixels are still on screen until the next full repaint
+    catches up, which is exactly the transient white/black streak being
+    reported. This is a well-known Tkinter-on-Windows symptom of
+    uncomposited rendering, not a bug in any single drawing call, so no
+    fix to one canvas or one tab would address it.
+
+    Giving the window ANY non-1.0 `-alpha` value flips Windows' Desktop
+    Window Manager into compositing that window instead of letting the
+    app draw straight to screen -- every repaint then goes through DWM's
+    own off-screen back buffer and is presented as one complete frame,
+    which is what actually stops the tearing. 0.9999 alpha is visually
+    indistinguishable from fully opaque (no perceptible transparency)
+    but is enough to cross the threshold that turns compositing on. This
+    is a standard, widely-used mitigation for exactly this class of
+    Tkinter/Windows flicker -- not a real transparency feature being
+    used here for anything visual -- and is entirely a no-op wrapped in
+    try/except everywhere else (macOS/Linux Tk either already composites
+    natively or ignores a change this small, so nothing changes there).
+
+    This is a mitigation, not a guaranteed fix for every possible cause
+    of on-screen tearing (a sufficiently overloaded redraw -- e.g. an
+    animation still ticking on a page you've just scrolled away from --
+    can still visibly lag even once DWM is compositing). If streaks
+    persist after this, the next thing worth checking is whether an
+    active NeuralProgress animation (`.start()`/`.tick()`) is still
+    running on a tab you're no longer looking at.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        root.attributes("-alpha", 0.9999)
+    except Exception:
+        pass  # cosmetic mitigation only -- never let this block launch
+
+
 def launch():
     _make_dpi_aware()
     root = Tk()
     _apply_tk_scaling(root)
+    _force_dwm_composition(root)
     root.withdraw()  # hidden while the real window builds, splash covers that gap
     splash = None
     try:

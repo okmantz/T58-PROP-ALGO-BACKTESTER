@@ -24,6 +24,7 @@ phone (as opposed to browsing to one) is out of scope for this MVP.
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import threading
 import time
@@ -2910,6 +2911,11 @@ def forward_test_info():
     return render_template("forward_test.html")
 
 
+@app.route("/deploy-live")
+def deploy_live_info():
+    return render_template("deploy_live.html")
+
+
 @app.route("/search")
 def search_form():
     return render_template(
@@ -2981,8 +2987,18 @@ def search_start():
             workers=int(workers_raw) if workers_raw else None,
             random_seed=seed,
         )
-        risk = RiskConfig()
-        rules = PropRules()
+        risk = RiskConfig(
+            initial_balance=float(form.get("initial_balance", 100000) or 100000),
+            risk_mode=form.get("risk_mode", "percent"),
+            risk_value=float(form.get("risk_value", 1.0) or 1.0),
+            pip_size=float(form.get("pip_size", 0.0001) or 0.0001),
+        )
+        rules = PropRules(
+            account_size=float(form.get("account_size", 100000) or 100000),
+            evaluation_profit_target_pct=float(form.get("profit_target", 8) or 8),
+            daily_loss_limit_pct=float(form.get("daily_loss", 5) or 5),
+            max_drawdown_pct=float(form.get("max_dd", 10) or 10),
+        )
 
         job_id = uuid.uuid4().hex[:12]
         db_path = str(SEARCH_DIR / f"search_{job_id}.db")
@@ -3310,6 +3326,163 @@ def speed_run_job_status(job_id):
 @app.route("/speed_run_reports/<path:filename>")
 def serve_speedrun_report(filename):
     return send_from_directory(SPEEDRUN_REPORTS_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Generate Strategies (AI) -- drafts a NEW strategy's source code from a
+# plain-language idea via a local Ollama model, grounded in research/ papers
+# and your own best existing strategies. See app.ai.strategy_generator's
+# module docstring for the full safety rationale: every result is saved
+# tagged DRAFT and nothing here ever runs generated code automatically.
+# Needs no market data at all, unlike everything else in this file -- it
+# only drafts source code, it doesn't backtest it.
+# ---------------------------------------------------------------------------
+
+_GENSTRAT_JOBS: dict[str, dict] = {}
+_GENSTRAT_JOBS_LOCK = threading.Lock()
+
+
+def _genstrat_job_progress(job_id: str, tokens: int, elapsed: float) -> None:
+    with _GENSTRAT_JOBS_LOCK:
+        job = _GENSTRAT_JOBS.get(job_id)
+        if job is not None:
+            job["tokens"] = tokens
+            job["elapsed"] = elapsed
+
+
+def _run_genstrat_job(
+    job_id: str, settings: OllamaSettings, language: str, idea: str,
+    num_ctx: int, num_predict: int, stall_timeout: int, max_total: int,
+) -> None:
+    from app.ai.strategy_generator import generate_strategy
+
+    try:
+        result = generate_strategy(
+            settings, language, idea,
+            timeout=stall_timeout, max_total_seconds=max_total,
+            num_ctx=num_ctx, num_predict=num_predict,
+            progress_cb=lambda tokens, elapsed: _genstrat_job_progress(job_id, tokens, elapsed),
+        )
+        with _GENSTRAT_JOBS_LOCK:
+            job = _GENSTRAT_JOBS[job_id]
+            job["done"] = True
+            if result.code is None:
+                job["error"] = result.error or "Generation failed."
+            else:
+                job["code"] = result.code
+                job["filename_hint"] = result.filename_hint
+                job["language"] = language
+                job["idea"] = idea
+    except Exception as exc:  # noqa: BLE001 -- must surface on the status page, not crash the thread silently
+        log_crash("Generate Strategies (web)", exc=exc)
+        with _GENSTRAT_JOBS_LOCK:
+            job = _GENSTRAT_JOBS[job_id]
+            job["done"] = True
+            job["error"] = f"Unexpected error: {exc}"
+
+
+@app.route("/generate-strategies")
+def generate_strategies_form():
+    saved_ai = load_ollama_settings()
+    return render_template(
+        "generate_strategies.html", ai_enabled=saved_ai.enabled, ai_host=saved_ai.host, ai_model=saved_ai.model,
+    )
+
+
+@app.route("/generate-strategies/start", methods=["POST"])
+def generate_strategies_start():
+    form = request.form
+    idea = (form.get("idea") or "").strip()
+    if not idea:
+        saved_ai = load_ollama_settings()
+        return render_template(
+            "generate_strategies.html", error="Describe the strategy idea first.",
+            ai_enabled=saved_ai.enabled, ai_host=saved_ai.host, ai_model=saved_ai.model,
+        ), 400
+
+    language = form.get("language", "python")
+    settings = OllamaSettings(
+        enabled=True, host=form.get("ai_host", "http://localhost:11434") or "http://localhost:11434",
+        model=form.get("ai_model", "llama3.1") or "llama3.1",
+    )
+    try:
+        save_ollama_settings(settings)  # persists, same as the desktop tab's own checkbox
+    except Exception:
+        pass  # best-effort -- a save failure shouldn't block the run itself
+
+    from app.ai.strategy_generator import DEFAULT_MAX_TOTAL_SECONDS, DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_TIMEOUT_SECONDS
+
+    num_ctx = int(form.get("num_ctx", DEFAULT_NUM_CTX) or DEFAULT_NUM_CTX)
+    num_predict = int(form.get("num_predict", DEFAULT_NUM_PREDICT) or DEFAULT_NUM_PREDICT)
+    stall_timeout = int(form.get("stall_timeout", DEFAULT_TIMEOUT_SECONDS) or DEFAULT_TIMEOUT_SECONDS)
+    max_total = int(form.get("max_total", DEFAULT_MAX_TOTAL_SECONDS) or DEFAULT_MAX_TOTAL_SECONDS)
+
+    job_id = uuid.uuid4().hex[:12]
+    with _GENSTRAT_JOBS_LOCK:
+        _GENSTRAT_JOBS[job_id] = {
+            "done": False, "error": None, "code": None, "filename_hint": None, "language": language,
+            "idea": idea, "tokens": 0, "elapsed": 0.0, "started_at": time.time(),
+        }
+    thread = threading.Thread(
+        target=_run_genstrat_job,
+        args=(job_id, settings, language, idea, num_ctx, num_predict, stall_timeout, max_total),
+        daemon=True,
+    )
+    thread.start()
+    return redirect(url_for("generate_strategies_job", job_id=job_id))
+
+
+@app.route("/generate-strategies/job/<job_id>")
+def generate_strategies_job(job_id):
+    with _GENSTRAT_JOBS_LOCK:
+        job = _GENSTRAT_JOBS.get(job_id)
+    if job is None:
+        return render_template("generate_strategies_job.html", job_id=job_id, not_found=True), 404
+    return render_template("generate_strategies_job.html", job_id=job_id, not_found=False)
+
+
+@app.route("/generate-strategies/job/<job_id>/status.json")
+def generate_strategies_job_status(job_id):
+    with _GENSTRAT_JOBS_LOCK:
+        job = _GENSTRAT_JOBS.get(job_id)
+    if job is None:
+        return jsonify({"found": False}), 404
+    return jsonify({
+        "found": True, "done": job["done"], "error": job["error"], "tokens": job["tokens"], "elapsed": job["elapsed"],
+        "code": job["code"], "filename_hint": job["filename_hint"], "language": job["language"], "idea": job["idea"],
+    })
+
+
+@app.route("/generate-strategies/save", methods=["POST"])
+def generate_strategies_save():
+    """AJAX save -- mirrors the desktop tab's SAVE TO LIBRARY AS DRAFT
+    button. Takes whatever's currently in the code editor on the page
+    (lets you hand-edit the draft before saving, same as desktop), not
+    whatever's stored in the job dict, so edits made after generation
+    finished are respected."""
+    payload = request.get_json(force=True, silent=True) or {}
+    language = payload.get("language", "python")
+    code_text = (payload.get("code") or "").rstrip("\n")
+    idea = payload.get("idea", "")
+    filename_stem = (payload.get("filename") or "").strip() or "generated_strategy"
+    filename_stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", filename_stem).strip("_") or "generated_strategy"
+    ext = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}.get(language, ".py")
+    filename = f"{filename_stem}{ext}"
+    if not code_text:
+        return jsonify({"ok": False, "error": "No code to save."}), 400
+    try:
+        try:
+            save_strategy_text(code_text, filename, language, overwrite=False)
+        except StrategyAlreadyExists:
+            return jsonify({"ok": False, "error": f"'{filename}' already exists in the library. Rename it and try again."}), 409
+        # Always DRAFT, regardless of anything else -- see
+        # app.ai.strategy_generator's module docstring for why an
+        # AI-generated strategy is never allowed to start higher than this.
+        set_strategy_status(language, filename, "draft")
+        save_strategy_metadata(language, filename, {"description": f"AI-drafted from idea: {idea[:200]}"})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "filename": filename})
 
 
 def main():

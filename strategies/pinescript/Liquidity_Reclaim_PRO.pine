@@ -1,450 +1,74 @@
-//@version=6
-strategy("Regime-Gated Liquidity Reclaim PRO",
-     overlay=true,
-     pyramiding=0,
-     initial_capital=100000,
-     commission_type=strategy.commission.percent,
-     commission_value=0.0,
-     process_orders_on_close=true)
-
-// ============================================================
-// INPUTS
-// ============================================================
-
-atrPeriod = input.int(20, "ATR Period")
-fastEMA = input.int(50, "Fast EMA")
-slowEMA = input.int(200, "Slow EMA")
-
-liquidityLookback = input.int(36, "Liquidity Lookback")
-fvgExpiry = input.int(8, "FVG Expiry Bars")
-sweepRecency = input.int(12, "Sweep Recency Bars")
-
-minDisplacementATR = input.float(0.80, "Minimum Displacement ATR")
-minCloseLocation = input.float(0.68, "Minimum Close Location")
-
-minATRRatio = input.float(0.80, "Minimum ATR Ratio")
-maxATRRatio = input.float(1.75, "Maximum ATR Ratio")
-
-stopBufferATR = input.float(0.12, "Stop Buffer ATR")
-maxStopATR = input.float(1.50, "Maximum Stop ATR")
-
-targetR = input.float(1.40, "Target R")
-breakevenR = input.float(0.75, "Breakeven R")
-
-maxHoldBars = input.int(16, "Maximum Hold Bars")
-
-maxTradesDay = input.int(3, "Maximum Trades / Day")
-maxLossesDay = input.int(2, "Maximum Losses / Day")
-
-dailyLossR = input.float(1.0, "Maximum Daily Loss R")
-dailyProfitLockR = input.float(1.50, "Daily Profit Lock R")
-
-maxConsecutiveLosses = input.int(2, "Maximum Consecutive Losses")
-
-cooldownBars = input.int(6, "Cooldown Bars")
-lossCooldownBars = input.int(12, "Loss Cooldown Bars")
-
-// ============================================================
-// SESSION
-// ============================================================
-
-session1 = not na(time(timeframe.period, "0930-1130", "America/New_York"))
-session2 = not na(time(timeframe.period, "1330-1530", "America/New_York"))
-
-inSession = session1 or session2
-
-// ============================================================
-// INDICATORS
-// ============================================================
-
-atr = ta.atr(atrPeriod)
-
-atrBaseline = ta.median(atr, 80)
-
-atrRatio = atrBaseline != 0 ? atr / atrBaseline : na
-
-fast = ta.ema(close, fastEMA)
-slow = ta.ema(close, slowEMA)
-
-fastSlope = fast - fast[5]
-slowSlope = slow - slow[10]
-
-// ============================================================
-// LIQUIDITY
-// ============================================================
-
-priorHigh = ta.highest(high[1], liquidityLookback)
-priorLow = ta.lowest(low[1], liquidityLookback)
-
-sweepLow = low < priorLow and close > priorLow
-sweepHigh = high > priorHigh and close < priorHigh
-
-barsSinceLowSweep = ta.barssince(sweepLow)
-barsSinceHighSweep = ta.barssince(sweepHigh)
-
-recentLowSweep =
-     not na(barsSinceLowSweep) and
-     barsSinceLowSweep <= sweepRecency
-
-recentHighSweep =
-     not na(barsSinceHighSweep) and
-     barsSinceHighSweep <= sweepRecency
-
-// ============================================================
-// CANDLE QUALITY
-// ============================================================
-
-candleRange = high - low
-
-body = math.abs(close - open)
-
-closeLocation =
-     candleRange > 0 ?
-     (close - low) / candleRange :
-     0.5
-
-bodyRatio =
-     candleRange > 0 ?
-     body / candleRange :
-     0.0
-
-// ============================================================
-// FVG
-// ============================================================
-
-bullFVG =
-     low > high[2] and
-     close > open and
-     body >= minDisplacementATR * atr and
-     closeLocation >= minCloseLocation and
-     bodyRatio >= 0.55
-
-bearFVG =
-     high < low[2] and
-     close < open and
-     body >= minDisplacementATR * atr and
-     closeLocation <= 1.0 - minCloseLocation and
-     bodyRatio >= 0.55
-
-// ============================================================
-// FVG STATE
-// ============================================================
-
-var float bullTop = na
-var float bullBottom = na
-var int bullAge = 99999
-
-var float bearTop = na
-var float bearBottom = na
-var int bearAge = 99999
-
-if bullFVG
-    bullTop := high[2]
-    bullBottom := low
-    bullAge := 0
-else if not na(bullTop)
-    bullAge += 1
-
-if bearFVG
-    bearTop := low[2]
-    bearBottom := high
-    bearAge := 0
-else if not na(bearTop)
-    bearAge += 1
-
-if bullAge > fvgExpiry
-    bullTop := na
-    bullBottom := na
-
-if bearAge > fvgExpiry
-    bearTop := na
-    bearBottom := na
-
-// ============================================================
-// PROP RISK STATE
-// ============================================================
-
-var int tradesToday = 0
-var int lossesToday = 0
-var int consecutiveLosses = 0
-
-var float dailyR = 0.0
-
-var int cooldown = 0
-var int barsHeld = 0
-
-var int lastDay = dayofmonth
-
-if dayofmonth != lastDay
-    tradesToday := 0
-    lossesToday := 0
-    consecutiveLosses := 0
-    dailyR := 0.0
-    lastDay := dayofmonth
-
-if cooldown > 0
-    cooldown -= 1
-
-// ============================================================
-// SESSION TRADE LIMIT
-// ============================================================
-
-var bool tradedSession1 = false
-var bool tradedSession2 = false
-
-if dayofmonth != dayofmonth[1]
-    tradedSession1 := false
-    tradedSession2 := false
-
-// ============================================================
-// POSITION VARIABLES
-// ============================================================
-
-var float entryPrice = na
-var float stopPrice = na
-var float targetPrice = na
-var float riskDistance = na
-
-// ============================================================
-// POSITION MANAGEMENT
-// ============================================================
-
-if strategy.position_size != 0
-
-    barsHeld += 1
-
-    longPosition = strategy.position_size > 0
-
-    if longPosition
-
-        if high >= entryPrice + breakevenR * riskDistance
-            stopPrice := math.max(stopPrice, entryPrice)
-
-        stopHit = low <= stopPrice
-        targetHit = high >= targetPrice
-
-        invalidation =
-             close < fast - 0.25 * atr
-
-        if stopHit or targetHit or invalidation
-
-            if stopHit
-                strategy.close("Long", comment="Stop")
-                dailyR -= 1.0
-                lossesToday += 1
-                consecutiveLosses += 1
-                cooldown := lossCooldownBars
-
-            else if targetHit
-                strategy.close("Long", comment="Target")
-                dailyR += targetR
-                consecutiveLosses := 0
-                cooldown := cooldownBars
-
-            else
-                strategy.close("Long", comment="Invalidation")
-
-            barsHeld := 0
-
-    else
-
-        if low <= entryPrice - breakevenR * riskDistance
-            stopPrice := math.min(stopPrice, entryPrice)
-
-        stopHit = high >= stopPrice
-        targetHit = low <= targetPrice
-
-        invalidation =
-             close > fast + 0.25 * atr
-
-        if stopHit or targetHit or invalidation
-
-            if stopHit
-                strategy.close("Short", comment="Stop")
-                dailyR -= 1.0
-                lossesToday += 1
-                consecutiveLosses += 1
-                cooldown := lossCooldownBars
-
-            else if targetHit
-                strategy.close("Short", comment="Target")
-                dailyR += targetR
-                consecutiveLosses := 0
-                cooldown := cooldownBars
-
-            else
-                strategy.close("Short", comment="Invalidation")
-
-            barsHeld := 0
-
-    // Time/session exit
-    if barsHeld >= maxHoldBars or not inSession
-        strategy.close_all(comment="Time/Session Exit")
-        barsHeld := 0
-        cooldown := cooldownBars
-
-// ============================================================
-// PROP TRADING PERMISSION
-// ============================================================
-
-allowedToTrade =
-     strategy.position_size == 0 and
-     inSession and
-     cooldown <= 0 and
-     tradesToday < maxTradesDay and
-     lossesToday < maxLossesDay and
-     dailyR > -dailyLossR and
-     dailyR < dailyProfitLockR and
-     consecutiveLosses < maxConsecutiveLosses
-
-// ============================================================
-// VOLATILITY
-// ============================================================
-
-regimeOK =
-     not na(atrRatio) and
-     atrRatio >= minATRRatio and
-     atrRatio <= maxATRRatio
-
-// ============================================================
-// TREND
-// ============================================================
-
-longTrend =
-     fast > slow and
-     fastSlope > 0 and
-     slowSlope >= 0
-
-shortTrend =
-     fast < slow and
-     fastSlope < 0 and
-     slowSlope <= 0
-
-// ============================================================
-// SESSION TRADE LIMIT
-// ============================================================
-
-sessionAllowed =
-     (session1 and not tradedSession1) or
-     (session2 and not tradedSession2)
-
-// ============================================================
-// SETUPS
-// ============================================================
-
-longSetup =
-     allowedToTrade and
-     sessionAllowed and
-     regimeOK and
-     recentLowSweep and
-     not na(bullTop) and
-     bullAge <= fvgExpiry and
-     longTrend and
-     low <= bullTop and
-     close > bullTop and
-     close > open and
-     closeLocation >= 0.65 and
-     bodyRatio >= 0.45
-
-shortSetup =
-     allowedToTrade and
-     sessionAllowed and
-     regimeOK and
-     recentHighSweep and
-     not na(bearTop) and
-     bearAge <= fvgExpiry and
-     shortTrend and
-     high >= bearTop and
-     close < bearTop and
-     close < open and
-     closeLocation <= 0.35 and
-     bodyRatio >= 0.45
-
-// ============================================================
-// LONG ENTRY
-// ============================================================
-
-if longSetup
-
-    sweepPrice = low[barsSinceLowSweep]
-
-    structuralStop =
-         math.min(bullBottom, sweepPrice) -
-         stopBufferATR * atr
-
-    risk = math.abs(close - structuralStop)
-
-    if risk <= maxStopATR * atr
-
-        risk := math.max(risk, 0.35 * atr)
-
-        entryPrice := close
-        riskDistance := risk
-
-        stopPrice := entryPrice - risk
-        targetPrice := entryPrice + targetR * risk
-
-        strategy.entry("Long", strategy.long)
-
-        tradesToday += 1
-
-        if session1
-            tradedSession1 := true
-
-        if session2
-            tradedSession2 := true
-
-// ============================================================
-// SHORT ENTRY
-// ============================================================
-
-if shortSetup
-
-    sweepPrice = high[barsSinceHighSweep]
-
-    structuralStop =
-         math.max(bearBottom, sweepPrice) +
-         stopBufferATR * atr
-
-    risk = math.abs(close - structuralStop)
-
-    if risk <= maxStopATR * atr
-
-        risk := math.max(risk, 0.35 * atr)
-
-        entryPrice := close
-        riskDistance := risk
-
-        stopPrice := entryPrice + risk
-        targetPrice := entryPrice - targetR * risk
-
-        strategy.entry("Short", strategy.short)
-
-        tradesToday += 1
-
-        if session1
-            tradedSession1 := true
-
-        if session2
-            tradedSession2 := true
-
-// ============================================================
-// VISUALS
-// ============================================================
-
-plot(fast, "Fast EMA")
-plot(slow, "Slow EMA")
-
-plotshape(
-     sweepLow,
-     title="Liquidity Sweep Low",
-     style=shape.triangleup,
-     location=location.belowbar,
-     size=size.tiny)
-
-plotshape(
-     sweepHigh,
-     title="Liquidity Sweep High",
-     style=shape.triangledown,
-     location=location.abovebar,
-     size=size.tiny)
+// NOTE (2026-09-03, rewritten for the T58 parser): the previous version of this file was a
+// full Pine v6 strategy (session time() windows, ta.median/ta.barssince, var state variables,
+// FVG top/bottom tracking, a full daily-risk/cooldown state machine) written the way you'd
+// actually code it for TradingView. None of that is inside the T58 PineScript adapter's
+// supported subset (see app/strategy/pinescript.py's module docstring) -- it's a line-based
+// parser for a deliberately small set of constructs, not a Pine language implementation, so
+// it fails loudly rather than silently mis-backtesting something it can't really read. Trying
+// to load the old file raised:
+//   StrategyError: unsupported expression on right-hand side of
+//   'session1 = not na(time(timeframe.period, "0930-1130", "America/New_York"))'
+// This rewrite keeps the same underlying idea -- price sweeps away from value and then
+// reclaims it, traded with the higher-timeframe trend -- but expresses it with only what the
+// parser actually understands: price refs, ta.sma/ema/wma/rsi, ta.crossover/crossunder, and
+// boolean comparisons. What could NOT be preserved because the parser has no equivalent at
+// all: session-time windows, liquidity-sweep/FVG detection (needs highest()/lowest()/shifted
+// bar refs, none of which this adapter supports), and the daily trade/loss-limit state
+// machine (var state + counters aren't supported either -- use RiskConfig.daily_loss_limit_pct
+// / max_trades_per_day in the app's own risk settings for that instead, same as every other
+// PineScript/MQL5 strategy in this repo). If you want the FULL sweep/FVG/session-state design
+// preserved exactly, that needs to be a Python strategy (app/strategy/python.py runs real
+// Python, no regex subset limit) -- Winning_Liquidity_Reclaim.py is that version.
+//@version=5
+strategy("T58 Liquidity Reclaim (Simplified)")
+
+fastLen = input.int(20, "Fast EMA")
+slowLen = input.int(100, "Slow EMA")
+rsiLen = input.int(14, "RSI Length")
+
+rsiLongMin = input.float(28.0, "Long RSI Minimum")
+rsiLongMax = input.float(48.0, "Long RSI Maximum")
+rsiShortMin = input.float(52.0, "Short RSI Minimum")
+rsiShortMax = input.float(72.0, "Short RSI Maximum")
+
+fastEMA = ta.ema(close, fastLen)
+slowEMA = ta.ema(close, slowLen)
+rsiVal = ta.rsi(close, rsiLen)
+
+// higher-timeframe trend filter (fast EMA vs slow EMA, in place of the
+// original's separate 50/200 slope-checked pair -- the parser has no
+// concept of "slope over N bars" without shifted refs, so trend is
+// expressed the same way trend_pullback.pine already does it)
+longTrend = fastEMA > slowEMA
+shortTrend = fastEMA < slowEMA
+
+// "reclaim" trigger: price sweeping back across the fast EMA is the closest
+// event this parser can express to the original's sweep-then-FVG-fill entry
+reclaimUp = ta.crossover(close, fastEMA)
+reclaimDown = ta.crossunder(close, fastEMA)
+
+// RSI bands stand in for "just came off an extreme and is recovering" --
+// tighter/lower than trend_pullback.pine's continuation bands on purpose,
+// since this is a reversion-style reclaim, not a trend-continuation pullback
+longMomentum = rsiVal > rsiLongMin and rsiVal < rsiLongMax
+shortMomentum = rsiVal > rsiShortMin and rsiVal < rsiShortMax
+
+longCondition = longTrend and reclaimUp and longMomentum
+shortCondition = shortTrend and reclaimDown and shortMomentum
+
+exitLongCondition = ta.crossunder(close, fastEMA)
+exitShortCondition = ta.crossover(close, fastEMA)
+
+strategy.entry("Long", strategy.long, when=longCondition)
+strategy.entry("Short", strategy.short, when=shortCondition)
+
+strategy.close("Long", when=exitLongCondition)
+strategy.close("Short", when=exitShortCondition)
+
+// Instrument-scale-independent stop/target (see pinescript.py docstring) --
+// the original file's fixed structural stop (sweep low/high +/- ATR buffer)
+// isn't expressible without shifted refs either, so this uses the same
+// ATR-multiple approach every other strategy in this repo already uses.
+// T58_SL_ATR_MULT=1.25
+// T58_TP_ATR_MULT=2.0
+// T58_ATR_PERIOD=14

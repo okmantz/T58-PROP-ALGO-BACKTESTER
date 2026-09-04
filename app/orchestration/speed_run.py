@@ -90,6 +90,7 @@ from app.orchestration.full_pipeline import (
     FullPipelineConfig, FullPipelineResult, run_full_pipeline,
 )
 from app.prop.simulator import PropRules
+from app.reports.crash_log import log_crash
 from app.search.batch_runner import SearchCancelled, SearchStageConfig, SearchSummary, _spec_from_record, run_search
 from app.search.strategy_space import build_strategy_from_spec, generate_search_space
 

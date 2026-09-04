@@ -57,6 +57,7 @@ reason, never allowed to take down a run that otherwise succeeded.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -75,7 +76,9 @@ from app.optimize.code_parameter_space import patched_source_for_strategy
 from app.optimize.parameter_space import RefinementError
 from app.optimize.refinement import RefinementConfig, preflight_signal_check
 from app.optimize.walkforward_ga import WalkforwardGAResult, run_walkforward_aware_refinement
+from app.orchestration.resource_guard import safe_worker_count
 from app.prop.simulator import AccountSimResult, PropRules, simulate_account
+from app.reports.crash_log import log_crash
 from app.search.robustness import WalkForwardResult, run_walk_forward
 from app.search.strategy_space import build_strategy_from_spec
 from app.strategy.base import Strategy
@@ -315,6 +318,25 @@ def run_full_pipeline(
     t0 = time.time()
     warnings: list[str] = []
     display_name = _display_name(strategy)
+
+    # Step 2's GA below loads its own full copy of `df` into each worker
+    # process it spawns (same pattern as Search Lab / Evolution Lab -- see
+    # app.orchestration.resource_guard's module docstring). On a large
+    # dataset (e.g. years of 1-minute bars), letting that default to
+    # os.cpu_count() -- especially when this is itself one of several
+    # strategies running in a batch, or another heavy job is running at
+    # the same time -- risks exhausting system memory well before CPU.
+    # Only overrides when the caller hasn't already pinned an explicit
+    # value (batch mode already computes its own per-item split; this
+    # additionally caps that against available memory).
+    _safe_fp_workers = safe_worker_count(df, requested=cfg.parallel_search_max_workers)
+    if _safe_fp_workers != (cfg.parallel_search_max_workers or _safe_fp_workers):
+        log(
+            f"Reducing Full Pipeline GA worker processes from {cfg.parallel_search_max_workers} to "
+            f"{_safe_fp_workers} -- {len(df):,} bars is large enough that more full copies of it "
+            f"(one per worker) would risk exhausting available memory."
+        )
+    cfg = replace(cfg, parallel_search_max_workers=_safe_fp_workers)
 
     # Automatically ties the raw execution engine's account-blown circuit
     # breaker (app.backtest.execution) to whatever max-drawdown floor this
@@ -844,6 +866,7 @@ def _batch_item_worker(
         )
         return (i, label, True, result, None)
     except Exception as exc:  # noqa: BLE001 -- one bad strategy must not stop the batch
+        log_crash(f"Full Pipeline batch item {i} ({label})", exc=exc)
         return (i, label, False, None, str(exc))
 
 
@@ -905,10 +928,52 @@ def run_full_pipeline_batch(
     t0 = time.time()
     outcomes_by_index: dict[int, FullPipelineBatchOutcome] = {}
 
+    # Every full 7-step pipeline in this batch can easily run for tens of
+    # minutes each (a 6-year, 1-minute-bar dataset especially so); the
+    # per-item HTML report only appears once THAT item fully finishes, and
+    # nothing at all was ever written summarizing the batch as a whole. If
+    # the process dies partway through (crash, forced shutdown, OOM) -- as
+    # opposed to one strategy cleanly failing, which _record already
+    # handles -- everything that HAD finished earlier in the batch was
+    # otherwise invisible unless you already knew to go hunting for each
+    # item's individual report file. This writes a small running summary
+    # to `output_dir/batch_progress.json` after every item finishes (pass
+    # or fail), so a batch that's interrupted at item 3 of 7 still leaves
+    # a readable record of what happened to items 1-3.
+    progress_path = Path(output_dir) / "batch_progress.json"
+
+    def _write_progress(done_count: int) -> None:
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            payload = {
+                "started_at": t0,
+                "updated_at": time.time(),
+                "total_items": len(items),
+                "completed_items": done_count,
+                "outcomes": [
+                    {
+                        "index": i,
+                        "label": outcomes_by_index[i].label,
+                        "ok": outcomes_by_index[i].ok,
+                        "verdict": outcomes_by_index[i].verdict,
+                        "reason": outcomes_by_index[i].reason,
+                        "report_html": str(outcomes_by_index[i].report_html) if outcomes_by_index[i].report_html else None,
+                    }
+                    for i in sorted(outcomes_by_index)
+                ],
+            }
+            tmp = progress_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+            tmp.replace(progress_path)  # atomic-ish: a crash mid-write can't corrupt the last good file
+        except Exception:
+            pass  # best-effort -- must never break the batch itself
+
     def _record(i: int, label: str, ok: bool, result, reason: str | None) -> None:
         if not ok:
             log(f"  Skipped -- Full Pipeline error: {reason}")
             outcomes_by_index[i] = FullPipelineBatchOutcome(label, ok=False, reason=reason)
+            _write_progress(len(outcomes_by_index))
             return
         if item_library_refs.get(i) is not None:
             try:
@@ -939,6 +1004,7 @@ def run_full_pipeline_batch(
             eval_pass_probability=result.final_mc.evaluation_pass_probability,
             report_html=result.report_paths["html"], result=result,
         )
+        _write_progress(len(outcomes_by_index))
 
     item_library_refs = {i: item.library_ref for i, item in enumerate(items, start=1)}
     safe_names = {}
@@ -997,6 +1063,7 @@ def run_full_pipeline_batch(
             # rest of the batch silently vanishing with no report and no
             # recorded reason.
             log(f"\nParallel batch pool failed ({exc}) -- finishing the remaining strategy(ies) one at a time...")
+            log_crash("Full Pipeline batch (worker pool)", exc=exc, extra=f"{len(outcomes_by_index)}/{len(items)} item(s) had already finished.")
             remaining = [
                 (i, item) for i, item in enumerate(items, start=1)
                 if i not in outcomes_by_index

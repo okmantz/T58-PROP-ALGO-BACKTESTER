@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Speed Run</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: var(--text); font-size: 15px;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15); }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  input[type=file] { width: 100%; color: #ccc; }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid #ff5f5f; background: #ff5f5f; color: #2a0000;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+    box-shadow: 0 0 22px rgba(255,95,95,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  details summary { font-size: 13px; color: #999; cursor: pointer; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; }
+  .checkbox-row input { width: auto; }
+  .checkbox-row label { margin: 0; }
+</style>
+</head>
+<body>
+{% set active_page = 'speed_run' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>&#9889; Speed run</h1>
+  <p>One button: searches EVERY registered strategy family at once for something that shows an edge,
+  validates the best few candidates through Full Pipeline (walk-forward-aware GA + fresh Monte Carlo +
+  out-of-sample check) running concurrently, and hands back whichever one is best -- READY, MARGINAL,
+  or (if nothing cleared the bar) an honest "no winner found." This does NOT skip any check Full Pipeline
+  or Search Lab would otherwise run; it only asks each of them to spend less time per candidate, and
+  every existing safeguard still runs exactly as it does everywhere else in this app. It finds its own
+  strategy, so there's no Step 2 (Strategy) here -- just data, risk, and prop rules. Depending on your
+  data size and machine, a run typically takes anywhere from several minutes to an hour or more.</p>
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="post" action="/speed-run/start" enctype="multipart/form-data">
+
+  <div class="card">
+    <h2>1. Market data</h2>
+    {% if stored_datasets %}
+    <label>Use a previously stored dataset</label>
+    <select name="existing_dataset">
+      <option value="">— none, I'm uploading new file(s) below —</option>
+      {% for ds in stored_datasets %}
+      <option value="{{ ds.name }}">{{ ds.name }} ({{ (ds.size_bytes / 1024) | round(1) }} KB)</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+    <label>Or upload new CSV file(s) (timestamp, open, high, low, close, volume)</label>
+    <input type="file" name="csv_file" accept=".csv" multiple>
+  </div>
+
+  <div class="card">
+    <h2>2. Risk &amp; prop rules</h2>
+    <div class="row">
+      <div><label>Initial balance</label><input type="number" name="initial_balance" value="100000"></div>
+      <div><label>Account size (prop rules)</label><input type="number" name="account_size" value="100000"></div>
+    </div>
+    <div class="row">
+      <div><label>Risk mode</label>
+        <select name="risk_mode"><option value="percent">% of balance</option><option value="fixed">Fixed lot</option></select>
+      </div>
+      <div><label>Risk value</label><input type="number" step="0.1" name="risk_value" value="1.0"></div>
+    </div>
+    <div class="row">
+      <div><label>Profit target %</label><input type="number" step="0.1" name="profit_target" value="8"></div>
+      <div><label>Daily loss limit %</label><input type="number" step="0.1" name="daily_loss" value="5"></div>
+    </div>
+    <div class="row">
+      <div><label>Max drawdown %</label><input type="number" step="0.1" name="max_dd" value="10"></div>
+      <div><label>Pip size</label><input type="number" step="0.0001" name="pip_size" value="0.0001"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Speed Run settings</h2>
+    <p class="help">Defaults are already tuned toward speed over thoroughness -- lower them further for
+    a quicker, rougher pass, or raise them if you have more time to spend before the deadline.</p>
+    <details open>
+      <summary>Phase 1: discovery (searches every family at once)</summary>
+      <div class="row">
+        <div><label>Max candidates sampled (all families combined)</label><input type="number" name="max_candidates" value="1200"></div>
+        <div><label>Stage 1 survivors kept</label><input type="number" name="stage1_top_n" value="24"></div>
+      </div>
+      <div class="row">
+        <div><label>GA population</label><input type="number" name="ga_population" value="8"></div>
+        <div><label>GA generations</label><input type="number" name="ga_generations" value="3"></div>
+      </div>
+    </details>
+    <details open style="margin-top:10px;">
+      <summary>Phase 2: validation (through Full Pipeline)</summary>
+      <div class="row">
+        <div><label>Candidates to validate</label><input type="number" name="top_k_to_validate" value="3"></div>
+        <div><label>Max concurrent validations</label><input type="number" name="max_concurrent_validations" value="2"></div>
+      </div>
+      <div class="row">
+        <div><label>Walk-forward/OOS folds</label><input type="number" name="validation_folds" value="3"></div>
+        <div><label>Final Monte Carlo sims</label><input type="number" name="validation_final_mc_sims" value="3000"></div>
+      </div>
+    </details>
+    <label style="margin-top:10px;">Fitness metric</label>
+    <select name="fitness_metric">
+      {% for key, label in fitness_metrics.items() %}
+      <option value="{{ key }}" {{ 'selected' if key == 'eval_pass_probability' else '' }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <label>Random seed</label>
+    <input type="number" name="random_seed" value="42">
+    <label class="checkbox-row" style="margin-top:12px;"><input type="checkbox" name="save_to_library" checked>Save the winning strategy to the Strategy Library when finished</label>
+  </div>
+
+  <button class="submit-btn" type="submit">&#9889; Find me a winner</button>
+</form>
+
+</div>
+</div>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

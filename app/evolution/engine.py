@@ -481,6 +481,22 @@ class EvolutionRunner:
         self.leaderboard: list[EvolutionCandidateRecord] = []      # current top N (all-time best seen)
         self.journal: list[str] = []                                 # numbered HYPOTHESIS-style entries
         self._elites: list[tuple[dict, dict]] = []                    # seeds mutated children next gen
+        # FIX (2026-09-03): before this, when a generation produced zero
+        # true PRE-FILTER survivors, self._elites stayed [] and
+        # _generate_population(gen, []) took the "no elites" branch --
+        # 100% fresh random immigrants, every single generation. With a
+        # compound bar (min trades AND profit_factor>=1.0 AND net_profit>0
+        # AND a drawdown ceiling) on costly/real-spread data, blind random
+        # sampling can run for dozens of generations without ever landing
+        # inside that region by chance -- which is exactly what a batch log
+        # showing "0/52 survived" for 20 straight generations looks like:
+        # not "no strategy exists," but "the GA never got a foothold to
+        # start climbing from." near_miss_seeds holds the best-scoring
+        # PRE-FILTER *failures* each generation (ranked by profit factor,
+        # not required to pass) so _generate_population can mutate around
+        # the closest-to-profitable configs instead of only reshuffling
+        # randomly until a true survivor appears on its own.
+        self._near_miss_seeds: list[tuple[dict, dict]] = []
         self._consecutive_empty_generations = 0
         self.resumed = False                                          # set True if a checkpoint was loaded
         self._pool: ProcessPoolExecutor | None = None
@@ -657,17 +673,27 @@ class EvolutionRunner:
                 t0 = time.time()
                 self._log(f"===== GENERATION {gen} =====")
 
-                population = self._generate_population(gen, self._elites)
+                # Breed from real elites once we have any; otherwise breed
+                # from the best near-misses found so far rather than
+                # resampling purely at random every generation (see
+                # self._near_miss_seeds's docstring in __init__).
+                breeding_pool = self._elites or self._near_miss_seeds
+                if not self._elites and self._near_miss_seeds:
+                    self._log(f"  (no true survivor yet -- breeding from the {len(self._near_miss_seeds)} "
+                              f"closest near-misses found so far instead of pure random search)")
+                population = self._generate_population(gen, breeding_pool)
                 self._log(f"GENERATE: {len(population)} candidates.")
                 if self._stop_flag.is_set():
                     break
 
-                stage1_survivors, rejection_counts = self._prefilter(population, gen)
+                stage1_survivors, rejection_counts, near_miss_top = self._prefilter(population, gen)
                 prefilter_elapsed = time.time() - t0
                 self._log(f"PRE-FILTER + BACKTEST: {len(stage1_survivors)}/{len(population)} survived "
                           f"(took {prefilter_elapsed:.1f}s).")
                 if not stage1_survivors:
                     self._handle_empty_prefilter(gen, rejection_counts)
+                    if near_miss_top:
+                        self._near_miss_seeds = near_miss_top
                 if self._stop_flag.is_set() or not stage1_survivors:
                     self._finish_empty_generation(gen, population, elapsed=time.time() - t0)
                     self._save_checkpoint(next_generation=gen + 1)
@@ -942,6 +968,7 @@ class EvolutionRunner:
         Either path produces identical survivors/rejection_counts/
         tested_rows; only the wall-clock time differs."""
         survivors = []
+        near_misses: list[tuple[float, dict, dict]] = []  # (rank_score, spec, meta) for candidates that traded but failed a gate
         rejection_counts = {
             "build_or_backtest_error": 0, "no_trades": 0, "min_trades": 0,
             "profit_factor": 0, "max_drawdown": 0, "unprofitable": 0,
@@ -973,6 +1000,12 @@ class EvolutionRunner:
             if reasons:
                 for r in reasons:
                     rejection_counts[r] += 1
+                # Rank near-misses mainly on profit factor (the gate that's
+                # hardest to clear by luck), with net profit as a tiebreak --
+                # a candidate at pf=0.97 with a small loss is a genuinely
+                # closer miss than one at pf=0.2, even though both failed.
+                rank_score = (pf_val, stats.get("net_profit") or 0.0)
+                near_misses.append((rank_score, spec, meta))
             else:
                 survivors.append((cid, spec, meta, bt))
 
@@ -1016,7 +1049,9 @@ class EvolutionRunner:
                 _consume(cid, spec, meta, bt, reasons, error, stats)
 
         evo_checkpoint.append_tested_rows(tested_rows, Path(self.cfg.tested_log_path))
-        return survivors, rejection_counts
+        near_misses.sort(key=lambda t: t[0], reverse=True)
+        near_miss_top = [(spec, meta) for _score, spec, meta in near_misses[: self.cfg.elite_keep]]
+        return survivors, rejection_counts, near_miss_top
 
     def _tested_row(self, cid: str, meta: dict, gen: int, passed: bool, reasons: list[str],
                      n_trades=None, profit_factor=None, net_profit=None, max_drawdown_pct=None,

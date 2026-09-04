@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Deploy Live</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 14px; line-height: 1.6; font-size: 14px; color: #ddd; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card ul { margin: 8px 0 0; padding-left: 20px; }
+  .card li { margin-bottom: 6px; }
+  .warn { background: #3A0E14; border: 1px solid #6b2323; color: #F0C7CC; padding: 16px; border-radius: 12px; margin-bottom: 14px; font-size: 13px; line-height: 1.6; }
+  .warn strong { color: #FF8FA0; }
+</style>
+</head>
+<body>
+{% set active_page = 'deploy_live' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Deploy Live</h1>
+  <p>This one stays desktop-only -- on purpose, not as an oversight.</p>
+</div>
+
+<div class="warn">
+  <strong>&#9888; This connects to real, funded accounts and trades real money.</strong> Unlike every
+  other gap between this web app and the desktop app, this isn't just "hasn't been built yet" -- there
+  are two separate reasons it shouldn't be built the same way here.
+</div>
+
+<div class="card">
+  <h2>Reason 1: the same platform constraint as Forward Test</h2>
+  <p>The desktop app's Deploy Live tab connects the same way its Forward Test / Live Demo Test tab does
+  -- via the <code>MetaTrader5</code> Python package, which only works on Windows, and only against an
+  MT5 terminal actually installed and logged in on that same machine. There's no web equivalent of "the
+  MT5 terminal on your desk" to connect to from a phone or browser -- see the Forward Test page for the
+  full explanation, since it's the identical underlying limitation.</p>
+</div>
+
+<div class="card">
+  <h2>Reason 2: this server has no login, and Deploy Live handles real credentials</h2>
+  <p>The desktop app stores your prop-firm login via your OS's secure credential store specifically
+  because it's a real broker password. This web server, as configured, has <strong>no authentication at
+  all</strong> and listens on every network interface -- anyone on the same network (or further, if a
+  port is ever forwarded) could reach it. Building live-credential entry and real-order-placement on top
+  of that would be a serious step backward in safety, independent of the MT5 platform issue above. This
+  isn't a "not implemented yet" gap to close quickly -- it needs a real login system in front of this
+  server first, which is a separate project from anything else in this patch.</p>
+</div>
+
+<div class="card">
+  <h2>What this means practically</h2>
+  <ul>
+    <li>Use the T58-Prop-Algo-Backtester.exe (or <code>python -m app.main</code>) on Windows for live
+    prop-firm deployment -- that tab works exactly as before, with the same warnings it's always had.</li>
+    <li>Everything else in this app -- backtesting, Full Pipeline, Search Lab, Speed Run, Evolution Lab,
+    Generate Strategies, the Strategy Library -- works identically whether you're on the desktop app or
+    this web app.</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>If real web-based live deployment matters to you later</h2>
+  <p>The honest options, if this becomes a priority:</p>
+  <ul>
+    <li>Leave it desktop-only permanently (simplest, no new moving parts, no new attack surface).</li>
+    <li>Add real authentication (a login, not just "the app is on my LAN") to this server as a
+    prerequisite, then build a small always-on Windows relay service (running wherever a real MT5
+    terminal lives) that this web app talks to over the network instead of importing the MT5 package
+    directly -- a real project in its own right, and one worth getting a second pair of eyes on given
+    it touches real money, not a quick port.</li>
+  </ul>
+</div>
+
+</div>
+</div>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Generate Strategies — Job</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#111111">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; background: #0d0d0d; color: #eee; }
+  header { padding: 18px 16px 8px; border-bottom: 1px solid #262626; }
+  header h1 { font-size: 18px; margin: 0; }
+  nav { display: flex; gap: 14px; padding: 10px 16px 0; }
+  nav a { color: #9ecbff; font-size: 13px; text-decoration: none; }
+  main { padding: 16px; max-width: 780px; margin: 0 auto; }
+  .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #aaa; margin: 0 0 10px; }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #eee;
+             border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #code { width: 100%; min-height: 380px; background: #0d0d0d; border: 1px solid #262626; border-radius: 8px; padding: 10px;
+          font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #ccc; white-space: pre; overflow: auto; resize: vertical; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text] { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #333; background: #0d0d0d; color: #eee; font-size: 14px; }
+  .save-btn { width: 100%; padding: 13px; border-radius: 10px; border: 1px solid #d477ff; background: #d477ff; color: #2a0a33;
+              font-size: 15px; font-weight: 700; margin-top: 10px; }
+  .save-btn:disabled { opacity: 0.5; }
+  .note { font-size: 12px; color: #999; margin-top: 8px; }
+  .status-msg { font-size: 13px; margin-top: 8px; }
+  .status-ok { color: #7ee08a; }
+  .status-err { color: #ffb4b4; }
+</style>
+</head>
+<body>
+<header><h1>T58 Trading — Generate Strategies (AI)</h1></header>
+<nav>
+  <a href="/">Run &amp; Report</a>
+  <a href="/generate-strategies">New Generation</a>
+</nav>
+<main>
+
+{% if not_found %}
+<div class="error">Job "{{ job_id }}" was not found (the server may have restarted since it ran).</div>
+{% else %}
+
+<div class="card">
+  <h2 id="status-title"><span class="spinner" id="spinner"></span>Generating&hellip;</h2>
+  <p class="note" id="progress-note">Starting&hellip;</p>
+</div>
+
+<div class="error" id="error-card" style="display:none;"></div>
+
+<div class="card" id="output-card" style="display:none;">
+  <h2>Generated code (not saved yet -- review, edit if needed, then save below)</h2>
+  <textarea id="code" spellcheck="false"></textarea>
+  <label>Filename (no extension)</label>
+  <input type="text" id="filename">
+  <button class="save-btn" id="save-btn">Save to library as DRAFT</button>
+  <p class="status-msg" id="save-status"></p>
+  <p class="note">Saved strategies land in the Strategy Library tagged DRAFT -- open Run &amp; Report or
+  Search Lab, load it, and run it through the normal backtest &rarr; validation ladder like anything
+  else before trusting it.</p>
+</div>
+
+{% endif %}
+</main>
+
+{% if not not_found %}
+<script>
+  const jobId = {{ job_id | tojson }};
+  let language = 'python';
+
+  function poll() {
+    fetch(`/generate-strategies/job/${jobId}/status.json`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.found) return;
+
+        if (data.error) {
+          document.getElementById('spinner').style.display = 'none';
+          document.getElementById('status-title').textContent = 'Generation failed';
+          document.getElementById('progress-note').textContent = '';
+          const ec = document.getElementById('error-card');
+          ec.style.display = 'block';
+          ec.textContent = data.error;
+          return;
+        }
+
+        if (!data.done) {
+          document.getElementById('progress-note').textContent =
+            `${data.tokens || 0} token(s) received so far, ${Math.round(data.elapsed || 0)}s elapsed.`;
+          setTimeout(poll, 1500);
+          return;
+        }
+
+        document.getElementById('spinner').style.display = 'none';
+        document.getElementById('status-title').textContent = 'Draft generated';
+        document.getElementById('progress-note').textContent =
+          'Review the code below (it is NOT saved yet), then save it when ready.';
+        language = data.language || 'python';
+        document.getElementById('output-card').style.display = 'block';
+        document.getElementById('code').value = data.code || '';
+        document.getElementById('filename').value = data.filename_hint || 'generated_strategy';
+        window._genstratIdea = data.idea || '';
+      })
+      .catch(() => setTimeout(poll, 3000));
+  }
+  poll();
+
+  document.getElementById('save-btn').addEventListener('click', () => {
+    const btn = document.getElementById('save-btn');
+    const status = document.getElementById('save-status');
+    btn.disabled = true;
+    status.textContent = 'Saving…';
+    status.className = 'status-msg';
+    fetch('/generate-strategies/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        language: language,
+        code: document.getElementById('code').value,
+        filename: document.getElementById('filename').value,
+        idea: window._genstratIdea || '',
+      }),
+    })
+      .then(r => r.json())
+      .then(data => {
+        btn.disabled = false;
+        if (data.ok) {
+          status.textContent = `Saved as ${data.filename} [DRAFT]. Open Run & Report to load and test it.`;
+          status.className = 'status-msg status-ok';
+        } else {
+          status.textContent = data.error || 'Save failed.';
+          status.className = 'status-msg status-err';
+        }
+      })
+      .catch(() => {
+        btn.disabled = false;
+        status.textContent = 'Save failed -- network error.';
+        status.className = 'status-msg status-err';
+      });
+  });
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+{% endif %}
+</body>
+</html>

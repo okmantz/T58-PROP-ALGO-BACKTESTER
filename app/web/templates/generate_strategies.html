@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 Generate Strategies (AI)</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .card p.help { font-size: 12px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  label { display: block; font-size: 13px; color: #ccc; margin: 10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid var(--border-light);
+    background: var(--panel-3); color: var(--text); font-size: 15px;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(53,224,176,0.15); }
+  textarea { min-height: 130px; font-family: inherit; font-size: 14px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .submit-btn {
+    width: 100%; padding: 15px; border-radius: 10px; border: 1px solid #d477ff; background: #d477ff; color: #2a0a33;
+    font-size: 16px; font-weight: 700; margin-top: 6px;
+    box-shadow: 0 0 22px rgba(212,119,255,0.35);
+  }
+  .error { background: #2a1414; border: 1px solid #6b2323; color: #ffb4b4; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .warn { background: #3A2E0E; border: 1px solid #6b5223; color: #ffcf7a; padding: 12px; border-radius: 10px; margin-bottom: 14px; font-size: 13px; line-height: 1.5; }
+  details summary { font-size: 13px; color: #999; cursor: pointer; }
+</style>
+</head>
+<body>
+{% set active_page = 'generate_strategies' %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>&#10038; Generate strategies (AI)</h1>
+  <p>Drafts a NEW strategy's source code from a plain-language idea, using a local Ollama model --
+  grounded in whatever papers you've dropped into the research/ folder and your own best-performing
+  saved strategies of the same language. Every strategy this produces is saved tagged DRAFT and has to
+  earn its way through the normal backtest &rarr; validation ladder like anything else -- nothing runs
+  automatically.</p>
+</div>
+
+<div class="warn">
+  Read before using: a local model can write code that LOOKS reasonable but has a lookahead bug, an
+  unsupported PineScript/MQL5 construct, or exit logic that silently never fires. Treat every generated
+  strategy as a rough first draft, not a finished one -- run it through Run &amp; Report and ideally Full
+  Pipeline before trusting any of its numbers, exactly like a stranger's strategy you found online.
+</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="post" action="/generate-strategies/start">
+
+  <div class="card">
+    <h2>Strategy idea</h2>
+    <p class="help">Describe entry/exit logic, indicators, market/timeframe, and anything else you want
+    reflected -- the more specific, the better the draft. Research excerpts and your own prior strategies
+    (if any exist yet for the chosen language) are added automatically as grounding.</p>
+    <label>Language</label>
+    <select name="language">
+      <option value="python">Python</option>
+      <option value="pinescript">PineScript</option>
+      <option value="mql5">MQL5</option>
+    </select>
+    <label>Idea</label>
+    <textarea name="idea" placeholder="e.g. Trend-following on 15m EURUSD using a 20/50 EMA cross, only taking longs above the 200 EMA, with a 1.5x ATR stop and 2:1 reward-to-risk take profit..."></textarea>
+  </div>
+
+  <div class="card">
+    <h2>Ollama connection</h2>
+    <p class="help">Needs a local Ollama reachable from wherever this server runs (works over your
+    home/office LAN -- point it at the IP of whatever machine is running Ollama).</p>
+    <div class="row">
+      <div><label>Ollama host</label><input type="text" name="ai_host" value="{{ ai_host }}"></div>
+      <div><label>Model</label><input type="text" name="ai_model" value="{{ ai_model }}"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>Resource usage (local Ollama)</summary>
+      <p class="help">Keeps this one-off code-generation call lean on a local machine -- a smaller
+      context window and output cap mean less RAM/VRAM used and a faster response, without materially
+      limiting a strategy file. Raise these only if generation keeps visibly getting cut off mid-file.</p>
+      <div class="row">
+        <div><label>Context window (tokens)</label><input type="number" name="num_ctx" value="4096"></div>
+        <div><label>Max output length (tokens)</label><input type="number" name="num_predict" value="1800"></div>
+      </div>
+      <div class="row">
+        <div><label>Stall timeout (seconds of silence before giving up)</label><input type="number" name="stall_timeout" value="180"></div>
+        <div><label>Hard time cap (seconds, even if still generating)</label><input type="number" name="max_total" value="900"></div>
+      </div>
+    </details>
+  </div>
+
+  <button class="submit-btn" type="submit">Generate draft</button>
+</form>
+
+</div>
+</div>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>

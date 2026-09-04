@@ -82,7 +82,9 @@ from app.evolution.surrogate import FamilySurrogateBank
 from app.monte_carlo.engine import MonteCarloConfig, run_monte_carlo
 from app.optimize.parameter_space import apply_genome, extract_genome
 from app.optimize.refinement import _mutate, _stressed_risk_config
+from app.orchestration.resource_guard import safe_worker_count
 from app.prop.simulator import PropRules, simulate_account, summarize_single_run
+from app.reports.crash_log import log_crash
 from app.search.robustness import parameter_neighborhood_robustness, run_walk_forward
 from app.search.strategy_space import (
     StrategySpaceError,
@@ -525,6 +527,19 @@ class EvolutionRunner:
         workers = self.cfg.parallel_workers
         if workers is None:
             workers = os.cpu_count() or 1
+        # Each worker below loads its OWN full copy of self.df (see
+        # _evo_init_worker) -- on a large dataset this pool can, on its
+        # own or stacked with another heavy job (Full Pipeline, Speed Run)
+        # running at the same time, exhaust system memory well before CPU.
+        # See app.orchestration.resource_guard for the full rationale.
+        safe_workers = safe_worker_count(self.df, requested=workers)
+        if safe_workers < workers:
+            self._log(
+                f"Reducing Evolution Lab worker processes from {workers} to {safe_workers} -- "
+                f"{len(self.df):,} bars is large enough that {workers} full copies of it (one per "
+                f"worker) would risk exhausting available memory."
+            )
+        workers = safe_workers
         if workers <= 1:
             return None
         try:
@@ -737,8 +752,13 @@ class EvolutionRunner:
                 self._elites = [(r.spec, r.meta) for r in new_elites]
                 self._save_checkpoint(next_generation=gen + 1)
                 gen += 1
-        except Exception:
+        except Exception as exc:
             self._log("Evolution Lab crashed:\n" + traceback.format_exc())
+            # Written straight to disk (data/logs/crash_log.txt), independent
+            # of this in-memory log widget/callback -- if the process itself
+            # is killed (e.g. out-of-memory) shortly after this, the GUI log
+            # above may never actually get painted or persisted anywhere.
+            log_crash("Evolution Lab", exc=exc, extra=f"generation={gen}")
         finally:
             self._shutdown_pool()
             self.is_running = False

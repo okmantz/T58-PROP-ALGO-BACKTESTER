@@ -172,6 +172,7 @@
           <option value="{{ key }}" {{ 'selected' if key == 'eval_pass_probability' else '' }}>{{ label }}</option>
           {% endfor %}
         </select>
+        <p style="font-size:12px;color:#888;margin-top:4px;">Not trading a prop-firm evaluation? Pick "Long-Term Net Profit" -- it scores candidates purely on total P&amp;L and ignores prop-firm drawdown/payout rules entirely.</p>
       </div>
     </div>
     <label class="checkbox-row" style="display:flex;align-items:center;gap:8px;"><input type="checkbox" name="save_to_library" checked style="width:auto;">Save the result to the Strategy Library (tagged "draft")</label>

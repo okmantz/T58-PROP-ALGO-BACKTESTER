@@ -338,13 +338,14 @@
       <input type="number" name="robustness_neighbors" value="6">
       <label>Fitness metric</label>
       <select name="fitness_metric">
-        <option value="eval_pass_probability">Eval pass probability -- reach target before hitting a limit (recommended)</option>
+        <option value="eval_pass_probability">Eval pass probability -- reach target before hitting a limit (recommended for prop firms)</option>
         <option value="composite_prop_score">Composite prop score</option>
         <option value="first_payout_probability">First payout probability</option>
-        <option value="net_profit">Net profit</option>
+        <option value="net_profit">Long-term net profit ($) -- for long-term trading with no prop firm</option>
         <option value="sharpe_ratio">Sharpe ratio</option>
         <option value="profit_factor">Profit factor</option>
       </select>
+      <p style="font-size:12px;color:#888;margin-top:4px;">Not trading a prop-firm evaluation? Pick "Long-term net profit" -- it scores candidates purely on total P&amp;L and ignores prop-firm drawdown/payout rules entirely.</p>
     </details>
   </div>
 

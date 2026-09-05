@@ -74,14 +74,65 @@ install — no manual file copying required.
 
 ## 2. Local Python app (any OS)
 
+Works on Windows, macOS, and Linux — the only two things that trip people
+up are (a) not being *inside* the extracted/cloned folder yet when running
+these commands, since `config/requirements.txt` is a path relative to the
+repo root, and (b) some Linux distros (Debian, Ubuntu, Linux Mint) only
+ever install a `python3` command, never a plain `python` — see the notes
+under the block below if either of those happens to you.
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+# 0. Get the code onto your computer, if you haven't already, then move
+#    INTO that folder -- every command after this assumes you're standing
+#    inside it. If you downloaded a "Code -> Download ZIP" from GitHub
+#    instead of using git clone, extract it first, then cd into the
+#    extracted folder (its name will look like T58-Prop-Algo-Backtester
+#    or T58-PROP-ALGO-BACKTESTER-main).
+git clone <this-repo-url>
+cd T58-Prop-Algo-Backtester
+
+# 1. Create and activate a virtual environment (isolates this app's
+#    Python packages from everything else on your system).
+python3 -m venv .venv                 # Windows: py -m venv .venv
+
+# 2. Activate it -- the command differs by OS/shell, run ONE of these:
+source .venv/bin/activate             # macOS / Linux, bash or zsh
+.venv\Scripts\activate.bat            # Windows, Command Prompt (cmd.exe)
+.venv\Scripts\Activate.ps1            # Windows, PowerShell
+
+# 3. Install dependencies (this path is relative to the repo root you
+#    cd'd into in step 0 -- if this fails with "No such file or
+#    directory", you're not standing inside the repo folder yet).
 pip install -r config/requirements.txt
 
-python -m app.main                 # desktop GUI
+# 4. Run it.
+python -m app.main                    # desktop GUI
 python -m app.main --cli --csv data/examples/EURUSD_5M_sample.csv --sims 10000   # headless
 ```
+
+**Notes if a command above didn't work:**
+
+- **`Command 'python' not found, did you mean 'python3'`** (Debian, Ubuntu,
+  Linux Mint, and most other Linux distros): these ship only a `python3`
+  command, not a plain `python`, unless you've separately installed the
+  `python-is-python3` package. Use `python3` everywhere above **only for
+  creating the virtual environment** (step 1) — once the venv is
+  *activated* (step 2), the plain `python` command inside it always points
+  at the venv's own Python regardless of what your system default is, so
+  steps 3-4 work exactly as written on every OS, including Linux.
+- **`ERROR: Could not open requirements file: ... config/requirements.txt`**:
+  this means the command was run from the wrong folder — `cd` into the
+  repo folder itself first (step 0), then confirm `config/requirements.txt`
+  exists relative to where you are with `ls config/requirements.txt`
+  (macOS/Linux) or `dir config\requirements.txt` (Windows).
+- **PowerShell says running scripts is disabled** when you try
+  `Activate.ps1`: run
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or just use
+  `.venv\Scripts\activate.bat` in Command Prompt instead.
+- You'll know the venv is active because your terminal prompt gets a
+  `(.venv)` prefix — if you don't see that, activation (step 2) didn't
+  take effect, and step 3/4 will install into (or run) your system Python
+  instead of the isolated one.
 
 CLI output is written to `reports/report.{json,html}` plus `report_summary.csv`
 and `report_trades.csv`. Open `report.html` in a browser — it's self-contained
@@ -115,14 +166,41 @@ stay on while you use it from your phone.
 ### Alternative: run it from source
 
 ```bash
+# from inside the repo folder (see the "Local Python app" section above
+# for the git clone / cd / venv steps if you haven't done those yet)
 pip install -r config/requirements.txt
 python run_web.py
 ```
 
-This does the same thing as the exe (prints your LAN address, opens a
-QR code, serves on `http://0.0.0.0:5000`). You can also run the plainer
-`python -m app.web.server` if you'd rather find your LAN IP manually
-(`ipconfig` on Windows, `ifconfig`/`ip addr` on Mac/Linux).
+This prints your LAN address, opens a QR code, and serves on
+`http://0.0.0.0:5000` — and so does the plainer `python -m app.web.server`
+alternative (both now share the exact same startup banner and QR code
+logic; there used to be a real gap here where only `run_web.py` showed a
+QR code at all, and `python -m app.web.server` showed neither a QR code
+nor a LAN address). Either way, the running app itself also has this same
+address + QR code available any time at its **Phone access** sidebar link
+(`/mobile-access`) — useful if you started it a while ago and the
+original console banner has scrolled out of view.
+
+**Getting "site can't be reached" on your phone almost always means one
+of these:**
+
+- You typed `https://` instead of `http://` — this server doesn't speak
+  HTTPS at all, so an `https://` address will never connect, phone or not.
+- You typed `127.0.0.1` (or `localhost`) instead of the LAN address the
+  banner/`/mobile-access` page actually shows — `127.0.0.1` only ever
+  means "this computer itself"; it's meaningless from a phone or any
+  other device.
+- Phone and computer aren't on the same Wi-Fi network (phone on cellular
+  data, or a guest/isolated Wi-Fi network — common in offices, coffee
+  shops, and hotels).
+- Windows Firewall is blocking it — the first run should prompt "Allow
+  python.exe to communicate on Private networks?"; if you clicked
+  Cancel/No, open **Windows Security → Firewall & network protection →
+  Allow an app through firewall** and enable Python for Private networks.
+
+You can also find your LAN IP manually (`ipconfig` on Windows,
+`ifconfig`/`ip addr` on Mac/Linux) if you'd rather type it yourself.
 
 From your phone's browser:
 

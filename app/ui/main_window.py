@@ -1311,6 +1311,8 @@ class MainWindow:
 
         if self._custom_titlebar_active:
             self._build_resize_grip()
+
+    def _pump_splash(self, status: str) -> None:
         """Best-effort: updates the boot splash's status text and pumps
         the Tk event loop once, so the splash's glow animation actually
         animates through _build_ui()'s otherwise fully synchronous,

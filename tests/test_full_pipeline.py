@@ -81,9 +81,17 @@ def test_full_pipeline_end_to_end_manual_strategy(tmp_path):
     assert len(result.final_bt.trades) > 0
     assert result.verdict in ("READY", "MARGINAL", "NOT READY")
     assert result.report_paths["html"].exists()
-    # Manual configs aren't files -- nothing should be saved to the library.
-    assert result.saved_library_path is None
-    assert "aren't files" in result.saved_library_note
+    # Manual configs are saved to the Strategy Library as JSON, same as a
+    # code strategy would be saved as a .py/.pine/.mq5 file (see the
+    # full_pipeline.py fix that stopped manual configs from being treated
+    # as having "nothing to save" -- library.py already had a first-class
+    # "manual" strategy type for exactly this).
+    assert result.saved_library_path is not None
+    assert result.saved_library_path.exists()
+    assert result.saved_library_path.suffix == ".json"
+    assert "Saved to the Strategy Library" in result.saved_library_note
+    assert result.final_code_text is not None
+    assert result.final_code_extension == ".json"
 
 
 def test_full_pipeline_raises_fast_on_zero_trade_baseline(tmp_path):

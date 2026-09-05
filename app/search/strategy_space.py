@@ -1640,6 +1640,392 @@ _FVG_QUICK_FILL_FADE = SkeletonSpec(
 )
 
 
+# ---------------------------------------------------------------------------
+# Expansion round 2 (Sep 2026, requested batch): 8 more named hypothesis
+# families, chosen specifically to cover ground the first 26 didn't --
+# either a canonical taxonomy group with ZERO existing family
+# (relative_strength) or the deliberate MIRROR IMAGE of an existing
+# hypothesis (trading the same primitive the opposite direction), so the
+# Search Lab's coverage of app.strategy.family_taxonomy.FAMILY_GROUPS
+# stops being lopsided toward mean-reversion/breakout and starts actually
+# spanning the full taxonomy. Every comparison below follows this file's
+# existing scale-safety convention: a raw price/ATR-scale indicator is
+# only ever compared to ANOTHER price/ATR-scale indicator, never to a
+# hardcoded absolute number (that's exactly the FX-pip-vs-gold-price bug
+# class root-caused and fixed in app/backtest/execution.py -- see
+# /areas/prop-algo-backtester.md) -- only genuinely dimensionless reads
+# (RSI 0-100, a z-score, relative_volume as a ratio, a regime flag) are
+# ever compared to a plain number.
+# ---------------------------------------------------------------------------
+
+
+def _build_relative_strength_momentum(p: dict) -> dict:
+    period, entry_z, exit_z = p["period"], p["entry_z"], p["exit_z"]
+    return {
+        "name": f"Relative Strength Momentum (period={period}, entry_z={entry_z})",
+        "entry_conditions": {
+            "long": [_cond({"type": "pair_zscore", "period": period}, ">", _val(entry_z))],
+            "short": [_cond({"type": "pair_zscore", "period": period}, "<", _val(-entry_z))],
+        },
+        "exit_conditions": {
+            "long": [_cond({"type": "pair_zscore", "period": period}, "<", _val(exit_z))],
+            "short": [_cond({"type": "pair_zscore", "period": period}, ">", _val(-exit_z))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=p["max_bars"]),
+    }
+
+
+_RELATIVE_STRENGTH_MOMENTUM = SkeletonSpec(
+    name="relative_strength_momentum",
+    label="Relative Strength Ratio Momentum (requires merged pair data)",
+    description=(
+        "The deliberate MIRROR IMAGE of Family G (stat_pairs): instead of fading a stretched "
+        "relative-value z-score back toward zero, this BUYS the primary instrument once its "
+        "ratio to a second instrument has ALREADY stretched significantly positive (betting "
+        "it keeps outperforming) and shorts once the ratio has stretched significantly "
+        "negative -- a relative-strength MOMENTUM hypothesis rather than a mean-reversion one, "
+        "on the exact same pair_zscore primitive with the entry direction inverted. Fills the "
+        "'relative_strength' taxonomy group, which previously had zero families in it. Same "
+        "single-leg execution caveat as stat_pairs: only the primary instrument is traded."
+    ),
+    param_grid={
+        "period": [30, 50, 100],
+        "entry_z": [1.5, 2.0, 2.5],
+        "exit_z": [0.5, 0.75],
+        "stop_atr_mult": [1.5, 2.0],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [48, 96],
+    },
+    build=_build_relative_strength_momentum,
+    valid=lambda p: p["exit_z"] < p["entry_z"],
+    requires_pair_data=True,
+)
+
+
+def _build_volume_climax_reversal(p: dict) -> dict:
+    vol_period, vol_mult, atr_period, max_bars = p["vol_period"], p["vol_mult"], p["atr_period"], p["max_bars"]
+    return {
+        "name": f"Volume Climax Reversal (rel-vol{vol_period}>{vol_mult}x, vol-expansion gated)",
+        "entry_conditions": {
+            # A down-close candle on climactic volume, during a volatility-EXPANSION
+            # regime, reads as capitulation/exhaustion selling rather than the start of a
+            # sustained new leg down -- fade it long. Mirrored for shorts.
+            "long": [
+                _cond(_ind("relative_volume", vol_period), ">", _val(vol_mult)),
+                _cond({"type": "volatility_regime", "period": atr_period}, "==", _val(1)),
+                _cond({"type": "candle_direction", "direction": "bearish"}, "is true", _val(1)),
+            ],
+            "long_connectors": ["AND", "AND"],
+            "short": [
+                _cond(_ind("relative_volume", vol_period), ">", _val(vol_mult)),
+                _cond({"type": "volatility_regime", "period": atr_period}, "==", _val(1)),
+                _cond({"type": "candle_direction", "direction": "bullish"}, "is true", _val(1)),
+            ],
+            "short_connectors": ["AND", "AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+    }
+
+
+_VOLUME_CLIMAX_REVERSAL = SkeletonSpec(
+    name="volume_climax_reversal",
+    label="Volume Climax Exhaustion Reversal (relative-volume spike fade)",
+    description=(
+        "Fades a single candle that printed on climactic relative volume (a real multiple of "
+        "its own recent average -- a dimensionless ratio, not a raw volume count) during a "
+        "volatility-expansion regime, betting the move was exhaustion/capitulation rather than "
+        "the start of a sustained trend. A genuinely different reversal trigger from Family C "
+        "(a statistical band) or Family M (a confirmed swing pivot) -- this one fires on ORDER-"
+        "FLOW INTENSITY at a single bar, nothing else."
+    ),
+    param_grid={
+        "vol_period": [14, 20],
+        "vol_mult": [2.0, 3.0],
+        "atr_period": [14, 20],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.5],
+        "max_bars": [12, 24],
+    },
+    build=_build_volume_climax_reversal,
+)
+
+
+def _build_vwap_trend_continuation(p: dict) -> dict:
+    ema_fast, ema_slow = p["ema_fast"], p["ema_slow"]
+    rsi_period, rsi_pullback_low, rsi_pullback_high = p["rsi_period"], p["rsi_pullback_low"], p["rsi_pullback_high"]
+    max_bars = p["max_bars"]
+    return {
+        "name": f"VWAP Trend Continuation (ema {ema_fast}/{ema_slow}, rsi{rsi_period})",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("ema", ema_fast), ">", _ind("ema", ema_slow)),
+                _cond(_ind("close", 1), ">", _ind("vwap", 1)),
+                _cond(_ind("rsi", rsi_period), "<", _val(rsi_pullback_low)),
+            ],
+            "long_connectors": ["AND", "AND"],
+            "short": [
+                _cond(_ind("ema", ema_fast), "<", _ind("ema", ema_slow)),
+                _cond(_ind("close", 1), "<", _ind("vwap", 1)),
+                _cond(_ind("rsi", rsi_period), ">", _val(rsi_pullback_high)),
+            ],
+            "short_connectors": ["AND", "AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("rsi", rsi_period), ">", _val(rsi_pullback_high))],
+            "short": [_cond(_ind("rsi", rsi_period), "<", _val(rsi_pullback_low))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+    }
+
+
+_VWAP_TREND_CONTINUATION = SkeletonSpec(
+    name="vwap_trend_continuation",
+    label="VWAP Trend Continuation (stay-above-VWAP pullback buy)",
+    description=(
+        "The deliberate MIRROR IMAGE of Family I (vwap_reversion): instead of fading a stretch "
+        "AWAY from VWAP, this buys a shallow RSI pullback WHILE price is still holding above "
+        "VWAP inside an established EMA uptrend (mirrored for downtrends/shorts) -- a "
+        "continuation reading of the same anchor price, not a mean-reversion one."
+    ),
+    param_grid={
+        "ema_fast": [20, 50],
+        "ema_slow": [100, 200],
+        "rsi_period": [7, 14],
+        "rsi_pullback_low": [35, 45],
+        "rsi_pullback_high": [55, 65],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [24, 48],
+    },
+    build=_build_vwap_trend_continuation,
+    valid=lambda p: p["ema_fast"] < p["ema_slow"] and p["rsi_pullback_low"] < p["rsi_pullback_high"],
+)
+
+
+def _build_bollinger_band_walk(p: dict) -> dict:
+    bb_period, ema_trend, max_bars = p["bb_period"], p["ema_trend"], p["max_bars"]
+    return {
+        "name": f"Bollinger Band Walk Continuation (bb{bb_period}, ema{ema_trend} filter)",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("close", 1), ">", {"type": "bollinger_upper", "period": bb_period, "field": "close"}),
+                _cond(_ind("close", 1), ">", _ind("ema", ema_trend)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_ind("close", 1), "<", {"type": "bollinger_lower", "period": bb_period, "field": "close"}),
+                _cond(_ind("close", 1), "<", _ind("ema", ema_trend)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("close", 1), "<", {"type": "bollinger_mid", "period": bb_period, "field": "close"})],
+            "short": [_cond(_ind("close", 1), ">", {"type": "bollinger_mid", "period": bb_period, "field": "close"})],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+    }
+
+
+_BOLLINGER_BAND_WALK = SkeletonSpec(
+    name="bollinger_band_walk_continuation",
+    label="Bollinger Band Walk Continuation (trend-following band ride)",
+    description=(
+        "The deliberate MIRROR IMAGE of Family C (mean_reversion_band): instead of fading a "
+        "close outside the Bollinger Band, this TRADES WITH a close that's already outside it, "
+        "provided a slower EMA trend filter agrees -- the classic 'band walk' reading of the "
+        "same statistical envelope, betting the move keeps riding the band rather than "
+        "reverting. Exits back at the midline either way, same as Family C's exit."
+    ),
+    param_grid={
+        "bb_period": [14, 20, 30],
+        "ema_trend": [50, 100],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_bollinger_band_walk,
+)
+
+
+def _build_gap_and_go(p: dict) -> dict:
+    start, end, flat_time, max_bars = p["session_start"], p["session_end"], p["flat_time"], p["max_bars"]
+    return {
+        "name": f"Gap-and-Go Continuation ({start}-{end})",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("open", 1), ">", {"type": "previous_day_close"}),
+                _cond(_ind("close", 1), ">", _ind("open", 1)),
+            ],
+            "long_connectors": ["AND", "AND"],
+            "short": [
+                _cond({"type": "time_of_day", "session_start": start, "session_end": end}, "is true", _val(1)),
+                _cond(_ind("open", 1), "<", {"type": "previous_day_close"}),
+                _cond(_ind("close", 1), "<", _ind("open", 1)),
+            ],
+            "short_connectors": ["AND", "AND"],
+        },
+        "exit_conditions": {"long": [], "short": [], "long_connectors": [], "short_connectors": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+        "_time_based_exit": flat_time,
+    }
+
+
+_GAP_AND_GO_CONTINUATION = SkeletonSpec(
+    name="gap_and_go_continuation",
+    label="Gap-and-Go Continuation (session-gated, flat-by-clock-time)",
+    description=(
+        "The deliberate MIRROR IMAGE of Family K (overnight_gap_fade): instead of fading an "
+        "overnight gap back toward yesterday's close, this trades WITH the gap, entering only "
+        "within an early session window and only if the opening candle itself hasn't already "
+        "reversed direction -- betting a gap that's holding is more likely to run than fill. "
+        "Force-flattens by clock time, same discipline as Family E."
+    ),
+    param_grid={
+        "session_start": ["08:30", "13:30"],
+        "session_end": ["09:30", "14:30"],
+        "flat_time": ["16:00"],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [1.5, 2.5],
+        "max_bars": [12, 24],
+    },
+    build=lambda p: _apply_time_based_exit(_build_gap_and_go(p)),
+    valid=lambda p: p["session_start"] < p["session_end"],
+)
+
+
+def _build_volume_confirmed_breakout(p: dict) -> dict:
+    lookback, vol_period, vol_mult, max_bars = p["lookback"], p["vol_period"], p["vol_mult"], p["max_bars"]
+    return {
+        "name": f"Volume-Confirmed Breakout (lb={lookback}, rel-vol{vol_period}>{vol_mult}x)",
+        "entry_conditions": {
+            "long": [
+                _cond(_breakout_flag(lookback, "bullish"), "is true", _val(1)),
+                _cond(_ind("relative_volume", vol_period), ">", _val(vol_mult)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_breakout_flag(lookback, "bearish"), "is true", _val(1)),
+                _cond(_ind("relative_volume", vol_period), ">", _val(vol_mult)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+    }
+
+
+_VOLUME_CONFIRMED_BREAKOUT = SkeletonSpec(
+    name="volume_confirmed_breakout",
+    label="Volume-Confirmed Breakout (Donchian + relative-volume filter)",
+    description=(
+        "An N-bar breakout gated by relative volume (a real multiple of its own recent "
+        "average) instead of Family A's trend-direction (EMA) filter or Family D's ATR-state "
+        "filter -- a third, independent way to separate a 'real' breakout from a false one: "
+        "conviction read from ORDER FLOW rather than price direction or volatility state."
+    ),
+    param_grid={
+        "lookback": [10, 20, 40],
+        "vol_period": [14, 20],
+        "vol_mult": [1.5, 2.0],
+        "stop_atr_mult": [1.0, 1.5, 2.0],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_volume_confirmed_breakout,
+)
+
+
+def _build_wma_sma_divergence_trend(p: dict) -> dict:
+    period, ema_trend, max_bars = p["period"], p["ema_trend"], p["max_bars"]
+    return {
+        "name": f"WMA/SMA Divergence Trend (period={period}, ema{ema_trend} filter)",
+        "entry_conditions": {
+            "long": [
+                _cond(_ind("wma", period), ">", _ind("sma", period)),
+                _cond(_ind("close", 1), ">", _ind("ema", ema_trend)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond(_ind("wma", period), "<", _ind("sma", period)),
+                _cond(_ind("close", 1), "<", _ind("ema", ema_trend)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {
+            "long": [_cond(_ind("wma", period), "<", _ind("sma", period))],
+            "short": [_cond(_ind("wma", period), ">", _ind("sma", period))],
+        },
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+    }
+
+
+_WMA_SMA_DIVERGENCE_TREND = SkeletonSpec(
+    name="wma_sma_divergence_trend",
+    label="WMA/SMA Divergence Trend (recency-weighted acceleration filter)",
+    description=(
+        "Compares a recency-weighted moving average (WMA) against a plain equal-weighted one "
+        "(SMA) of the SAME period and length: when WMA pulls ahead of SMA, recent bars are "
+        "moving faster than older ones -- an ACCELERATING trend -- confirmed by a slower EMA "
+        "trend filter. A different mechanism from Family L (wma_ribbon_trend, which stacks "
+        "three WMAs of different periods) and from every other trend family here, none of "
+        "which compare two DIFFERENT averaging methods of the same window."
+    ),
+    param_grid={
+        "period": [10, 20, 30],
+        "ema_trend": [50, 100, 200],
+        "stop_atr_mult": [1.0, 1.5],
+        "target_atr_mult": [2.0, 3.0],
+        "max_bars": [None, 48],
+    },
+    build=_build_wma_sma_divergence_trend,
+)
+
+
+def _build_higher_low_structure_continuation(p: dict) -> dict:
+    lookback, ema_trend, max_bars = p["lookback"], p["ema_trend"], p["max_bars"]
+    return {
+        "name": f"Higher-Low Structure Continuation (lookback={lookback}, ema{ema_trend} filter)",
+        "entry_conditions": {
+            "long": [
+                _cond({"type": "swing_low", "lookback": lookback}, "is true", _val(1)),
+                _cond(_ind("close", 1), ">", _ind("ema", ema_trend)),
+            ],
+            "long_connectors": ["AND"],
+            "short": [
+                _cond({"type": "swing_high", "lookback": lookback}, "is true", _val(1)),
+                _cond(_ind("close", 1), "<", _ind("ema", ema_trend)),
+            ],
+            "short_connectors": ["AND"],
+        },
+        "exit_conditions": {"long": [], "short": []},
+        "risk_management": _risk_management(p["stop_atr_mult"], p["target_atr_mult"], max_bars_in_trade=max_bars),
+    }
+
+
+_HIGHER_LOW_STRUCTURE_CONTINUATION = SkeletonSpec(
+    name="higher_low_structure_continuation",
+    label="Higher-Low Structure Continuation (trend-filtered swing-pivot buy)",
+    description=(
+        "Buys a just-CONFIRMED swing low only while price is still above a slower EMA trend "
+        "filter (mirrored: sells a confirmed swing high only below it) -- a continuation-via-"
+        "structure hypothesis, distinct from Family M (swing_structure_fade, the same pivot "
+        "primitive with NO trend filter, trading every pivot as a contrarian fade) and from "
+        "Family B/Family V (which trigger off an RSI/EMA-distance reading, never off a "
+        "confirmed price pivot)."
+    ),
+    param_grid={
+        "lookback": [5, 10, 15],
+        "ema_trend": [50, 100, 200],
+        "stop_atr_mult": [0.75, 1.0, 1.5],
+        "target_atr_mult": [1.5, 2.0, 3.0],
+        "max_bars": [None, 24, 48],
+    },
+    build=_build_higher_low_structure_continuation,
+)
+
+
 FAMILIES: dict[str, SkeletonSpec] = {
     _TREND_BREAKOUT.name: _TREND_BREAKOUT,
     _MTF_PULLBACK.name: _MTF_PULLBACK,
@@ -1679,6 +2065,23 @@ FAMILIES: dict[str, SkeletonSpec] = {
     _MICRO_PULLBACK_CONTINUATION.name: _MICRO_PULLBACK_CONTINUATION,
     _CHANGE_OF_CHARACTER_REVERSAL_SCALP.name: _CHANGE_OF_CHARACTER_REVERSAL_SCALP,
     _FVG_QUICK_FILL_FADE.name: _FVG_QUICK_FILL_FADE,
+    # -- Expansion round 2 (8 new families): fills the previously-empty
+    # relative_strength taxonomy group, plus 4 deliberate mirror-image
+    # hypotheses of existing families (relative_strength_momentum vs
+    # stat_pairs, vwap_trend_continuation vs vwap_reversion,
+    # bollinger_band_walk_continuation vs mean_reversion_band,
+    # gap_and_go_continuation vs overnight_gap_fade) and 3 new
+    # independent mechanisms (volume_climax_reversal, volume_confirmed_
+    # breakout, wma_sma_divergence_trend, higher_low_structure_continuation)
+    # -- see each SkeletonSpec's own description for what makes it distinct.
+    _RELATIVE_STRENGTH_MOMENTUM.name: _RELATIVE_STRENGTH_MOMENTUM,
+    _VOLUME_CLIMAX_REVERSAL.name: _VOLUME_CLIMAX_REVERSAL,
+    _VWAP_TREND_CONTINUATION.name: _VWAP_TREND_CONTINUATION,
+    _BOLLINGER_BAND_WALK.name: _BOLLINGER_BAND_WALK,
+    _GAP_AND_GO_CONTINUATION.name: _GAP_AND_GO_CONTINUATION,
+    _VOLUME_CONFIRMED_BREAKOUT.name: _VOLUME_CONFIRMED_BREAKOUT,
+    _WMA_SMA_DIVERGENCE_TREND.name: _WMA_SMA_DIVERGENCE_TREND,
+    _HIGHER_LOW_STRUCTURE_CONTINUATION.name: _HIGHER_LOW_STRUCTURE_CONTINUATION,
 }
 
 # Families that need something beyond the plain OHLCV df -- checked by

@@ -40,6 +40,10 @@
   </div>
   <p class="note" id="s-reason"></p>
   <p class="note" id="s-library-note"></p>
+  <div id="s-guidance-wrap" style="display:none;">
+    <h3 style="margin-bottom:6px;">What to try next</h3>
+    <ul id="s-guidance-list" class="note" style="margin-top:0; padding-left:20px;"></ul>
+  </div>
   <div class="links" id="s-report-links"></div>
 </div>
 
@@ -106,6 +110,20 @@
               document.getElementById('s-elapsed').textContent = fmt(s.elapsed_seconds, 0) + 's';
             }
             document.getElementById('s-reason').textContent = s.winner_reason || '';
+
+            const guidanceWrap = document.getElementById('s-guidance-wrap');
+            const guidanceList = document.getElementById('s-guidance-list');
+            guidanceList.innerHTML = '';
+            if (!s.winner && s.guidance && s.guidance.length) {
+              guidanceWrap.style.display = 'block';
+              s.guidance.forEach(line => {
+                const li = document.createElement('li');
+                li.textContent = line;
+                guidanceList.appendChild(li);
+              });
+            } else {
+              guidanceWrap.style.display = 'none';
+            }
 
             if (s.candidates && s.candidates.length) {
               document.getElementById('candidates-card').style.display = 'block';

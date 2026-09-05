@@ -102,6 +102,15 @@ _SKELETON_TO_GROUP: dict[str, str] = {
     "micro_pullback_continuation": "pullback",
     "change_of_character_reversal_scalp": "market_structure",
     "fvg_quick_fill_fade": "liquidity_sweep",
+    # Expansion round 2 (app.search.strategy_space Families added Sep 2026)
+    "relative_strength_momentum": "relative_strength",
+    "volume_climax_reversal": "mean_reversion",
+    "vwap_trend_continuation": "vwap",
+    "bollinger_band_walk_continuation": "trend_following",
+    "gap_and_go_continuation": "momentum",
+    "volume_confirmed_breakout": "breakout",
+    "wma_sma_divergence_trend": "trend_following",
+    "higher_low_structure_continuation": "pullback",
 }
 
 # Path 2a: app.strategy.dna active_tags() -> canonical group. Checked in

@@ -78,6 +78,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -162,6 +163,130 @@ class SpeedRunResult:
     winner: SpeedRunCandidateResult | None
     winner_reason: str
     elapsed_seconds: float
+    # Populated only when winner is None -- see _diagnose_no_winner(). A
+    # concrete, ranked "here's what to try next" list instead of just
+    # reporting failure, so a no-winner run on a new instrument/dataset
+    # gives you a next move rather than a dead end.
+    guidance: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# "No winner found" guidance -- requested after an overnight Bitcoin run
+# found a winner but two back-to-back AAPL runs didn't: rather than just
+# reporting failure, mine whatever real diagnostic data this run already
+# produced (Full Pipeline's own verdict_reasons for anything that got far
+# enough to be validated; the run's own config for anything that didn't)
+# into concrete parameter tweaks, ranked by how often each reason actually
+# showed up in THIS run rather than a generic checklist.
+# ---------------------------------------------------------------------------
+
+# (substring to search a verdict_reason for, human suggestion). Checked in
+# order against every validated candidate's verdict_reasons; a reason can
+# match more than one bucket (e.g. a low eval-pass AND a high risk-of-ruin
+# reason on the same candidate both count), and counts drive the ranking
+# below so the most common real cause surfaces first.
+_REASON_SUGGESTIONS: list[tuple[str, str]] = [
+    (
+        "evaluation-pass probability",
+        "Loosen Prop Rules (03): raise Daily Loss Limit % and/or Max Drawdown %, or lower Profit "
+        "Target %, so a candidate has more room to reach the target before tripping a limit first.",
+    ),
+    (
+        "first-payout probability",
+        "Candidates are reaching the eval target but rarely surviving to a real payout milestone -- "
+        "try a SMALLER Risk Value (04 Risk & Execution) so more of the account survives the drawdown "
+        "that tends to follow a pass, rather than loosening the prop limits themselves.",
+    ),
+    (
+        "risk of ruin",
+        "Risk of ruin this high almost always means position sizing is too aggressive for this "
+        "instrument's volatility -- lower Risk Value (04 Risk & Execution); if using \"% of balance\" "
+        "sizing, try a noticeably smaller percentage.",
+    ),
+    (
+        "out-of-sample",
+        "There isn't enough historical data on this instrument to reliably check candidates "
+        "out-of-sample -- upload a longer history, or lower Speed Run's validation fold count so "
+        "each fold still gets enough bars.",
+    ),
+    (
+        "drawdown",
+        "Candidates' own drawdown regularly exceeds what Prop Rules allows -- raise Max Drawdown % "
+        "in Prop Rules (03), or lower Risk Value (04) so each losing streak costs less of the account.",
+    ),
+    (
+        "icir",
+        "The edge found doesn't clear a statistical-significance bar once multiple-testing correction "
+        "is applied -- this usually means what Phase 1 found was closer to noise than a reproducible "
+        "pattern on THIS dataset. A longer or different historical file for this instrument is more "
+        "likely to help than retuning parameters on the same one.",
+    ),
+]
+
+# Generic guidance for the "zero Stage 3 survivors" case, where nothing got
+# far enough to produce a real verdict_reason to mine -- ordered roughly by
+# how likely each is to actually be the blocker in practice.
+_NO_SURVIVORS_SUGGESTIONS: list[str] = [
+    "Increase 'Max candidates sampled' and 'Stage 1 survivors kept' in Speed Run Settings -- a wider "
+    "Phase 1 net gives more candidates a real shot at reaching validation.",
+    "Loosen Prop Rules (03): raise Daily Loss Limit % and Max Drawdown %, or lower Profit Target %.",
+    "Lower Risk Value (04 Risk & Execution) -- oversized positions relative to this instrument's own "
+    "volatility can wipe candidates out before Stage 1 even finishes scoring them.",
+    "Double-check Pip Size (04) actually matches this instrument -- a stock priced in whole dollars "
+    "(e.g. AAPL) needs a different pip size than an FX pair; a mismatch here can silently produce "
+    "nonsensical position sizes that fail every candidate at once.",
+    "If this instrument trades far fewer hours than whatever you last ran (e.g. a stock's ~6.5-hour "
+    "session vs. Bitcoin's 24/7 market), session-gated families -- Session/Time-of-Day Effect, "
+    "Opening Range Retest, Gap-and-Go Continuation -- are usually a better fit than families tuned "
+    "assuming round-the-clock trading.",
+    "Run Speed Run again on the exact same data -- Phase 1 samples a different random subset of each "
+    "family's grid every run, so a second pass can turn up a candidate the first pass missed.",
+]
+
+
+def _diagnose_no_winner(
+    summary: SearchSummary, results: list[SpeedRunCandidateResult], cfg: SpeedRunConfig,
+) -> list[str]:
+    if not summary.leaderboard:
+        lines = list(_NO_SURVIVORS_SUGGESTIONS)
+        lines[0] = (
+            f"Increase 'Max candidates sampled' (currently {cfg.max_candidates}) and "
+            f"'Stage 1 survivors kept' (currently {cfg.stage1_top_n}) in Speed Run Settings -- a "
+            "wider Phase 1 net gives more candidates a real shot at reaching validation."
+        )
+        return lines
+
+    reason_counts: Counter[str] = Counter()
+    for r in results:
+        if r.pipeline_result is None:
+            continue
+        for reason_text in r.pipeline_result.verdict_reasons:
+            lowered = reason_text.lower()
+            for needle, _suggestion in _REASON_SUGGESTIONS:
+                if needle in lowered:
+                    reason_counts[needle] += 1
+
+    if not reason_counts:
+        # Every validation either failed outright (r.error set) or produced
+        # a NOT READY verdict with no reason string matching a known
+        # bucket -- fall back to the same generic checklist as the
+        # zero-survivors case rather than returning nothing.
+        return list(_NO_SURVIVORS_SUGGESTIONS)
+
+    ranked_needles = [needle for needle, _count in reason_counts.most_common()]
+    suggestion_by_needle = dict(_REASON_SUGGESTIONS)
+    lines = [
+        f"Most common blocker across {len(results)} validated candidate(s): "
+        f"{ranked_needles[0]} ({reason_counts[ranked_needles[0]]}x). {suggestion_by_needle[ranked_needles[0]]}"
+    ]
+    for needle in ranked_needles[1:]:
+        lines.append(f"Also seen ({reason_counts[needle]}x): {suggestion_by_needle[needle]}")
+    lines.append(
+        "Or accept a MARGINAL verdict instead of holding out for READY -- rerun Full Pipeline "
+        "directly on whichever candidate above scored closest, this time saving it to the library "
+        "even at MARGINAL, and validate it further by hand."
+    )
+    return lines
 
 
 def _score_key(row: dict) -> float:
@@ -261,15 +386,15 @@ def run_speed_run(
         )
 
     if not summary.leaderboard:
+        guidance = _diagnose_no_winner(summary, [], cfg)
         log(
-            "\nNo Stage 3 survivors -- nothing to validate. Widen Prop Rules / Risk "
-            "settings, or try again (each run samples a different random subset of "
-            "each family's grid), before assuming no edge exists here."
+            "\nNo Stage 3 survivors -- nothing to validate. Here's what to try next:\n"
+            + "\n".join(f"  - {line}" for line in guidance)
         )
         return SpeedRunResult(
             search_summary=summary, candidates=[], winner=None,
             winner_reason="No candidate survived Stage 3 of discovery.",
-            elapsed_seconds=time.time() - t0,
+            elapsed_seconds=time.time() - t0, guidance=guidance,
         )
 
     # -- Phase 2: validate the top-K leaders through Full Pipeline -------
@@ -353,9 +478,14 @@ def run_speed_run(
         reason = "No validated candidate reached even a MARGINAL verdict. See individual results below."
     log(reason)
 
+    guidance: list[str] = []
+    if winner is None:
+        guidance = _diagnose_no_winner(summary, results, cfg)
+        log("\nWhat to try next:\n" + "\n".join(f"  - {line}" for line in guidance))
+
     elapsed = time.time() - t0
     log(f"\nSpeed Run complete in {elapsed / 60:.1f} minute(s).")
     return SpeedRunResult(
         search_summary=summary, candidates=results, winner=winner,
-        winner_reason=reason, elapsed_seconds=elapsed,
+        winner_reason=reason, elapsed_seconds=elapsed, guidance=guidance,
     )

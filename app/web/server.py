@@ -36,6 +36,7 @@ from flask import (
 )
 
 from app.ai.ollama_settings import OllamaSettings
+from app.web.network_info import lan_url, print_startup_banner, qr_code_data_uri, qr_code_file
 from app.ai.ollama_settings import load_settings as load_ollama_settings
 from app.ai.ollama_settings import save_settings as save_ollama_settings
 from app.ai.research_agent import ResearchAgentContext, ResearchAgent
@@ -461,6 +462,20 @@ def data_alpaca_fetch():
 def data_alpaca_forget():
     alpaca_credentials.clear_credentials()
     return redirect(url_for("index", alpaca_notice="Saved Alpaca keys removed from this computer.", alpaca_notice_kind="success"))
+
+
+@app.route("/mobile-access")
+def mobile_access():
+    """Shows the same LAN address + QR code the console banner prints
+    (see app.web.network_info), but IN the running app itself -- so it's
+    reachable from a browser tab on the PC (e.g. after starting via
+    `python -m app.web.server`, which used to show none of this), not
+    only from the separate run_web.py launcher's popped-open image."""
+    url = lan_url()
+    qr_data_uri = qr_code_data_uri(url)
+    return render_template(
+        "mobile_access.html", active_page="mobile_access", url=url, qr_data_uri=qr_data_uri,
+    )
 
 
 @app.route("/dashboard")
@@ -3492,6 +3507,7 @@ def speed_run_job_status(job_id):
             "winner_reason": result.winner_reason,
             "elapsed_seconds": result.elapsed_seconds,
             "candidates": candidates,
+            "guidance": result.guidance,
         }
 
     return jsonify({
@@ -3663,6 +3679,16 @@ def generate_strategies_save():
 
 
 def main():
+    # UPGRADE (Sep 2026, QR-code/phone-reachability fix): this used to be
+    # a bare `app.run(host="0.0.0.0", port=5000, ...)` with no banner at
+    # all -- see app.web.network_info's module docstring for why that was
+    # the actual root cause of "the QR code still doesn't generate" (there
+    # was never a QR code generated on THIS entry point to begin with, only
+    # on the separate `run_web.py` launcher). Now both entry points print
+    # the identical LAN-address-and-QR-code banner.
+    url = lan_url()
+    qr_path = qr_code_file(url)
+    print_startup_banner(url, qr_path)
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
 
 

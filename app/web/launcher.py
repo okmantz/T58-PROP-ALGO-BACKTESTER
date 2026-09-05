@@ -17,61 +17,21 @@ and both devices share the same Wi-Fi network while the phone is used.
 
 This module does NOT duplicate the Flask app in app.web.server -- it
 only adds the "find my LAN IP / show a QR code / open a browser" glue
-around the exact same server.
+around the exact same server, via app.web.network_info (shared with
+app.web.server itself -- see that module's docstring for why running
+`python -m app.web.server` used to show none of this).
 """
 from __future__ import annotations
 
-import socket
 import sys
 import threading
 import time
 import webbrowser
-from pathlib import Path
 
-PORT = 5000
-
-
-def get_lan_ip() -> str:
-    """Best-effort guess at this machine's LAN IP (not the loopback one).
-
-    Opens a UDP socket to a public address without sending any data --
-    this is just a trick to ask the OS which local interface/IP it would
-    use, so it works with no internet connection too.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+from app.web.network_info import PORT, get_lan_ip, print_startup_banner, qr_code_file
 
 
-def _qr_image_path(url: str) -> Path | None:
-    """Render a QR code PNG for `url` and return its path, or None if the
-    qrcode/Pillow libraries aren't available or QR generation fails for any
-    other reason (server still works fine without this -- the printed URL
-    is always shown too). Deliberately broad: this is a nice-to-have, so a
-    missing optional dependency, a locked/unwritable home directory, or any
-    other environment quirk should never crash the launcher."""
-    try:
-        import qrcode
-
-        qr = qrcode.QRCode(box_size=10, border=2)
-        qr.add_data(url)
-        qr.make(fit=True)
-        img = qr.make_image()
-        out_dir = Path.home() / ".t58-backtester"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "phone-qr-code.png"
-        img.save(out_path)
-        return out_path
-    except Exception:
-        return None
-
-
-def _open_qr_image(path: Path) -> None:
+def _open_qr_image(path) -> None:
     """Open the QR code image with whatever the OS uses for PNGs."""
     try:
         if sys.platform.startswith("win"):
@@ -89,53 +49,6 @@ def _open_qr_image(path: Path) -> None:
     except Exception:
         # Non-fatal -- the console message with the raw URL is enough.
         pass
-
-
-def _banner(url: str, qr_path: Path | None) -> None:
-    line = "=" * 64
-    print(line)
-    print("  T58 PROP ALGO BACKTESTER -- now running as a website")
-    print(line)
-    print(f"  On THIS computer, it just opened at:\n      {url}")
-    print()
-    print("  On your PHONE (same Wi-Fi as this computer), open:")
-    print(f"      {url}")
-    if qr_path is not None:
-        print()
-        print(f"  A QR code also opened in a picture viewer ({qr_path}).")
-        print("  Scan it with your phone's camera to jump straight there.")
-    else:
-        print()
-        print("  (Could not generate a QR code image -- just type the")
-        print("   address above into your phone's browser instead.)")
-    print()
-    print("  Once it's open on your phone, use the browser menu ->")
-    print('  "Add to Home Screen" to get a real app icon.')
-    print()
-    print("  If your phone says the site can't be reached, this almost")
-    print("  always means something on the network is blocking the")
-    print("  connection, not a problem with the app itself (it's already")
-    print("  listening on every network interface on this machine).")
-    print("  Most likely causes, in order:")
-    print("   1. Windows Defender Firewall -- the FIRST time this runs,")
-    print("      Windows should prompt \"Allow python.exe to communicate")
-    print("      on Private networks?\". If you clicked Cancel/No (or the")
-    print("      prompt never appeared), open Windows Security -> Firewall")
-    print("      & network protection -> Allow an app through firewall,")
-    print("      and enable Python for Private networks.")
-    print("   2. Your PC's network is set to \"Public\" instead of")
-    print("      \"Private\" in Windows -- Public profiles block incoming")
-    print("      connections like this one by default.")
-    print("   3. Phone and PC aren't actually on the same network (phone")
-    print("      on cellular data, or on a guest Wi-Fi network that")
-    print("      isolates devices from each other -- common on coffee")
-    print("      shop / office / hotel Wi-Fi).")
-    print("   4. A VPN active on either device can also hide LAN traffic")
-    print("      from the other one -- try disabling it temporarily.")
-    print()
-    print("  Keep this window open while you use the app on your phone.")
-    print("  Closing this window stops the backtester.")
-    print(line)
 
 
 def main() -> None:
@@ -158,7 +71,7 @@ def main() -> None:
 
     ip = get_lan_ip()
     url = f"http://{ip}:{PORT}"
-    qr_path = _qr_image_path(url)
+    qr_path = qr_code_file(url)
 
     def _open_things_once_server_is_up() -> None:
         time.sleep(1.0)
@@ -168,7 +81,7 @@ def main() -> None:
 
     threading.Thread(target=_open_things_once_server_is_up, daemon=True).start()
 
-    _banner(url, qr_path)
+    print_startup_banner(url, qr_path)
     try:
         app.run(host="0.0.0.0", port=PORT, debug=False)
     except OSError as exc:

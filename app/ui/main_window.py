@@ -294,6 +294,12 @@ apply_theme(CURRENT_THEME)
 FONT = "Segoe UI"
 MONO = "Consolas"
 
+# Kill-switch for the custom borderless title bar (see MainWindow.__init__
+# and _build_custom_titlebar) -- flip to False to fall back to the native
+# Windows title bar + the older DWM-recolor attempt (_apply_dark_titlebar)
+# if the custom one ever misbehaves on a particular machine/Windows build.
+USE_CUSTOM_TITLEBAR = True
+
 # NOTE: the condition-row vocabulary (sources/operators/kind mapping) used
 # to live here, but now lives in app.ui.condition_builder alongside the
 # widget that uses it, so there's a single source of truth.
@@ -849,6 +855,31 @@ class MainWindow:
         self.root.geometry("1000x760")
         self.root.minsize(900, 680)
 
+        # UPGRADE (Sep 2026, "ugly blue banner" fix, final attempt): three
+        # earlier rounds of _apply_dark_titlebar() tried to recolor
+        # Windows' own native title bar via DWM and never actually stuck
+        # on this machine, despite running with no error every time --
+        # some Windows builds just don't honor DWMWA_USE_IMMERSIVE_DARK_MODE
+        # reliably, and there's no way to detect that failure from here to
+        # fall back cleanly. Removing the native title bar entirely and
+        # drawing this app's own (see _build_custom_titlebar) sidesteps the
+        # whole problem: there is no native caption left for Windows to
+        # paint blue. USE_CUSTOM_TITLEBAR is a single kill-switch (module
+        # constant, top of file) in case this ever needs to be turned off
+        # on a machine where it misbehaves -- everything downstream checks
+        # self._custom_titlebar_active, never the raw platform check alone.
+        self._custom_titlebar_active = False
+        if USE_CUSTOM_TITLEBAR and sys.platform == "win32":
+            try:
+                self.root.overrideredirect(True)
+                _keep_taskbar_icon(self.root)
+                self._custom_titlebar_active = True
+            except Exception:
+                self._custom_titlebar_active = False
+        self._drag_offset: tuple[int, int] | None = None
+        self._maximized = False
+        self._normal_geometry: str | None = None
+
         # State that must survive a theme toggle's full widget rebuild
         # (see _toggle_theme) lives directly on self, set once here --
         # _build_ui() only ever CREATES widgets, it never resets this.
@@ -891,6 +922,152 @@ class MainWindow:
         self._build_ui()
         self._show_page(current_page)
 
+    def _build_custom_titlebar(self):
+        """Replaces Windows' own native title bar -- the bright OS-accent
+        blue bar repeatedly reported as "ugly" -- with this app's own,
+        drawn in its own dark theme. Works together with
+        `self.root.overrideredirect(True)` (see __init__): once the
+        native caption is gone there is nothing left for Windows to paint
+        blue, so unlike the three earlier _apply_dark_titlebar() rounds,
+        this doesn't depend on a particular Windows build's DWM support
+        actually taking effect. Only ever called when
+        self._custom_titlebar_active is True (win32 + overrideredirect
+        succeeded) -- macOS/Linux, or a machine where overrideredirect
+        itself fails for any reason, keep the native title bar untouched.
+        """
+        bar = Frame(self.root, bg=PANEL_2, height=32)
+        bar.pack(side="top", fill="x")
+        bar.pack_propagate(False)
+        self._titlebar = bar
+
+        icon_shown = False
+        try:
+            icon_path = _asset_path("t58_mark_medium.png")
+            if icon_path.exists():
+                self._titlebar_icon = PhotoImage(file=str(icon_path))
+                factor = max(1, self._titlebar_icon.width() // 18)
+                if factor > 1:
+                    self._titlebar_icon = self._titlebar_icon.subsample(factor, factor)
+                Label(bar, image=self._titlebar_icon, bg=PANEL_2).pack(side="left", padx=(10, 6))
+                icon_shown = True
+        except Exception:
+            icon_shown = False
+
+        title_lbl = Label(
+            bar, text="T58 Trading — Prop Algo Backtester", bg=PANEL_2, fg=TEXT_MUTED,
+            font=_safe_font(9, "bold"),
+        )
+        title_lbl.pack(side="left", padx=(0 if icon_shown else 10, 0))
+
+        btn_row = Frame(bar, bg=PANEL_2)
+        btn_row.pack(side="right")
+
+        def _make_btn(symbol, hover_bg, hover_fg, command):
+            b = Label(
+                btn_row, text=symbol, bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(11),
+                width=4, cursor="hand2",
+            )
+            b.pack(side="left", fill="y")
+            b.bind("<Button-1>", lambda _e: command())
+            b.bind("<Enter>", lambda _e, w=b, hb=hover_bg, hf=hover_fg: w.configure(bg=hb, fg=hf))
+            b.bind("<Leave>", lambda _e, w=b: w.configure(bg=PANEL_2, fg=TEXT_MUTED))
+            return b
+
+        _make_btn("\u2013", PANEL_HOVER, TEXT, self._titlebar_minimize)
+        self._maximize_btn = _make_btn("\u25A1", PANEL_HOVER, TEXT, self._titlebar_toggle_maximize)
+        _make_btn("\u2715", RED, "#FFFFFF", self._titlebar_close)
+
+        # Dragging the bar (or its title text) moves the whole window --
+        # the one native-caption behavior a borderless window has to
+        # reimplement by hand.
+        def _start_drag(event):
+            self._drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
+
+        def _do_drag(event):
+            if self._maximized or self._drag_offset is None:
+                return
+            ox, oy = self._drag_offset
+            self.root.geometry(f"+{event.x_root - ox}+{event.y_root - oy}")
+
+        for widget in (bar, title_lbl):
+            widget.bind("<Button-1>", _start_drag)
+            widget.bind("<B1-Motion>", _do_drag)
+            widget.bind("<Double-Button-1>", lambda _e: self._titlebar_toggle_maximize())
+
+    def _titlebar_minimize(self):
+        """iconify() on an overrideredirect(True) window doesn't behave
+        like a normal minimize on Windows -- the window can vanish with
+        no reliable way to bring it back. Briefly restoring the native
+        frame for the iconify/deiconify round-trip, then reapplying
+        overrideredirect once Windows reports the window "normal" again
+        (via the <Map> event a restore fires), is the standard
+        workaround."""
+        try:
+            self.root.overrideredirect(False)
+            self.root.iconify()
+        except Exception:
+            return
+
+        def _watch(_event=None):
+            try:
+                if self.root.state() == "normal":
+                    self.root.overrideredirect(True)
+                    self.root.unbind("<Map>", bind_id)
+            except Exception:
+                pass
+
+        bind_id = self.root.bind("<Map>", _watch)
+
+    def _titlebar_toggle_maximize(self):
+        if self._maximized:
+            if self._normal_geometry:
+                self.root.geometry(self._normal_geometry)
+            self._maximized = False
+            if hasattr(self, "_maximize_btn"):
+                self._maximize_btn.configure(text="\u25A1")
+            return
+        self._normal_geometry = self.root.geometry()
+        area = _get_work_area()
+        if area:
+            x, y, w, h = area
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            self.root.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
+        self._maximized = True
+        if hasattr(self, "_maximize_btn"):
+            self._maximize_btn.configure(text="\u25A3")
+
+    def _titlebar_close(self):
+        self.root.destroy()
+
+    def _build_resize_grip(self):
+        """A borderless window (overrideredirect(True)) has no native
+        resize handles on its edges either -- this puts one small,
+        diagonal-cursor grip in the bottom-right corner (the same
+        minimalist approach apps like Discord/Spotify use for their own
+        custom title bars) rather than reimplementing all four edges plus
+        four corners for a desktop app that's rarely resized by dragging
+        in the first place."""
+        grip = Label(self.root, text="\u2599", bg=BG, fg=TEXT_DIM, cursor="size_nw_se", font=_safe_font(10))
+        grip.place(relx=1.0, rely=1.0, anchor="se", x=-2, y=-2)
+        grip.lift()
+        self._resize_grip = grip
+        self._resize_start = None
+
+        def _start(event):
+            self._resize_start = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
+
+        def _do(event):
+            if self._resize_start is None or self._maximized:
+                return
+            sx, sy, sw, sh = self._resize_start
+            nw = max(900, sw + (event.x_root - sx))
+            nh = max(680, sh + (event.y_root - sy))
+            self.root.geometry(f"{nw}x{nh}")
+
+        grip.bind("<Button-1>", _start)
+        grip.bind("<B1-Motion>", _do)
+
     def _try_start_heavy_job(self, name: str) -> bool:
         """Acquires app.orchestration.resource_guard.HEAVY_JOB_GUARD for
         one of the multi-worker-process jobs (Search Lab, Evolution Lab,
@@ -924,6 +1101,9 @@ class MainWindow:
         self.root.configure(bg=BG)
         self._configure_styles()
         self._pump_splash("Configuring theme...")
+
+        if self._custom_titlebar_active:
+            self._build_custom_titlebar()
 
         # Main application shell.
         shell = Frame(self.root, bg=BG)
@@ -1063,7 +1243,7 @@ class MainWindow:
             ("prop", "", "2  Prop-Firm Rules", self.tab_prop, NEON_CYAN),
             ("risk", "", "3  Risk & Execution", self.tab_risk, NEON_CYAN),
             ("run", "", "4  Run & Report", self.tab_run, NEON_CYAN),
-            ("payout", "", "Payout Probability", self.tab_payout, NEON_CYAN),
+            ("payout", "", "5  Payout Probability", self.tab_payout, NEON_CYAN),
 
             (None, None, "\u2462 OPTIMIZE", None, None),
             ("refine", "", "Iterative Refinement", self.tab_refine, BLUE),
@@ -1129,7 +1309,8 @@ class MainWindow:
 
         self._show_page("dashboard")
 
-    def _pump_splash(self, status: str) -> None:
+        if self._custom_titlebar_active:
+            self._build_resize_grip()
         """Best-effort: updates the boot splash's status text and pumps
         the Tk event loop once, so the splash's glow animation actually
         animates through _build_ui()'s otherwise fully synchronous,
@@ -1931,6 +2112,14 @@ class MainWindow:
             wraplength=190, justify="left", anchor="w",
         ).pack(anchor="w", fill="x", padx=14, pady=(0, 10))
         return card
+
+    def _evo_families_select_all(self):
+        for var in getattr(self, "evo_family_vars", {}).values():
+            var.set(True)
+
+    def _evo_families_clear_all(self):
+        for var in getattr(self, "evo_family_vars", {}).values():
+            var.set(False)
 
     def _ring_stat_card(self, parent, label, pct, accent):
         """A KPI tile that shows its value as a glowing ring instead of
@@ -8743,36 +8932,62 @@ class MainWindow:
         families_frame = Frame(cfg_section, bg=PANEL)
         families_frame.pack(fill="x", padx=18, pady=(4, 4))
         Label(
-            families_frame, text="Families to include (none selected = every family)",
+            families_frame, text="Families to include (none checked = every family)",
             bg=PANEL, fg=TEXT_MUTED, font=_safe_font(9),
         ).pack(anchor="w")
-        # height=6 -> 10 with a real scrollbar: the family list grew from 11
-        # to 21 (see app.search.strategy_space's "expansion round"), so a
-        # fixed 6-row box with no scrollbar at all used to hide most of the
-        # list with no way to reach it. columnconfigure/rowconfigure below
-        # let the listbox actually grow if the window itself is resized
-        # taller, same pattern as the leaderboard box further down.
-        families_list_frame = Frame(families_frame, bg=PANEL)
-        families_list_frame.pack(fill="both", expand=True, pady=(2, 0))
-        families_list_frame.columnconfigure(0, weight=1)
-        families_list_frame.rowconfigure(0, weight=1)
-        self.evo_families_listbox = Listbox(
-            families_list_frame, height=10, selectmode=EXTENDED, exportselection=False,
-            bg=PANEL_3, fg=TEXT, selectbackground=BORDER_LIGHT, selectforeground=METAL_BRIGHT,
-            activestyle="none", relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
-            font=(MONO, 9),
-        )
-        evo_families_scroll = ttk.Scrollbar(
-            families_list_frame, orient="vertical", command=self.evo_families_listbox.yview,
+        # UPGRADE (family deselect fix): this used to be a Listbox in
+        # EXTENDED select mode -- a plain click on ANY row, with no Ctrl
+        # held, replaces the entire selection with just that one row. That
+        # is exactly the reported "I clicked one by accident and lost my
+        # whole selection" trap: there was no way to remove a single row
+        # without also knowing the (undiscoverable, unlabeled) Ctrl+click
+        # toggle gesture. A checkbox per family has no such trap -- clicking
+        # one only ever flips that one family, on or off, leaving every
+        # other checkbox exactly as it was. SELECT ALL / CLEAR ALL below
+        # cover the "toggle everything at once" case the old Listbox's
+        # Ctrl+A / click-drag range-select used to.
+        families_toolbar = Frame(families_frame, bg=PANEL)
+        families_toolbar.pack(fill="x", pady=(2, 0))
+        self._button(families_toolbar, "SELECT ALL", self._evo_families_select_all).pack(side="left")
+        self._button(families_toolbar, "CLEAR ALL", self._evo_families_clear_all).pack(side="left", padx=(6, 0))
+
+        # height=6 -> 10-ish rows visible with a real scrollbar: the family
+        # list grew from 11 to 34 (see app.search.strategy_space's
+        # "expansion round"s), so a short fixed box with no scrollbar at
+        # all used to hide most of the list with no way to reach it.
+        families_list_frame = Frame(families_frame, bg=PANEL_3, highlightthickness=1, highlightbackground=BORDER)
+        families_list_frame.pack(fill="both", expand=True, pady=(4, 0))
+        families_canvas = Canvas(families_list_frame, bg=PANEL_3, highlightthickness=0, height=200)
+        families_scroll = ttk.Scrollbar(
+            families_list_frame, orient="vertical", command=families_canvas.yview,
             style="T58.Vertical.TScrollbar",
         )
-        self.evo_families_listbox.config(yscrollcommand=evo_families_scroll.set)
-        self.evo_families_listbox.grid(row=0, column=0, sticky="nsew")
-        evo_families_scroll.grid(row=0, column=1, sticky="ns")
-        self._bind_isolated_wheel(self.evo_families_listbox)
+        families_canvas.configure(yscrollcommand=families_scroll.set)
+        families_canvas.pack(side="left", fill="both", expand=True)
+        families_scroll.pack(side="right", fill="y")
+
+        families_inner = Frame(families_canvas, bg=PANEL_3)
+        families_window_id = families_canvas.create_window((0, 0), window=families_inner, anchor="nw")
+        families_inner.bind(
+            "<Configure>", lambda _e: families_canvas.configure(scrollregion=families_canvas.bbox("all")),
+        )
+        families_canvas.bind(
+            "<Configure>", lambda e: families_canvas.itemconfig(families_window_id, width=e.width),
+        )
+        self._bind_isolated_wheel(families_canvas)
+        self._bind_isolated_wheel(families_inner)
+
+        self.evo_family_vars: dict[str, BooleanVar] = {}
         try:
             for fam in sorted(list_families().keys()):
-                self.evo_families_listbox.insert(END, fam)
+                var = BooleanVar(value=False)
+                self.evo_family_vars[fam] = var
+                Checkbutton(
+                    families_inner, text=fam, variable=var, bg=PANEL_3, fg=TEXT,
+                    selectcolor=PANEL_2, activebackground=PANEL_3, activeforeground=TEXT,
+                    font=(MONO, 9), anchor="w", relief="flat", highlightthickness=0, padx=6, bd=0,
+                    cursor="hand2",
+                ).pack(fill="x", anchor="w")
         except Exception:
             pass
 
@@ -8960,7 +9175,7 @@ class MainWindow:
 
         risk = self._build_risk_config()
         rules = self._build_prop_rules()
-        selected_families = [self.evo_families_listbox.get(i) for i in self.evo_families_listbox.curselection()] or None
+        selected_families = [fam for fam, var in self.evo_family_vars.items() if var.get()] or None
         max_gen_raw = self.evo_max_generations.get_str().strip()
         max_generations = int(max_gen_raw) if max_gen_raw.isdigit() else None
         prefilter_bars_raw = self.evo_prefilter_max_bars.get_str().strip()
@@ -9961,7 +10176,8 @@ class MainWindow:
             else:
                 self._last_speedrun_html_path = None
                 self.open_speedrun_report_btn.config(state="disabled")
-                self.speedrun_verdict_label.config(text=f"No winner. {result.winner_reason}", fg=RED)
+                hint = "  See the log below for what to try next." if result.guidance else ""
+                self.speedrun_verdict_label.config(text=f"No winner. {result.winner_reason}{hint}", fg=RED)
 
             try:
                 self._refresh_dashboard()
@@ -11924,6 +12140,67 @@ def _hex_to_colorref(hex_color: str) -> int:
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return (b << 16) | (g << 8) | r
+
+
+def _keep_taskbar_icon(root: Tk) -> None:
+    """overrideredirect(True) (see MainWindow.__init__) removes the
+    window's native caption AND, as a side effect on Windows, its taskbar
+    button and Alt-Tab entry -- both are driven by the same WS_CAPTION /
+    WS_EX_APPWINDOW window styles Windows uses to draw the native title
+    bar this fix is deliberately removing. Forcing WS_EX_APPWINDOW back on
+    (and WS_EX_TOOLWINDOW off) via ctypes restores both, so the window is
+    borderless but still shows up in the taskbar exactly like any other
+    app -- no native caption required for either. The brief withdraw/
+    after(deiconify) at the end forces Windows to actually re-evaluate the
+    window's taskbar presence against the new style; SetWindowLongW alone
+    changes the style but doesn't reliably repaint/re-register it on an
+    already-created window.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        GWL_EXSTYLE = -20
+        WS_EX_APPWINDOW = 0x00040000
+        WS_EX_TOOLWINDOW = 0x00000080
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        root.withdraw()
+        root.after(10, root.deiconify)
+    except Exception:
+        pass  # cosmetic/UX-only -- never let this block launch
+
+
+def _get_work_area() -> tuple[int, int, int, int] | None:
+    """Returns (x, y, width, height) of the Windows work area -- the
+    screen minus the taskbar -- so MAXIMIZE on a borderless window (see
+    MainWindow._titlebar_toggle_maximize) doesn't cover the taskbar the
+    way a naive "fill winfo_screenwidth/height" would. Returns None on
+    non-Windows or on any failure; callers fall back to full screen size.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+            ]
+
+        rect = _RECT()
+        SPI_GETWORKAREA = 0x0030
+        ok = ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+        if not ok:
+            return None
+        return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+    except Exception:
+        return None
 
 
 def _apply_dark_titlebar(root: Tk) -> None:

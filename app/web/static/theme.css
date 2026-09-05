@@ -41,6 +41,24 @@
   --amber: #f0b429;
   --amber-rgb: 240, 180, 41;
 
+  /* ---- Decorative accent set -- matches the desktop app's own
+     NEON_CYAN/NEON_MAGENTA/NEON_LIME/NEON_VIOLET/NEON_AMBER/BLUE
+     palette exactly (see app/ui/main_window.py THEMES["dark"]), used
+     for the sidebar's per-section color-coding so the two builds read
+     as the same product rather than two different-looking apps. ---- */
+  --blue: #6fa8ff;
+  --blue-rgb: 111, 168, 255;
+  --neon-cyan: #00f0ff;
+  --neon-cyan-rgb: 0, 240, 255;
+  --neon-magenta: #ff2bd6;
+  --neon-magenta-rgb: 255, 43, 214;
+  --neon-lime: #b6ff3c;
+  --neon-lime-rgb: 182, 255, 60;
+  --neon-violet: #8a5cff;
+  --neon-violet-rgb: 138, 92, 255;
+  --neon-amber: #ffb547;
+  --neon-amber-rgb: 255, 181, 71;
+
   --success: var(--teal);
   --warning: var(--amber);
   --danger: var(--coral);
@@ -94,6 +112,23 @@ html[data-theme="light"] {
   --coral-rgb: 224, 69, 63;
   --amber: #b8790f;
   --amber-rgb: 184, 121, 15;
+
+  /* Same desaturated-for-light-backgrounds treatment as the desktop
+     app's own THEMES["light"] NEON_* set (see app/ui/main_window.py) --
+     same hue identity per accent, tuned for contrast on white/near-white
+     instead of matching the dark theme's raw brightness. */
+  --blue: #2c64d6;
+  --blue-rgb: 44, 100, 214;
+  --neon-cyan: #0089a3;
+  --neon-cyan-rgb: 0, 137, 163;
+  --neon-magenta: #b01c93;
+  --neon-magenta-rgb: 176, 28, 147;
+  --neon-lime: #5d8a12;
+  --neon-lime-rgb: 93, 138, 18;
+  --neon-violet: #6438c9;
+  --neon-violet-rgb: 100, 56, 201;
+  --neon-amber: #a66a16;
+  --neon-amber-rgb: 166, 106, 22;
 
   --shadow-sm: 0 1px 2px rgba(16, 24, 32, 0.08);
   --shadow-md: 0 6px 20px rgba(16, 24, 32, 0.10);
@@ -152,16 +187,33 @@ a { color: var(--teal); }
   display: flex; align-items: center; gap: 10px;
   padding: 8px 10px; border-radius: var(--radius-sm);
   color: var(--text-muted); text-decoration: none; font-size: 13px;
-  border: 1px solid transparent;
+  border: 1px solid transparent; border-left: 3px solid transparent;
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+  /* Defaults to teal (matches the plain OVERVIEW-section items, e.g.
+     Dashboard, that have no data-accent) -- a data-accent attribute
+     below overrides both of these per nav row, matching the desktop
+     sidebar's own per-section color-coded left accent strip
+     (app/ui/main_window.py's _draw_nav_accent). */
+  --item-accent: var(--teal);
+  --item-accent-rgb: var(--teal-rgb);
 }
+.t58-nav-item[data-accent="violet"]  { --item-accent: var(--neon-violet);   --item-accent-rgb: var(--neon-violet-rgb); }
+.t58-nav-item[data-accent="cyan"]    { --item-accent: var(--neon-cyan);     --item-accent-rgb: var(--neon-cyan-rgb); }
+.t58-nav-item[data-accent="blue"]    { --item-accent: var(--blue);         --item-accent-rgb: var(--blue-rgb); }
+.t58-nav-item[data-accent="amber"]   { --item-accent: var(--neon-amber);   --item-accent-rgb: var(--neon-amber-rgb); }
+.t58-nav-item[data-accent="magenta"] { --item-accent: var(--neon-magenta); --item-accent-rgb: var(--neon-magenta-rgb); }
+.t58-nav-item[data-accent="lime"]    { --item-accent: var(--neon-lime);    --item-accent-rgb: var(--neon-lime-rgb); }
+.t58-nav-item[data-accent="red"]     { --item-accent: var(--coral);       --item-accent-rgb: var(--coral-rgb); }
+.t58-nav-item[data-accent] { border-left-color: rgba(var(--item-accent-rgb), 0.55); }
 .t58-nav-item:hover { background: var(--panel-2); color: var(--text); }
 .t58-nav-item.active {
-  background: rgba(var(--teal-rgb), 0.10);
-  border-color: rgba(var(--teal-rgb), 0.35);
-  color: var(--teal);
-  text-shadow: 0 0 10px rgba(var(--teal-rgb), 0.35);
+  background: rgba(var(--item-accent-rgb), 0.10);
+  border-color: rgba(var(--item-accent-rgb), 0.35);
+  border-left-color: var(--item-accent);
+  color: var(--item-accent);
+  text-shadow: 0 0 10px rgba(var(--item-accent-rgb), 0.35);
 }
+.t58-nav-item .t58-nav-icon { color: var(--item-accent); }
 .t58-nav-item.top-level { margin-bottom: 4px; font-weight: 600; }
 .t58-nav-divider { height: 1px; background: var(--border); margin: 8px 6px; }
 .t58-nav-spacer { flex: 1; }

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>T58 — Phone Access</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="theme-color" content="#05070a">
+<link rel="stylesheet" href="/static/theme.css">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 10px; }
+  .qr-wrap { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 16px 0; }
+  .qr-wrap img { width: 220px; height: 220px; background: #fff; padding: 10px; border-radius: 10px; }
+  .url-box {
+    font-family: ui-monospace, Menlo, monospace; font-size: 15px; color: var(--teal);
+    background: var(--panel-3); border: 1px solid var(--border-light); border-radius: 8px;
+    padding: 10px 14px; word-break: break-all; text-align: center; width: 100%; max-width: 360px;
+  }
+  .warn { font-size: 13px; color: var(--amber, #f0b429); line-height: 1.5; margin-top: 6px; }
+  .note { font-size: 12px; color: #888; line-height: 1.6; }
+  ol { padding-left: 20px; color: #ccc; font-size: 13px; line-height: 1.7; }
+</style>
+</head>
+<body>
+{% set active_page = active_page|default('mobile_access') %}
+<div class="t58-shell">
+{% include '_sidebar.html' %}
+<div class="t58-main">
+<div class="t58-page-header">
+  <h1>Phone access</h1>
+  <p>Scan this on your phone (same Wi-Fi as this computer) to open the exact same app there —
+  no separate launcher, no install, this page always shows the current address.</p>
+</div>
+
+<div class="card">
+  <h2>Scan with your phone's camera</h2>
+  <div class="qr-wrap">
+    {% if qr_data_uri %}
+      <img src="{{ qr_data_uri }}" alt="QR code for {{ url }}">
+    {% else %}
+      <p class="warn">
+        Could not generate a QR code image on this machine (the optional
+        <code>qrcode</code> package may not be installed) — just type the address below
+        into your phone's browser instead.
+      </p>
+    {% endif %}
+    <div class="url-box">{{ url }}</div>
+  </div>
+  <p class="warn">
+    Type this EXACTLY as shown — it starts with <code>http</code>, not <code>https</code>
+    (this server doesn't speak HTTPS, so an <code>https://</code> address will always fail
+    to connect), and it is not <code>127.0.0.1</code> (that address only ever means
+    "this computer itself" — it's unreachable from any other device, including your phone).
+  </p>
+</div>
+
+<div class="card">
+  <h2>If your phone says "site can't be reached"</h2>
+  <ol>
+    <li>Make sure your phone and this computer are on the <strong>same Wi-Fi network</strong>
+      (not cellular data, and not a guest/isolated Wi-Fi network — common in coffee shops,
+      offices, and hotels).</li>
+    <li>On Windows, the first time this server runs, Windows should prompt
+      <em>"Allow python.exe to communicate on Private networks?"</em> — if you clicked
+      Cancel/No, or the prompt never appeared, open <strong>Windows Security → Firewall &amp;
+      network protection → Allow an app through firewall</strong> and enable Python for
+      Private networks.</li>
+    <li>Check your PC's network is set to <strong>Private</strong>, not <strong>Public</strong>,
+      in Windows network settings — Public profiles block incoming connections like this one
+      by default.</li>
+    <li>Temporarily disable any VPN on either device — a VPN can hide LAN traffic from the
+      other device even when both are on the same physical Wi-Fi.</li>
+  </ol>
+  <p class="note">
+    This computer needs to stay on and this app needs to keep running for your phone to
+    reach it — closing this browser tab doesn't stop the server, but closing the terminal
+    window it was started from does.
+  </p>
+</div>
+
+</div>
+</div>
+</body>
+</html>

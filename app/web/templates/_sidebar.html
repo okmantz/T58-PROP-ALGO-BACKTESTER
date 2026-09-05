@@ -11,6 +11,10 @@
     <span class="t58-nav-icon">&#8962;</span><span class="label">Dashboard</span>
   </a>
 
+  <a href="/mobile-access" class="t58-nav-item top-level {{ 'active' if active_page == 'mobile_access' else '' }}">
+    <span class="t58-nav-icon">&#128241;</span><span class="label">Phone access (QR code)</span>
+  </a>
+
   <div class="t58-nav-divider"></div>
   <div class="t58-nav-section-label">Strategy Lab</div>
 
@@ -20,102 +24,102 @@
   {% set validate_pages = ['validate_hub', 'wfo', 'wfga', 'cpcv', 'sensitivity', 'regime_matrix'] %}
   {% set champion_pages = ['family_diversity', 'ensemble', 'portfolio'] %}
 
-  <!-- (1) Create -->
+  <!-- (1) Create -- accent: violet, matches desktop's NEON_VIOLET for this section -->
   <details class="t58-nav-group" {{ 'open' if active_page in create_pages else '' }}>
     <summary><span class="t58-num">&#9312;</span> Create <span class="chev">&#9656;</span></summary>
     <div class="t58-nav-group-items">
-      <a href="/speed-run" class="t58-nav-item {{ 'active' if active_page == 'speed_run' else '' }}">
+      <a href="/speed-run" data-accent="violet" class="t58-nav-item {{ 'active' if active_page == 'speed_run' else '' }}">
         <span class="t58-nav-icon">&#9889;</span><span class="label">Speed run</span>
       </a>
-      <a href="/generate-strategies" class="t58-nav-item {{ 'active' if active_page == 'generate_strategies' else '' }}">
+      <a href="/generate-strategies" data-accent="violet" class="t58-nav-item {{ 'active' if active_page == 'generate_strategies' else '' }}">
         <span class="t58-nav-icon">&#10038;</span><span class="label">Generate strategies (AI)</span>
       </a>
-      <a href="/research-agent" class="t58-nav-item {{ 'active' if active_page == 'research_agent' else '' }}">
+      <a href="/research-agent" data-accent="violet" class="t58-nav-item {{ 'active' if active_page == 'research_agent' else '' }}">
         <span class="t58-nav-icon">&#9737;</span><span class="label">Research agent</span>
       </a>
     </div>
   </details>
 
-  <!-- (2) Test -->
+  <!-- (2) Test -- accent: cyan, matches desktop's NEON_CYAN for this section -->
   <details class="t58-nav-group" {{ 'open' if active_page in test_pages else '' }}>
     <summary><span class="t58-num">&#9313;</span> Test <span class="chev">&#9656;</span></summary>
     <div class="t58-nav-group-items">
-      <a href="/" class="t58-nav-item {{ 'active' if active_page == 'run' else '' }}">
+      <a href="/" data-accent="cyan" class="t58-nav-item {{ 'active' if active_page == 'run' else '' }}">
         <span class="t58-nav-icon">&#9654;</span><span class="label">Run &amp; report</span>
       </a>
-      <a href="/payout-probability" class="t58-nav-item {{ 'active' if active_page == 'payout_probability' else '' }}">
+      <a href="/payout-probability" data-accent="cyan" class="t58-nav-item {{ 'active' if active_page == 'payout_probability' else '' }}">
         <span class="t58-nav-icon">&#9878;</span><span class="label">Payout probability</span>
       </a>
     </div>
   </details>
 
-  <!-- (3) Optimize -->
+  <!-- (3) Optimize -- accent: blue, matches desktop's BLUE for this section -->
   <details class="t58-nav-group" {{ 'open' if active_page in optimize_pages else '' }}>
     <summary><span class="t58-num">&#9314;</span> Optimize <span class="chev">&#9656;</span></summary>
     <div class="t58-nav-group-items">
-      <a href="/optimize" class="t58-nav-item {{ 'active' if active_page == 'optimize_hub' else '' }}" style="font-weight:600;">
+      <a href="/optimize" data-accent="blue" class="t58-nav-item {{ 'active' if active_page == 'optimize_hub' else '' }}" style="font-weight:600;">
         <span class="t58-nav-icon">&#8981;</span><span class="label">Overview / picker</span>
       </a>
-      <a href="/search" class="t58-nav-item {{ 'active' if active_page == 'search' else '' }}">
+      <a href="/search" data-accent="blue" class="t58-nav-item {{ 'active' if active_page == 'search' else '' }}">
         <span class="t58-nav-icon">&#9636;</span><span class="label">Search lab</span>
       </a>
-      <a href="/refine" class="t58-nav-item {{ 'active' if active_page == 'refine' else '' }}">
+      <a href="/refine" data-accent="blue" class="t58-nav-item {{ 'active' if active_page == 'refine' else '' }}">
         <span class="t58-nav-icon">&#9851;</span><span class="label">Iterative refinement</span>
       </a>
-      <a href="/full-pipeline" class="t58-nav-item {{ 'active' if active_page == 'full_pipeline' else '' }}">
+      <a href="/full-pipeline" data-accent="blue" class="t58-nav-item {{ 'active' if active_page == 'full_pipeline' else '' }}">
         <span class="t58-nav-icon">&#9889;</span><span class="label">Full pipeline</span>
       </a>
-      <a href="/quick-optimize" class="t58-nav-item {{ 'active' if active_page == 'quick_optimize' else '' }}">
+      <a href="/quick-optimize" data-accent="blue" class="t58-nav-item {{ 'active' if active_page == 'quick_optimize' else '' }}">
         <span class="t58-nav-icon">&#9889;</span><span class="label">Quick optimize</span>
       </a>
-      <a href="/multi-objective" class="t58-nav-item {{ 'active' if active_page == 'multi_objective' else '' }}">
+      <a href="/multi-objective" data-accent="blue" class="t58-nav-item {{ 'active' if active_page == 'multi_objective' else '' }}">
         <span class="t58-nav-icon">&#10022;</span><span class="label">Multi-objective</span>
       </a>
-      <a href="/evolution" class="t58-nav-item {{ 'active' if active_page == 'evolution' else '' }}">
+      <a href="/evolution" data-accent="blue" class="t58-nav-item {{ 'active' if active_page == 'evolution' else '' }}">
         <span class="t58-nav-icon">&#9860;</span><span class="label">Evolution lab (GA)</span>
       </a>
     </div>
   </details>
 
-  <!-- (4) Validate -->
+  <!-- (4) Validate -- accent: amber, matches desktop's NEON_AMBER for this section -->
   <details class="t58-nav-group" {{ 'open' if active_page in validate_pages else '' }}>
     <summary><span class="t58-num">&#9315;</span> Validate <span class="chev">&#9656;</span></summary>
     <div class="t58-nav-group-items">
-      <a href="/validate" class="t58-nav-item {{ 'active' if active_page == 'validate_hub' else '' }}" style="font-weight:600;">
+      <a href="/validate" data-accent="amber" class="t58-nav-item {{ 'active' if active_page == 'validate_hub' else '' }}" style="font-weight:600;">
         <span class="t58-nav-icon">&#8981;</span><span class="label">Overview / checklist</span>
       </a>
-      <a href="/walk-forward-opt" class="t58-nav-item {{ 'active' if active_page == 'wfo' else '' }}">
+      <a href="/walk-forward-opt" data-accent="amber" class="t58-nav-item {{ 'active' if active_page == 'wfo' else '' }}">
         <span class="t58-nav-icon">&#8635;</span><span class="label">Walk-forward opt</span>
       </a>
-      <a href="/walk-forward-ga" class="t58-nav-item {{ 'active' if active_page == 'wfga' else '' }}">
+      <a href="/walk-forward-ga" data-accent="amber" class="t58-nav-item {{ 'active' if active_page == 'wfga' else '' }}">
         <span class="t58-nav-icon">&#8635;</span><span class="label">Walk-forward GA</span>
       </a>
-      <a href="/cpcv" class="t58-nav-item {{ 'active' if active_page == 'cpcv' else '' }}">
+      <a href="/cpcv" data-accent="amber" class="t58-nav-item {{ 'active' if active_page == 'cpcv' else '' }}">
         <span class="t58-nav-icon">&#8862;</span><span class="label">CPCV</span>
       </a>
-      <a href="/sensitivity" class="t58-nav-item {{ 'active' if active_page == 'sensitivity' else '' }}">
+      <a href="/sensitivity" data-accent="amber" class="t58-nav-item {{ 'active' if active_page == 'sensitivity' else '' }}">
         <span class="t58-nav-icon">&#8862;</span><span class="label">Sensitivity</span>
       </a>
-      <a href="/regime-matrix" class="t58-nav-item {{ 'active' if active_page == 'regime_matrix' else '' }}">
+      <a href="/regime-matrix" data-accent="amber" class="t58-nav-item {{ 'active' if active_page == 'regime_matrix' else '' }}">
         <span class="t58-nav-icon">&#9737;</span><span class="label">Regime survival matrix</span>
       </a>
-      <a href="/payout-probability" class="t58-nav-item {{ 'active' if active_page == 'payout_probability' else '' }}">
+      <a href="/payout-probability" data-accent="amber" class="t58-nav-item {{ 'active' if active_page == 'payout_probability' else '' }}">
         <span class="t58-nav-icon">&#9878;</span><span class="label">Monte Carlo</span>
       </a>
     </div>
   </details>
 
-  <!-- (5) Champion -->
+  <!-- (5) Champion -- accent: magenta, matches desktop's NEON_MAGENTA for this section -->
   <details class="t58-nav-group" {{ 'open' if active_page in champion_pages else '' }}>
     <summary><span class="t58-num">&#9316;</span> Champion <span class="chev">&#9656;</span></summary>
     <div class="t58-nav-group-items">
-      <a href="/portfolio" class="t58-nav-item {{ 'active' if active_page == 'portfolio' else '' }}">
+      <a href="/portfolio" data-accent="magenta" class="t58-nav-item {{ 'active' if active_page == 'portfolio' else '' }}">
         <span class="t58-nav-icon">&#9707;</span><span class="label">Multi-asset portfolio</span>
       </a>
-      <a href="/ensemble" class="t58-nav-item {{ 'active' if active_page == 'ensemble' else '' }}">
+      <a href="/ensemble" data-accent="magenta" class="t58-nav-item {{ 'active' if active_page == 'ensemble' else '' }}">
         <span class="t58-nav-icon">&#9707;</span><span class="label">Multi-strategy ensemble</span>
       </a>
-      <a href="/family-diversity" class="t58-nav-item {{ 'active' if active_page == 'family_diversity' else '' }}">
+      <a href="/family-diversity" data-accent="magenta" class="t58-nav-item {{ 'active' if active_page == 'family_diversity' else '' }}">
         <span class="t58-nav-icon">&#10038;</span><span class="label">Family diversity</span>
       </a>
     </div>
@@ -124,13 +128,15 @@
   <div class="t58-nav-divider"></div>
   <div class="t58-nav-section-label">&#9317; Deployment</div>
 
-  <a href="/forward-test" class="t58-nav-item {{ 'active' if active_page == 'forward_test' else '' }}">
+  <!-- Deployment row accents match desktop's per-row mix exactly:
+       forward test = NEON_LIME, deploy live = RED, monitor = NEON_CYAN. -->
+  <a href="/forward-test" data-accent="lime" class="t58-nav-item {{ 'active' if active_page == 'forward_test' else '' }}">
     <span class="t58-nav-icon">&#9711;</span><span class="label">Forward test (MT5)</span>
   </a>
-  <a href="/deploy-live" class="t58-nav-item {{ 'active' if active_page == 'deploy_live' else '' }}">
+  <a href="/deploy-live" data-accent="red" class="t58-nav-item {{ 'active' if active_page == 'deploy_live' else '' }}">
     <span class="t58-nav-icon">&#9888;</span><span class="label">Deploy live</span>
   </a>
-  <a href="/live-market" class="t58-nav-item {{ 'active' if active_page == 'live_market' else '' }}">
+  <a href="/live-market" data-accent="cyan" class="t58-nav-item {{ 'active' if active_page == 'live_market' else '' }}">
     <span class="t58-nav-icon">&#9679;</span><span class="label">Monitor (live market)</span>
   </a>
 

@@ -27,8 +27,34 @@ import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
 from app.web.network_info import PORT, get_lan_ip, print_startup_banner, qr_code_file
+
+
+def _qr_image_path(url: str) -> Path | None:
+    """Generate a QR code image for the given URL and save it to the home directory.
+    
+    Returns the path to the generated PNG file, or None if generation fails.
+    This is a best-effort function -- any failure degrades gracefully to None
+    so the launcher can still start the server even if qrcode/Pillow is missing
+    or broken.
+    """
+    try:
+        import qrcode
+        
+        qr = qrcode.QRCode(box_size=10, border=2)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image()
+        
+        out_path = Path.home() / "qr_code.png"
+        img.save(out_path)
+        return out_path
+    except Exception:
+        # Best-effort: any failure in optional qrcode/Pillow install
+        # degrades to None, never raises
+        return None
 
 
 def _open_qr_image(path) -> None:

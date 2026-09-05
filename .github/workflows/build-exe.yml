@@ -82,7 +82,7 @@ jobs:
             --clean `
             --onefile `
             --windowed `
-            --name "T58-Prop-Algo-Backtester" `
+            --name "T58-Quant-Algo-Backtester" `
             --paths . `
             --hidden-import "app" `
             --hidden-import "app.ui" `
@@ -135,12 +135,12 @@ jobs:
         run: |
           Write-Host "=== VERIFYING EXE ==="
 
-          if (-not (Test-Path "dist\T58-Prop-Algo-Backtester.exe")) {
+          if (-not (Test-Path "dist\T58-Quant-Algo-Backtester.exe")) {
             Write-Error "Executable was not created."
             exit 1
           }
 
-          $exe = Get-Item "dist\T58-Prop-Algo-Backtester.exe"
+          $exe = Get-Item "dist\T58-Quant-Algo-Backtester.exe"
 
           Write-Host "EXE CREATED:"
           Write-Host "Path: $($exe.FullName)"
@@ -160,8 +160,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "release\strategies" | Out-Null
 
           Copy-Item `
-            "dist\T58-Prop-Algo-Backtester.exe" `
-            "release\T58-Prop-Algo-Backtester.exe" `
+            "dist\T58-Quant-Algo-Backtester.exe" `
+            "release\T58-Quant-Algo-Backtester.exe" `
             -Force
 
           if (Test-Path "data\examples") {
@@ -243,13 +243,13 @@ jobs:
         run: |
           Compress-Archive `
             -Path "release\*" `
-            -DestinationPath "T58-Prop-Algo-Backtester-Windows.zip" `
+            -DestinationPath "T58-Quant-Algo-Backtester-Windows.zip" `
             -Force
 
           Write-Host ""
           Write-Host "=== ZIP CREATED ==="
 
-          $zip = Get-Item "T58-Prop-Algo-Backtester-Windows.zip"
+          $zip = Get-Item "T58-Quant-Algo-Backtester-Windows.zip"
 
           Write-Host "Path: $($zip.FullName)"
           Write-Host "Size: $($zip.Length) bytes"
@@ -257,12 +257,12 @@ jobs:
       - name: Upload Windows application
         uses: actions/upload-artifact@v4
         with:
-          name: T58-Prop-Algo-Backtester-Windows
-          path: T58-Prop-Algo-Backtester-Windows.zip
+          name: T58-Quant-Algo-Backtester-Windows
+          path: T58-Quant-Algo-Backtester-Windows.zip
           if-no-files-found: error
 
       - name: Attach Windows application to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: T58-Prop-Algo-Backtester-Windows.zip
+          files: T58-Quant-Algo-Backtester-Windows.zip

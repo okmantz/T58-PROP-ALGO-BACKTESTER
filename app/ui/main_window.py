@@ -1077,16 +1077,17 @@ class MainWindow:
             ("cpcv", "", "CPCV / PBO", self.tab_cpcv, NEON_AMBER),
             ("sensitivity", "", "Sensitivity", self.tab_sensitivity, NEON_AMBER),
             ("regimematrix", "", "Regime Survival Matrix", self.tab_regime_matrix, NEON_AMBER),
+            ("montecarlo", "", "Monte Carlo", self.tab_payout, NEON_AMBER),
 
             (None, None, "\u2464 CHAMPION", None, None),
             ("portfolio", "", "Multi-Asset Portfolio", self.tab_portfolio, NEON_MAGENTA),
             ("ensemble", "", "Multi-Strategy Ensemble", self.tab_ensemble, NEON_MAGENTA),
             ("familydiversity", "", "Family Diversity", self.tab_family_diversity, NEON_MAGENTA),
 
-            (None, None, "DEPLOYMENT", None, None),
-            ("forwardtest", "", "\u2465 Forward Test (MT5)", self.tab_forwardtest, NEON_LIME),
-            ("deploylive", "", "\u2466 Deploy Live", self.tab_deploylive, RED),
-            ("livemarket", "", "\u2467 Monitor (Live Market)", self.tab_livemarket, NEON_CYAN),
+            (None, None, "\u2465 DEPLOYMENT", None, None),
+            ("forwardtest", "", "Forward Test (MT5)", self.tab_forwardtest, NEON_LIME),
+            ("deploylive", "", "Deploy Live", self.tab_deploylive, RED),
+            ("livemarket", "", "Monitor (Live Market)", self.tab_livemarket, NEON_CYAN),
         ]
         self._tab_frame_by_key = {k: frame for k, _icon, _label, frame, _color in self._nav_items if k}
         self._nav_buttons: dict[str, Label] = {}
@@ -1144,6 +1145,19 @@ class MainWindow:
         except Exception:
             pass
 
+    def _group_header_for_key(self, key: str) -> str | None:
+        """Which section-divider label a given nav key falls under, e.g.
+        "cpcv" -> "\u2463 VALIDATE". Used so switching to a tab always
+        auto-expands the group it lives in, even if that group is
+        currently collapsed."""
+        current_header = None
+        for k, _icon, lbl_text, _frame, _color in self._nav_items:
+            if k is None:
+                current_header = lbl_text
+            elif k == key:
+                return current_header
+        return None
+
     def _build_sidebar_nav(self):
         def _wheel(event):
             delta = -1 if getattr(event, "delta", 0) > 0 else 1
@@ -1154,18 +1168,61 @@ class MainWindow:
             self._sidebar_canvas.yview_scroll(delta, "units")
             return "break"  # see the matching note on _sidebar_wheel above
 
+        # UPGRADE (Sep 2026 UI pass, round 2): the sidebar groups are now
+        # real collapsible dropdowns -- clicking a section header toggles
+        # it, and only the group containing whichever tab is currently
+        # active starts open, so opening the app doesn't dump all ~30 tabs
+        # on screen at once. "OVERVIEW" (Dashboard / User Manual) is the
+        # one section that's always open -- it's only 2 items and one of
+        # them (Dashboard) is the app's home page.
+        if not hasattr(self, "_collapsed_groups"):
+            self._collapsed_groups = {
+                lbl_text for k, _icon, lbl_text, _frame, _color in self._nav_items
+                if k is None and lbl_text != "OVERVIEW"
+            }
+            active_group = self._group_header_for_key(getattr(self, "active_page", "dashboard"))
+            if active_group:
+                self._collapsed_groups.discard(active_group)
+
+        # Rebuilding from scratch on every toggle is simple and cheap here
+        # (~30 widgets total) -- far less code/risk than trying to
+        # incrementally pack/unpack a subset of already-built rows.
+        for w in list(self._sidebar_inner.winfo_children()):
+            w.destroy()
+        self._nav_buttons: dict[str, Label] = {}
+
         first_section = True
+        section_collapsed = False
         for key, _icon, label, frame, color in self._nav_items:
             if key is None:
-                # A named section header (small-caps, letter-spaced, muted)
-                # rather than a bare line -- every group is labeled, which
-                # is what makes a long list like this read as organized
-                # sections instead of one long undifferentiated list.
-                Label(
-                    self._sidebar_inner, text=" ".join(label.upper()), bg=PANEL, fg=TEXT_DIM,
-                    font=_safe_font(7, "bold"), anchor="w",
-                ).pack(fill="x", padx=16, pady=(14 if not first_section else 4, 4))
+                # A named, clickable section header (small-caps,
+                # letter-spaced, muted) with a chevron showing open/closed
+                # state -- every group is both labeled AND a real dropdown,
+                # which is what actually makes a long list like this read
+                # as organized instead of messy.
+                collapsible = label != "OVERVIEW"
+                section_collapsed = collapsible and label in self._collapsed_groups
+                header_row = Frame(self._sidebar_inner, bg=PANEL, cursor=("hand2" if collapsible else "arrow"))
+                header_row.pack(fill="x", pady=(14 if not first_section else 4, 4))
+                chev = "\u25b8" if section_collapsed else "\u25be"
+                header_text = " ".join(label.upper()) + ("   " + chev if collapsible else "")
+                header_lbl = Label(
+                    header_row, text=header_text, bg=PANEL, fg=TEXT_DIM,
+                    font=_safe_font(7, "bold"), anchor="w", padx=16,
+                )
+                header_lbl.pack(fill="x")
+                if collapsible:
+                    def _toggle(_e=None, name=label):
+                        if name in self._collapsed_groups:
+                            self._collapsed_groups.discard(name)
+                        else:
+                            self._collapsed_groups.add(name)
+                        self._build_sidebar_nav()
+                    header_row.bind("<Button-1>", _toggle)
+                    header_lbl.bind("<Button-1>", _toggle)
                 first_section = False
+                continue
+            if section_collapsed:
                 continue
             row = Frame(self._sidebar_inner, bg=PANEL, cursor="hand2")
             row.pack(fill="x", padx=8, pady=1)
@@ -1242,6 +1299,10 @@ class MainWindow:
         self._draw_nav_accent(key, "hover" if entering else "idle")
 
     def _show_page(self, key: str):
+        group = self._group_header_for_key(key)
+        if group and group in getattr(self, "_collapsed_groups", set()):
+            self._collapsed_groups.discard(group)
+            self._build_sidebar_nav()
         self.active_page = key
         for k, (row, accent, lbl, color) in self._nav_buttons.items():
             active = k == key
@@ -3576,6 +3637,33 @@ class MainWindow:
 
         self._strategy_library_items: list = []
         self._refresh_strategy_library()
+
+        # ------------------------------------------------------------
+        # Manual Strategy Builder -- a clear, visible section start so
+        # it doesn't just blend into the library controls above it. Only
+        # relevant when MANUAL mode is selected above (Python/PineScript/
+        # MQL5 users can ignore everything below this point).
+        # ------------------------------------------------------------
+        manual_header = Frame(f, bg=BG)
+        manual_header.pack(fill="x", padx=24, pady=(22, 4))
+        manual_eyebrow_row = Frame(manual_header, bg=BG)
+        manual_eyebrow_row.pack(anchor="w")
+        Frame(manual_eyebrow_row, bg=NEON_VIOLET, width=14, height=2).pack(side="left", pady=(4, 0))
+        Label(
+            manual_eyebrow_row, text="CREATE / NO-CODE BUILDER", bg=BG, fg=NEON_VIOLET,
+            font=_safe_font(8, "bold"),
+        ).pack(side="left", padx=(7, 0))
+        Label(
+            manual_header, text="Manual Strategy Builder", bg=BG, fg=METAL_BRIGHT,
+            font=_safe_font(16, "bold"),
+        ).pack(anchor="w", pady=(5, 3))
+        Label(
+            manual_header,
+            text="Only used when MANUAL is the selected strategy source above -- define indicators and "
+                 "entry/exit rules visually here, no code required. Python / PineScript / MQL5 users can "
+                 "skip everything below.",
+            bg=BG, fg=TEXT_DIM, font=_safe_font(8), wraplength=820, justify="left",
+        ).pack(anchor="w", pady=(0, 4))
 
         # ------------------------------------------------------------
         # 24.1  Strategy information
@@ -6807,6 +6895,8 @@ class MainWindow:
         self._bind_isolated_wheel(self.rm_output)
 
     def _regime_matrix_clicked(self):
+        if not self._try_start_heavy_job(JOB_REGIME_MATRIX):
+            return
         self.rm_output.delete("1.0", END)
         threading.Thread(target=self._run_regime_matrix_pipeline, daemon=True).start()
 
@@ -6851,6 +6941,8 @@ class MainWindow:
             log(f"Strategy error: {exc}")
         except Exception:
             log("Unexpected error:\n" + traceback.format_exc())
+        finally:
+            self._release_heavy_job(JOB_REGIME_MATRIX)
 
     # -----------------------------------------------------------------------
     # Strategy Family Diversity -- reads the most recently completed Search
@@ -7002,6 +7094,8 @@ class MainWindow:
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
             return
+        if not self._try_start_heavy_job(JOB_WFO):
+            return
         self.wfo_output.delete("1.0", END)
         self.wfo_progress.start(10)
         threading.Thread(target=self._wfo_run_pipeline, daemon=True).start()
@@ -7048,6 +7142,7 @@ class MainWindow:
             self._log_wfo("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.wfo_progress.stop()
+            self._release_heavy_job(JOB_WFO)
 
     # -----------------------------------------------------------------------
     # Tab 9 — CPCV / PBO
@@ -7150,6 +7245,8 @@ class MainWindow:
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
             return
+        if not self._try_start_heavy_job(JOB_CPCV):
+            return
         self.cpcv_output.delete("1.0", END)
         self.cpcv_progress.start(10)
         threading.Thread(target=self._cpcv_run_pipeline, daemon=True).start()
@@ -7189,10 +7286,13 @@ class MainWindow:
             self._log_cpcv("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.cpcv_progress.stop()
+            self._release_heavy_job(JOB_CPCV)
 
     def _pbo_run_clicked(self):
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
+            return
+        if not self._try_start_heavy_job(JOB_CPCV):
             return
         self.cpcv_output.delete("1.0", END)
         self.cpcv_progress.start(10)
@@ -7256,6 +7356,7 @@ class MainWindow:
             self._log_cpcv("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.cpcv_progress.stop()
+            self._release_heavy_job(JOB_CPCV)
 
     # -----------------------------------------------------------------------
     # Tab 10 — Parameter Sensitivity
@@ -7362,6 +7463,8 @@ class MainWindow:
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
             return
+        if not self._try_start_heavy_job(JOB_SENSITIVITY):
+            return
         self.sens_output.delete("1.0", END)
         self.sens_progress.start(10)
         threading.Thread(target=self._sens_run_pipeline, daemon=True).start()
@@ -7406,6 +7509,7 @@ class MainWindow:
             self._log_sens("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.sens_progress.stop()
+            self._release_heavy_job(JOB_SENSITIVITY)
 
     # -----------------------------------------------------------------------
     # Tab 11 — Multi-Asset Portfolio
@@ -7738,6 +7842,8 @@ class MainWindow:
         if len(selected) < 2:
             messagebox.showwarning("Not enough objectives", "Select at least 2 objectives.")
             return
+        if not self._try_start_heavy_job(JOB_MULTI_OBJECTIVE):
+            return
         self.multiobj_output.delete("1.0", END)
         self.multiobj_progress.start(10)
         threading.Thread(target=self._multiobj_run_pipeline, args=(selected,), daemon=True).start()
@@ -7775,6 +7881,7 @@ class MainWindow:
             self._log_multiobj("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.multiobj_progress.stop()
+            self._release_heavy_job(JOB_MULTI_OBJECTIVE)
 
     # -----------------------------------------------------------------------
     # Tab 13 — Walk-Forward-Aware GA
@@ -7851,6 +7958,8 @@ class MainWindow:
         if not self.csv_paths:
             messagebox.showwarning("Missing data", "Please select a market data CSV in Step 1.")
             return
+        if not self._try_start_heavy_job(JOB_WFGA):
+            return
         self.wfga_output.delete("1.0", END)
         self.wfga_progress.start(10)
         threading.Thread(target=self._wfga_run_pipeline, daemon=True).start()
@@ -7896,6 +8005,7 @@ class MainWindow:
             self._log_wfga("\nUnexpected error:\n" + traceback.format_exc())
         finally:
             self.wfga_progress.stop()
+            self._release_heavy_job(JOB_WFGA)
 
 
     # -----------------------------------------------------------------------
@@ -11584,6 +11694,31 @@ def _apply_dark_titlebar(root: Tk) -> None:
             )
         except Exception:
             pass  # DWMWA_CAPTION_COLOR unsupported on this Windows build -- dark mode above still applied
+
+        # UPGRADE (Sep 2026 UI pass, round 3): the two DwmSetWindowAttribute
+        # calls above take effect immediately -- but only in the sense that
+        # DWM now *knows* the new values. It does not automatically repaint
+        # the already-drawn caption with them; on a window that's already
+        # on screen, the title bar visibly stays exactly as it was until
+        # something else (a resize, a move, minimize/restore) forces
+        # Windows to redraw the non-client frame. That's the actual bug
+        # behind "the code runs with no error, but the title bar is still
+        # blue" -- SetWindowPos with SWP_FRAMECHANGED is the standard way
+        # to force that redraw immediately without actually moving or
+        # resizing the window (all four SWP_NO* flags below keep its
+        # position/size/z-order/activation exactly as they were).
+        try:
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+        except Exception:
+            pass
     except Exception:
         pass  # cosmetic only -- never let this block launch or a theme toggle
 
@@ -11593,7 +11728,6 @@ def launch():
     root = Tk()
     _apply_tk_scaling(root)
     _force_dwm_composition(root)
-    _apply_dark_titlebar(root)
     root.withdraw()  # hidden while the real window builds, splash covers that gap
     splash = None
     try:
@@ -11615,6 +11749,19 @@ def launch():
     try:
         root.lift()
         root.focus_force()
+    except Exception:
+        pass
+    # UPGRADE (Sep 2026 UI pass, round 3): this used to run BEFORE
+    # root.withdraw() above -- i.e. on a window that wasn't even visible
+    # yet, then got hidden immediately after. DWM had nothing on screen to
+    # recolor at that point, and deiconify() later doesn't retroactively
+    # apply it. Recoloring the title bar only works reliably once the
+    # window is actually shown, so this now runs after deiconify()/lift(),
+    # on the real, visible window -- that's what was actually behind the
+    # title bar staying Windows' default blue despite this code running
+    # with no error.
+    try:
+        _apply_dark_titlebar(root)
     except Exception:
         pass
     root.mainloop()

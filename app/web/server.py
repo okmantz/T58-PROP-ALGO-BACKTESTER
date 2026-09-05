@@ -62,6 +62,7 @@ from app.orchestration.full_pipeline import FullPipelineConfig, run_full_pipelin
 from app.orchestration.quick_optimize import QuickOptimizeConfig, run_quick_optimize
 from app.orchestration.resource_guard import (
     HEAVY_JOB_GUARD, JOB_EVOLUTION_LAB, JOB_FULL_PIPELINE, JOB_SEARCH_LAB, JOB_SPEED_RUN,
+    JOB_WFO, JOB_WFGA, JOB_CPCV, JOB_SENSITIVITY, JOB_MULTI_OBJECTIVE, JOB_REGIME_MATRIX,
 )
 from app.orchestration.speed_run import SpeedRunConfig, SpeedRunResult, run_speed_run
 from app.orchestration.speed_run import _rank_key as _speedrun_rank_key
@@ -234,6 +235,26 @@ def build_strategy_from_code(mode: str, code: str):
     if mode == "mql5":
         return MQL5Strategy(code)
     raise StrategyError(f"Unknown strategy mode: {mode}")
+
+
+def _try_acquire_heavy_job(job_name: str, template_name: str, **template_ctx):
+    """Shared guard check for every long-running background tool (not just
+    the four ProcessPoolExecutor-based ones) -- see resource_guard.py's
+    module docstring for why WFO/WFGA/CPCV/Sensitivity/Multi-Objective/
+    Regime Matrix are included here too. Returns None if the job may
+    proceed; otherwise a ready-to-return (response, 409) tuple refusing it,
+    rendered with the same template/context the caller's own error paths
+    already use, so the person sees an ordinary in-page error rather than a
+    generic 409 page."""
+    if HEAVY_JOB_GUARD.try_acquire(job_name):
+        return None
+    msg = (
+        f"{HEAVY_JOB_GUARD.active_name} is already running on this server. Running more than one "
+        f"long, heavy job at the same time can exhaust available memory or CPU and is a common "
+        f"cause of the app becoming unresponsive or crashing. Wait for it to finish (or stop it) "
+        f"before starting {job_name}."
+    )
+    return render_template(template_name, error=msg, **template_ctx), 409
 
 
 def _build_strategy(mode: str, form, files):
@@ -1535,6 +1556,8 @@ def _run_wfo_job(
             job = _WFO_JOBS[job_id]
             job["done"] = True
             job["error"] = f"Unexpected error: {exc}"
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_WFO)
 
 
 @app.route("/walk-forward-opt")
@@ -1548,9 +1571,16 @@ def wfo_form():
 @app.route("/walk-forward-opt/start", methods=["POST"])
 def wfo_start():
     form = request.form
+    guard_resp = _try_acquire_heavy_job(
+        JOB_WFO, "wfo.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        fitness_metrics=FITNESS_METRICS,
+    )
+    if guard_resp:
+        return guard_resp
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_WFO)
             return render_template("wfo.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
 
         strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
@@ -1596,8 +1626,10 @@ def wfo_start():
         thread.start()
         return redirect(url_for("wfo_job", job_id=job_id))
     except (StrategyError, RefinementError) as exc:
+        HEAVY_JOB_GUARD.release(JOB_WFO)
         return render_template("wfo.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_WFO)
         return render_template("wfo.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 500
 
 
@@ -1672,6 +1704,8 @@ def _run_mo_job(job_id: str, df, strategy, risk: RiskConfig, rules: PropRules, m
             job = _MO_JOBS[job_id]
             job["done"] = True
             job["error"] = f"Unexpected error: {exc}"
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_MULTI_OBJECTIVE)
 
 
 @app.route("/multi-objective")
@@ -1685,9 +1719,17 @@ def mo_form():
 @app.route("/multi-objective/start", methods=["POST"])
 def mo_start():
     form = request.form
+    guard_resp = _try_acquire_heavy_job(
+        JOB_MULTI_OBJECTIVE, "multi_objective.html", stored_datasets=list_stored_datasets(),
+        saved_strategies_json=_saved_strategies_json(), all_objectives=sorted(OBJECTIVE_DIRECTIONS),
+        default_objectives=DEFAULT_OBJECTIVES,
+    )
+    if guard_resp:
+        return guard_resp
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_MULTI_OBJECTIVE)
             return render_template("multi_objective.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), all_objectives=sorted(OBJECTIVE_DIRECTIONS), default_objectives=DEFAULT_OBJECTIVES), 400
 
         strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
@@ -1726,8 +1768,10 @@ def mo_start():
         thread.start()
         return redirect(url_for("mo_job", job_id=job_id))
     except (StrategyError, RefinementError) as exc:
+        HEAVY_JOB_GUARD.release(JOB_MULTI_OBJECTIVE)
         return render_template("multi_objective.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), all_objectives=sorted(OBJECTIVE_DIRECTIONS), default_objectives=DEFAULT_OBJECTIVES), 400
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_MULTI_OBJECTIVE)
         return render_template("multi_objective.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), all_objectives=sorted(OBJECTIVE_DIRECTIONS), default_objectives=DEFAULT_OBJECTIVES), 500
 
 
@@ -1817,6 +1861,8 @@ def _run_wfga_job(
             job = _WFGA_JOBS[job_id]
             job["done"] = True
             job["error"] = f"Unexpected error: {exc}"
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_WFGA)
 
 
 @app.route("/walk-forward-ga")
@@ -1830,9 +1876,16 @@ def wfga_form():
 @app.route("/walk-forward-ga/start", methods=["POST"])
 def wfga_start():
     form = request.form
+    guard_resp = _try_acquire_heavy_job(
+        JOB_WFGA, "wfga.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+        fitness_metrics=FITNESS_METRICS,
+    )
+    if guard_resp:
+        return guard_resp
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_WFGA)
             return render_template("wfga.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
 
         strategy, library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
@@ -1877,8 +1930,10 @@ def wfga_start():
         thread.start()
         return redirect(url_for("wfga_job", job_id=job_id))
     except (StrategyError, RefinementError) as exc:
+        HEAVY_JOB_GUARD.release(JOB_WFGA)
         return render_template("wfga.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 400
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_WFGA)
         return render_template("wfga.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), fitness_metrics=FITNESS_METRICS), 500
 
 
@@ -2074,6 +2129,9 @@ def regime_matrix_form():
 def regime_matrix_run():
     form = request.form
     ctx = lambda **kw: dict(stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(), **kw)
+    guard_resp = _try_acquire_heavy_job(JOB_REGIME_MATRIX, "regime_matrix.html", **ctx())
+    if guard_resp:
+        return guard_resp
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
@@ -2118,6 +2176,8 @@ def regime_matrix_run():
         return render_template("regime_matrix.html", **ctx(error=str(exc))), 400
     except Exception as exc:  # noqa: BLE001
         return render_template("regime_matrix.html", **ctx(error=f"Unexpected error: {exc}")), 500
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_REGIME_MATRIX)
 
 
 # ---------------------------------------------------------------------------
@@ -2404,6 +2464,8 @@ def _run_cpcv_job(job_id: str, df, strategy, risk: RiskConfig, n_groups: int, n_
             job = _CPCV_JOBS[job_id]
             job["done"] = True
             job["error"] = f"Unexpected error: {exc}"
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_CPCV)
 
 
 @app.route("/cpcv")
@@ -2414,9 +2476,15 @@ def cpcv_form():
 @app.route("/cpcv/start", methods=["POST"])
 def cpcv_start():
     form = request.form
+    guard_resp = _try_acquire_heavy_job(
+        JOB_CPCV, "cpcv.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+    )
+    if guard_resp:
+        return guard_resp
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_CPCV)
             return render_template("cpcv.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
         strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
         risk = RiskConfig(
@@ -2446,8 +2514,10 @@ def cpcv_start():
         thread.start()
         return redirect(url_for("cpcv_job", job_id=job_id))
     except (StrategyError, CPCVError) as exc:
+        HEAVY_JOB_GUARD.release(JOB_CPCV)
         return render_template("cpcv.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_CPCV)
         return render_template("cpcv.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 500
 
 
@@ -2528,6 +2598,8 @@ def _run_sensitivity_job(job_id: str, df, strategy, risk: RiskConfig, rules: Pro
             job = _SENS_JOBS[job_id]
             job["done"] = True
             job["error"] = f"Unexpected error: {exc}"
+    finally:
+        HEAVY_JOB_GUARD.release(JOB_SENSITIVITY)
 
 
 @app.route("/sensitivity")
@@ -2538,9 +2610,15 @@ def sensitivity_form():
 @app.route("/sensitivity/start", methods=["POST"])
 def sensitivity_start():
     form = request.form
+    guard_resp = _try_acquire_heavy_job(
+        JOB_SENSITIVITY, "sensitivity.html", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json(),
+    )
+    if guard_resp:
+        return guard_resp
     try:
         df, active_label, import_note, dataset_error = _resolve_dataset(form, request.files)
         if dataset_error:
+            HEAVY_JOB_GUARD.release(JOB_SENSITIVITY)
             return render_template("sensitivity.html", error=dataset_error, stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
         strategy, _library_ref = _build_strategy(form.get("strategy_mode", "manual"), form, request.files)
         risk = RiskConfig(initial_balance=float(form.get("initial_balance", 100000)), pip_size=float(form.get("pip_size", 0.0001)))
@@ -2565,8 +2643,10 @@ def sensitivity_start():
         thread.start()
         return redirect(url_for("sensitivity_job", job_id=job_id))
     except (StrategyError, RefinementError) as exc:
+        HEAVY_JOB_GUARD.release(JOB_SENSITIVITY)
         return render_template("sensitivity.html", error=str(exc), stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 400
     except Exception as exc:  # noqa: BLE001
+        HEAVY_JOB_GUARD.release(JOB_SENSITIVITY)
         return render_template("sensitivity.html", error=f"Unexpected error: {exc}", stored_datasets=list_stored_datasets(), saved_strategies_json=_saved_strategies_json()), 500
 
 

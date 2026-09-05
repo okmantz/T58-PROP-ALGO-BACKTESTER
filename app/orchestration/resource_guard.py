@@ -178,3 +178,23 @@ JOB_SEARCH_LAB = "Search Lab"
 JOB_EVOLUTION_LAB = "Evolution Lab"
 JOB_FULL_PIPELINE = "Full Pipeline"
 JOB_SPEED_RUN = "Speed Run"
+
+# UPGRADE (Sep 2026 UI pass, round 2): these five don't spin up their own
+# ProcessPoolExecutor the way the four above do, but Walk-Forward Opt/GA in
+# particular re-run a full parameter search per fold (their own internal
+# multi-generation population search, repeated n_folds times) -- easily as
+# expensive as one of the four "big" jobs, just single-process. None of
+# them were guarded before, so nothing stopped e.g. WFO and CPCV and
+# Sensitivity all running at once on top of each other (or on top of a
+# Search Lab run) and adding up to the exact same "the whole machine froze"
+# failure mode this module was written to prevent -- they just didn't
+# multiply by cpu_count() while doing it. They share the SAME
+# HEAVY_JOB_GUARD slot as the four above (not a separate guard), so any one
+# of these nine job types blocks any other from starting concurrently in
+# this process.
+JOB_WFO = "Walk-Forward Optimization"
+JOB_WFGA = "Walk-Forward GA"
+JOB_CPCV = "CPCV"
+JOB_SENSITIVITY = "Sensitivity"
+JOB_MULTI_OBJECTIVE = "Multi-Objective Optimization"
+JOB_REGIME_MATRIX = "Regime Survival Matrix"

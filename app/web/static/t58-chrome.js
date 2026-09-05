@@ -4,34 +4,20 @@
    touch each template individually.
 
    Responsibilities:
-   - build + inject the sticky topbar (breadcrumb, engine status, theme toggle)
-   - persist + apply the light/dark theme choice
+   - build + inject the persistent stage stepper
    - remember which sidebar groups the person had open/closed
    - a small animateNumber() helper other pages can call for counted-up KPIs
+
+   (The old sticky top bar -- breadcrumb + engine-status pill + light/dark
+   toggle -- was removed per direct feedback that it read as an unwanted
+   banner across the top of every page. The theme toggle isn't currently
+   exposed anywhere else; reintroduce it as a small icon inside the
+   sidebar itself if a light/dark switch is wanted back.)
 */
 (function () {
   "use strict";
 
-  var THEME_KEY = "t58-theme";
   var GROUP_KEY_PREFIX = "t58-navgroup:";
-
-  function applyStoredTheme() {
-    var saved = null;
-    try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
-    if (saved === "light") document.documentElement.setAttribute("data-theme", "light");
-  }
-  // Apply before paint where possible to avoid a flash of the wrong theme.
-  applyStoredTheme();
-
-  function toggleTheme() {
-    var isLight = document.documentElement.getAttribute("data-theme") === "light";
-    var next = isLight ? "dark" : "light";
-    if (next === "light") document.documentElement.setAttribute("data-theme", "light");
-    else document.documentElement.removeAttribute("data-theme");
-    try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
-    var btn = document.getElementById("t58-theme-toggle");
-    if (btn) btn.textContent = next === "light" ? "\u263D" : "\u2600";
-  }
 
   function restoreNavGroups() {
     document.querySelectorAll(".t58-nav-group").forEach(function (group, idx) {
@@ -47,21 +33,6 @@
         try { localStorage.setItem(key, group.open ? "open" : "closed"); } catch (e) {}
       });
     });
-  }
-
-  function pageBreadcrumb() {
-    var activeItem = document.querySelector(".t58-nav-item.active");
-    var section = "";
-    if (activeItem) {
-      var group = activeItem.closest(".t58-nav-group");
-      if (group) {
-        var summary = group.querySelector("summary");
-        if (summary) section = summary.textContent.trim().replace(/[\u25B6\u25B8]/g, "").trim();
-      }
-    }
-    var pageTitleEl = document.querySelector(".t58-page-header h1");
-    var pageTitle = pageTitleEl ? pageTitleEl.textContent.trim() : document.title;
-    return section ? (section + " / " + pageTitle) : pageTitle;
   }
 
   /* The 8-stage journey: Create -> Test -> Optimize -> Validate ->
@@ -92,7 +63,6 @@
 
   function buildStepper() {
     var main = document.querySelector(".t58-main");
-    var topbar = document.querySelector(".t58-topbar");
     if (!main || document.querySelector(".t58-stepper")) return;
 
     var current = currentStageIndex();
@@ -112,58 +82,7 @@
       }
     });
 
-    if (topbar && topbar.nextSibling) main.insertBefore(bar, topbar.nextSibling);
-    else main.insertBefore(bar, main.firstChild);
-  }
-
-  function buildTopbar() {
-    var main = document.querySelector(".t58-main");
-    if (!main || document.querySelector(".t58-topbar")) return;
-
-    var bar = document.createElement("div");
-    bar.className = "t58-topbar";
-
-    var crumb = document.createElement("div");
-    crumb.className = "crumb";
-    crumb.innerHTML = "T58 &nbsp;/&nbsp; <b>" + pageBreadcrumb() + "</b>";
-
-    var right = document.createElement("div");
-    right.className = "right";
-
-    var status = document.createElement("div");
-    status.className = "t58-engine-status";
-    status.id = "t58-engine-status";
-    status.innerHTML = '<span class="dot"></span><span class="txt">Checking&hellip;</span>';
-
-    var themeBtn = document.createElement("button");
-    themeBtn.className = "t58-theme-toggle";
-    themeBtn.id = "t58-theme-toggle";
-    themeBtn.type = "button";
-    themeBtn.setAttribute("aria-label", "Toggle light / dark theme");
-    themeBtn.textContent = document.documentElement.getAttribute("data-theme") === "light" ? "\u263D" : "\u2600";
-    themeBtn.addEventListener("click", toggleTheme);
-
-    right.appendChild(status);
-    right.appendChild(themeBtn);
-    bar.appendChild(crumb);
-    bar.appendChild(right);
     main.insertBefore(bar, main.firstChild);
-
-    // Best-effort heartbeat -- reuses the dashboard's existing JSON feed
-    // purely as a "the Flask process is alive" ping. Never blocks the UI.
-    function ping() {
-      fetch("/api/dashboard-data", { cache: "no-store" })
-        .then(function (r) {
-          status.className = "t58-engine-status " + (r.ok ? "online" : "offline");
-          status.querySelector(".txt").textContent = r.ok ? "Engine online" : "Engine unreachable";
-        })
-        .catch(function () {
-          status.className = "t58-engine-status offline";
-          status.querySelector(".txt").textContent = "Engine unreachable";
-        });
-    }
-    ping();
-    setInterval(ping, 20000);
   }
 
   /* Simple counted-up number animation for hero KPIs. Any element with
@@ -193,7 +112,6 @@
   window.T58Chrome = { animateNumbers: animateNumbers };
 
   document.addEventListener("DOMContentLoaded", function () {
-    buildTopbar();
     buildStepper();
     restoreNavGroups();
     animateNumbers();

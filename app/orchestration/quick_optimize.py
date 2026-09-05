@@ -30,6 +30,7 @@ result as "worth a real Full Pipeline run," not as a finished answer.
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -258,10 +259,33 @@ def run_quick_optimize(
         except Exception as exc:  # noqa: BLE001 -- saving is a convenience, not the core result
             saved_library_note = f"Could not save to the Strategy Library: {exc}"
             log(saved_library_note)
+    elif cfg.save_to_library and final_source_type == "manual" and final_config:
+        # Same fix as app.orchestration.full_pipeline._finish -- manual/
+        # Search-Lab configs are dicts, not files, but app.strategy.library
+        # already has a first-class "manual" type that stores exactly this
+        # shape as JSON, so there's no real reason this used to give up.
+        base_name = Path(display_name).stem.replace(" ", "_") or "optimized_strategy"
+        filename = f"{base_name}_optimized.json"
+        config_text = json.dumps(final_config, indent=2)
+        try:
+            try:
+                saved_library_path = save_strategy_text(config_text, filename, "manual", overwrite=False)
+            except StrategyAlreadyExists:
+                filename = f"{base_name}_optimized_{int(time.time())}.json"
+                saved_library_path = save_strategy_text(config_text, filename, "manual", overwrite=False)
+            set_strategy_status("manual", filename, cfg.library_status)
+            saved_library_note = f"Saved to the Strategy Library as '{filename}' (status: {cfg.library_status})."
+            log(saved_library_note)
+            final_code_text = config_text
+            final_code_ext = ".json"
+        except Exception as exc:  # noqa: BLE001 -- saving is a convenience, not the core result
+            saved_library_note = f"Could not save to the Strategy Library: {exc}"
+            log(saved_library_note)
     elif final_source_type == "manual":
         saved_library_note = (
-            "Manual Strategy Builder configurations aren't files, so there's nothing to save to the "
-            "Strategy Library -- copy the winning parameters from this result into the Strategy tab."
+            "Manual Strategy Builder configuration produced, but nothing was saved (saving to the "
+            "Strategy Library is turned off) -- copy the winning parameters from this result into "
+            "the Strategy tab."
         )
 
     elapsed = time.time() - t0

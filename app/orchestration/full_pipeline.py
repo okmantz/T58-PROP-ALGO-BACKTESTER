@@ -744,11 +744,53 @@ def _finish(
         except Exception as exc:  # noqa: BLE001 -- saving to the library is a convenience, not core output
             saved_library_note = f"Could not save to the Strategy Library: {exc}"
             log(f"  {saved_library_note}")
+    elif cfg.save_to_library and final_source_type == "manual" and final_config:
+        # Manual Strategy Builder / Search Lab / Evolution Lab configs are
+        # dicts, not source files -- but app.strategy.library already has a
+        # first-class "manual" strategy type that stores exactly this shape
+        # as JSON (see library.py's STRATEGY_TYPES and Evolution Lab's own
+        # PROMOTE button, _promote_evolution_leader_record). This used to
+        # fall through to the "nothing to save" message below even though
+        # the library could save it perfectly well -- fixed by using the
+        # same json.dumps(config, indent=2) + save_strategy_text(..., "manual",
+        # ...) pattern Evolution Lab already relies on. Also mirrors the
+        # saved JSON into final_code_text/final_code_extension so a "view
+        # code" action downstream (e.g. Speed Run's candidate list) has
+        # something to show for a manual-builder winner too, not just for
+        # python/pinescript/mql5 ones.
+        base_name = Path(display_name).stem.replace(" ", "_") or "full_pipeline_strategy"
+        filename = f"{base_name}_pipeline.json"
+        config_text = json.dumps(final_config, indent=2)
+        try:
+            try:
+                saved_library_path = save_strategy_text(config_text, filename, "manual", overwrite=False)
+            except StrategyAlreadyExists:
+                filename = f"{base_name}_pipeline_{int(time.time())}.json"
+                saved_library_path = save_strategy_text(config_text, filename, "manual", overwrite=False)
+            set_strategy_status("manual", filename, cfg.library_status or _VERDICT_TO_LIBRARY_STATUS.get(verdict, "tested_passed"))
+            record_backtest_result("manual", filename, {
+                "trades": len(final_bt.trades),
+                "net_profit": round(final_bt.statistics.net_profit, 2),
+                "win_rate": round(final_bt.statistics.win_rate, 1),
+                "max_dd": round(final_bt.statistics.max_drawdown_pct, 2),
+                "eval_pass_probability": round(final_mc.evaluation_pass_probability, 1),
+                "first_payout_probability": round(final_mc.first_payout_probability, 1),
+                "verdict": verdict,
+                "report_html": str(report_paths["html"]),
+            })
+            saved_library_note = f"Saved to the Strategy Library as '{filename}' (status: {cfg.library_status})."
+            log(f"  {saved_library_note}")
+            final_code_text = config_text
+            final_code_ext = ".json"
+        except Exception as exc:  # noqa: BLE001 -- saving to the library is a convenience, not core output
+            saved_library_note = f"Could not save to the Strategy Library: {exc}"
+            log(f"  {saved_library_note}")
     elif final_source_type == "manual":
         saved_library_note = (
-            "Manual Strategy Builder configurations aren't files, so there's nothing to save to "
-            "the Strategy Library -- copy the winning settings from the report, or use "
-            "'Apply Best Config to Strategy Tab' after a standalone Iterative Refinement run."
+            "Manual Strategy Builder configuration produced, but nothing was saved (saving to the "
+            "Strategy Library is turned off, or no configuration was available) -- copy the winning "
+            "settings from the report, or use 'Apply Best Config to Strategy Tab' after a standalone "
+            "Iterative Refinement run."
         )
 
     log(f"\nFull Pipeline complete in {elapsed:.1f}s. Verdict: {verdict}.")

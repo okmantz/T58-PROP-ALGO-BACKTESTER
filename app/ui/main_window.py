@@ -84,6 +84,7 @@ from app.reports.validation_reports import (
     generate_walkforward_ga_report,
 )
 from app.search.batch_runner import SearchCancelled, SearchStageConfig, promote_champion, run_search
+from app.search.global_search import global_search
 from app.search.search_report import generate_search_report
 from app.search.strategy_space import StrategySpaceError, generate_search_space, list_families
 from app.strategy.base import StrategyError
@@ -1413,13 +1414,21 @@ class MainWindow:
             darkcolor=ACCENT,
         )
 
+    # Global top bar -- one persistent strip above the sidebar/content
+    # split (every tab, every page). Requested layout: brand + tagline on
+    # the left, a global search box in the middle (strategies / reports /
+    # datasets / runs -- see app.search.global_search), and Engine Online
+    # status + theme toggle + settings gear on the right, matching the
+    # web app's own top-of-page status/branding so the two builds read as
+    # the same product rather than two different apps.
+    _SEARCH_PLACEHOLDER = "\u2315  Search strategies, reports, datasets, runs..."
+
     def _build_header(self, parent):
-        header = Frame(parent, bg=BG, height=92)
+        header = Frame(parent, bg=BG, height=98)
         header.pack(fill="x", padx=18, pady=(16, 8))
         header.pack_propagate(False)
 
-        # Text-based mark keeps the executable independent of a required
-        # image path. Existing logo PNGs can still be added to this header.
+        # -- Left: brand mark + platform tagline --------------------------
         mark = Frame(header, bg=BG)
         mark.pack(side="left", fill="y")
 
@@ -1447,57 +1456,231 @@ class MainWindow:
         Frame(sub_row, bg=ACCENT, width=10, height=2).pack(side="left", pady=(3, 0))
         Label(
             sub_row,
-            text="PROP ALGO BACKTESTER",
+            text="QUANT RESEARCH & PROP INTELLIGENCE PLATFORM",
             bg=BG,
             fg=TEXT_MUTED,
             font=_safe_font(8, "bold"),
         ).pack(side="left", padx=(6, 0))
 
+        # -- Right: engine status / theme / settings, stacked ------------
         right = Frame(header, bg=BG)
         right.pack(side="right", fill="y")
 
-        top_row = Frame(right, bg=BG)
-        top_row.pack(anchor="e", pady=(13, 0))
+        status_row = Frame(right, bg=BG)
+        status_row.pack(anchor="e", pady=(11, 4))
+        Label(
+            status_row, text="\u25CF", bg=BG, fg=GREEN, font=_safe_font(9),
+        ).pack(side="left", padx=(0, 5))
+        Label(
+            status_row, text="Engine Online", bg=BG, fg=TEXT_MUTED, font=_safe_font(9, "bold"),
+        ).pack(side="left")
 
-        theme_label = "LIGHT" if CURRENT_THEME == "dark" else "DARK"
+        toggle_row = Frame(right, bg=BG)
+        toggle_row.pack(anchor="e", pady=(0, 4))
+
+        theme_icon = "\u263D" if CURRENT_THEME == "dark" else "\u2600"
         theme_btn = Label(
-            top_row,
-            text=f"\u25D1  {theme_label} MODE",
-            bg=PANEL_2,
-            fg=TEXT_MUTED,
-            font=_safe_font(8, "bold"),
-            padx=10,
-            pady=5,
-            highlightthickness=1,
-            highlightbackground=BORDER_LIGHT,
-            cursor="hand2",
+            toggle_row, text=f" {theme_icon} ", bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(10, "bold"),
+            padx=8, pady=4, highlightthickness=1, highlightbackground=BORDER_LIGHT, cursor="hand2",
         )
-        theme_btn.pack(side="left", padx=(0, 8))
+        theme_btn.pack(side="left", padx=(0, 6))
         theme_btn.bind("<Button-1>", lambda _e: self._toggle_theme())
         theme_btn.bind("<Enter>", lambda _e: theme_btn.configure(bg=PANEL_HOVER, fg=TEXT))
         theme_btn.bind("<Leave>", lambda _e: theme_btn.configure(bg=PANEL_2, fg=TEXT_MUTED))
 
-        Label(
-            top_row,
-            text="MVP",
-            bg=PANEL_2,
-            fg=ACCENT_HOVER,
-            font=_safe_font(8, "bold"),
-            padx=12,
-            pady=5,
-            highlightthickness=1,
-            highlightbackground=BORDER_LIGHT,
-        ).pack(side="left")
+        gear_btn = Label(
+            toggle_row, text=" \u2699 ", bg=PANEL_2, fg=TEXT_MUTED, font=_safe_font(10, "bold"),
+            padx=8, pady=4, highlightthickness=1, highlightbackground=BORDER_LIGHT, cursor="hand2",
+        )
+        gear_btn.pack(side="left")
+        gear_btn.bind("<Button-1>", lambda _e: self._open_settings_popup())
+        gear_btn.bind("<Enter>", lambda _e: gear_btn.configure(bg=PANEL_HOVER, fg=TEXT))
+        gear_btn.bind("<Leave>", lambda _e: gear_btn.configure(bg=PANEL_2, fg=TEXT_MUTED))
 
         Label(
             right,
-            text="HISTORICAL DATA  •  STRATEGY  •  RISK  •  SIMULATION",
+            text="HISTORICAL DATA  \u2022  STRATEGY  \u2022  RISK  \u2022  SIMULATION",
             bg=BG,
             fg=TEXT_DIM,
             font=_safe_font(7),
-        ).pack(anchor="e", pady=(7, 0))
+        ).pack(anchor="e", pady=(0, 2))
+
+        # -- Center: global search -----------------------------------------
+        # Packed last so it fills whatever width is left between the
+        # already-packed left/right sides, rather than needing an explicit
+        # width guess that would either clip on a small window or leave a
+        # gap on a large one.
+        search_wrap = Frame(header, bg=BG)
+        search_wrap.pack(side="left", fill="both", expand=True, padx=24)
+        search_inner = Frame(search_wrap, bg=BG)
+        search_inner.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.86)
+
+        self._global_search_var = StringVar(value=self._SEARCH_PLACEHOLDER)
+        search_entry = Entry(
+            search_inner, textvariable=self._global_search_var, bg=PANEL_2, fg=TEXT_DIM,
+            insertbackground=TEXT, relief="flat", font=_safe_font(10),
+            highlightthickness=1, highlightbackground=BORDER_LIGHT, highlightcolor=ACCENT,
+        )
+        search_entry.pack(fill="x", ipady=7, padx=1)
+        self._global_search_entry = search_entry
+
+        def _on_focus_in(_e):
+            if self._global_search_var.get() == self._SEARCH_PLACEHOLDER:
+                self._global_search_var.set("")
+                search_entry.configure(fg=TEXT)
+
+        def _on_focus_out(_e):
+            if not self._global_search_var.get().strip():
+                self._global_search_var.set(self._SEARCH_PLACEHOLDER)
+                search_entry.configure(fg=TEXT_DIM)
+
+        search_entry.bind("<FocusIn>", _on_focus_in)
+        search_entry.bind("<FocusOut>", _on_focus_out)
+        search_entry.bind("<Return>", lambda _e: self._run_global_search())
 
         Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=18, pady=(0, 12))
+
+    def _open_settings_popup(self):
+        """Minimal settings surface behind the top bar's gear icon.
+        Deliberately small -- this app's real per-feature settings (Ollama
+        host/model/API key, prop rules, risk defaults, etc.) already live
+        on their own tabs; this is just the handful of things that are
+        genuinely global (theme, where things are saved) plus a jump-off
+        point to the rest."""
+        win = Toplevel(self.root)
+        win.title("Settings")
+        win.configure(bg=BG)
+        win.geometry("420x320")
+        try:
+            _apply_dark_titlebar(win)
+        except Exception:
+            pass
+
+        Label(win, text="SETTINGS", bg=BG, fg=TEXT, font=_safe_font(12, "bold")).pack(anchor="w", padx=18, pady=(16, 10))
+
+        row = Frame(win, bg=BG)
+        row.pack(fill="x", padx=18, pady=6)
+        Label(row, text="Theme", bg=BG, fg=TEXT_MUTED, font=_safe_font(9)).pack(side="left")
+        theme_label = "Light" if CURRENT_THEME == "dark" else "Dark"
+        self._button(row, f"Switch to {theme_label}", lambda: (self._toggle_theme(), win.destroy())).pack(side="right")
+
+        row2 = Frame(win, bg=BG)
+        row2.pack(fill="x", padx=18, pady=6)
+        Label(row2, text="Strategy Library folder", bg=BG, fg=TEXT_MUTED, font=_safe_font(9)).pack(anchor="w")
+        try:
+            lib_dir = str(get_strategy_library_dir("python").parent)
+        except Exception:
+            lib_dir = "unknown"
+        Label(
+            row2, text=lib_dir, bg=BG, fg=TEXT_DIM, font=(MONO, 8), wraplength=380, justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+
+        row3 = Frame(win, bg=BG)
+        row3.pack(fill="x", padx=18, pady=6)
+        Label(row3, text="Reports folder", bg=BG, fg=TEXT_MUTED, font=_safe_font(9)).pack(anchor="w")
+        Label(
+            row3, text=str(OUTPUT_DIR), bg=BG, fg=TEXT_DIM, font=(MONO, 8), wraplength=380, justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+
+        Label(
+            win,
+            text="AI Assist (Ollama), prop rules, and risk defaults are configured on "
+            "their own tabs (Research Agent / Prop Rules / Risk).",
+            bg=BG, fg=TEXT_DIM, font=_safe_font(8), wraplength=380, justify="left",
+        ).pack(anchor="w", padx=18, pady=(14, 6))
+
+        self._button(win, "CLOSE", win.destroy).pack(anchor="e", padx=18, pady=12)
+
+    def _run_global_search(self):
+        query = self._global_search_var.get().strip()
+        if not query or query == self._SEARCH_PLACEHOLDER:
+            return
+        try:
+            results = global_search(query, max_per_kind=8, reports_dir=OUTPUT_DIR)
+        except Exception as exc:  # noqa: BLE001 -- search is a convenience, never worth crashing over
+            messagebox.showerror("Search failed", str(exc))
+            return
+        self._show_global_search_results(query, results)
+
+    def _show_global_search_results(self, query: str, results: list):
+        win = Toplevel(self.root)
+        win.title(f"Search: {query}")
+        win.configure(bg=BG)
+        win.geometry("760x520")
+        try:
+            _apply_dark_titlebar(win)
+        except Exception:
+            pass
+
+        Label(
+            win, text=f"SEARCH RESULTS -- \u201c{query}\u201d", bg=BG, fg=TEXT, font=_safe_font(12, "bold"),
+        ).pack(anchor="w", padx=16, pady=(14, 2))
+
+        if not results:
+            Label(
+                win, text="No strategies, reports, datasets, or runs matched.",
+                bg=BG, fg=TEXT_DIM, font=_safe_font(9),
+            ).pack(anchor="w", padx=16, pady=(4, 12))
+            self._button(win, "CLOSE", win.destroy).pack(anchor="e", padx=16, pady=12)
+            return
+
+        Label(
+            win, text=f"{len(results)} match(es), grouped by kind. Double-click a row to open it.",
+            bg=BG, fg=TEXT_DIM, font=_safe_font(8),
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        list_frame = Frame(win, bg=PANEL)
+        list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        box = Listbox(
+            list_frame, exportselection=False, bg=PANEL_3, fg=TEXT, activestyle="none",
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, font=(MONO, 9),
+        )
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=box.yview, style="T58.Vertical.TScrollbar")
+        box.config(yscrollcommand=scroll.set)
+        self._bind_isolated_wheel(box)
+        box.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        kind_labels = {"strategy": "STRATEGY", "dataset": "DATASET", "report": "REPORT", "run": "RUN"}
+        for r in results:
+            box.insert(END, f"[{kind_labels.get(r.kind, r.kind.upper()):9s}] {r.title}  -- {r.subtitle}")
+
+        def _open_selected(_e=None):
+            sel = box.curselection()
+            if not sel:
+                return
+            self._open_global_search_result(results[sel[0]])
+
+        box.bind("<Double-Button-1>", _open_selected)
+
+        btn_row = Frame(win, bg=BG)
+        btn_row.pack(fill="x", padx=16, pady=(0, 14))
+        self._button(btn_row, "OPEN", _open_selected).pack(side="left")
+        self._button(btn_row, "CLOSE", win.destroy).pack(side="left", padx=8)
+
+    def _open_global_search_result(self, result) -> None:
+        try:
+            if result.kind == "report" and result.path:
+                webbrowser.open(f"file://{Path(result.path).resolve()}")
+            elif result.kind == "strategy" and result.path:
+                text = Path(result.path).read_text(encoding="utf-8")
+                self._show_text_viewer(result.title, text)
+            elif result.kind == "dataset" and result.path:
+                self._show_text_viewer(
+                    result.title,
+                    f"Dataset file: {result.path}\n\nUse Step 1 (Data) to load this file for a run.",
+                )
+            elif result.kind == "run" and result.experiment_id:
+                from app.ai.experiment_memory import get_experiment_by_id
+
+                exp = get_experiment_by_id(result.experiment_id)
+                if exp is not None:
+                    body = "\n".join(f"{k}: {v}" for k, v in exp.to_dict().items() if k != "config")
+                    self._show_text_viewer(f"Run -- {exp.strategy_name}", body)
+        except Exception as exc:  # noqa: BLE001 -- opening a result is best-effort
+            messagebox.showerror("Couldn't open result", str(exc))
 
     def _page_header(self, parent, eyebrow, title, description=""):
         box = Frame(parent, bg=BG)
@@ -4175,6 +4358,10 @@ class MainWindow:
         win.title(title)
         win.configure(bg=BG)
         win.geometry("860x640")
+        try:
+            _apply_dark_titlebar(win)
+        except Exception:
+            pass  # cosmetic only -- see _apply_dark_titlebar's own docstring
 
         Label(
             win, text=title, bg=BG, fg=TEXT, font=_safe_font(11, "bold"),
@@ -4386,6 +4573,10 @@ class MainWindow:
         win.title(title)
         win.configure(bg=BG)
         win.geometry("760x520")
+        try:
+            _apply_dark_titlebar(win)
+        except Exception:
+            pass  # cosmetic only -- see _apply_dark_titlebar's own docstring
         Label(win, text=title, bg=BG, fg=TEXT, font=_safe_font(11, "bold")).pack(anchor="w", padx=14, pady=(12, 6))
         text_frame = Frame(win, bg=BG)
         text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
@@ -8981,6 +9172,10 @@ class MainWindow:
         win.title(f"Leaderboard detail -- {record.get('candidate_id', '?')}")
         win.configure(bg=BG)
         win.geometry("760x680")
+        try:
+            _apply_dark_titlebar(win)
+        except Exception:
+            pass  # cosmetic only -- see _apply_dark_titlebar's own docstring
         Label(
             win, text="LEADERBOARD DETAIL", bg=BG, fg=TEXT, font=_safe_font(13, "bold"),
         ).pack(anchor="w", padx=16, pady=(14, 6))
@@ -9159,9 +9354,9 @@ class MainWindow:
 
         library_section = self._section(
             f, "Strategy Library",
-            "Code strategies only (Manual Strategy Builder configs aren't files, so there's "
-            "nothing to save) -- the winning source is written under a new filename, never "
-            "overwriting the strategy you started from.",
+            "Works for code strategies (saved as a new .py/.pine/.mq5 file) and Manual Strategy "
+            "Builder / Search Lab configs alike (saved as JSON) -- either way it's written under "
+            "a new filename, never overwriting the strategy you started from.",
         )
         self.fp_save_to_library = LabeledCheckbox(
             library_section, "Save the winning strategy to the Strategy Library when finished", True,
@@ -9462,11 +9657,12 @@ class MainWindow:
 
         library_section = self._section(
             f, "Strategy Library",
-            "The winner (if any) is a code strategy discovered from scratch, so -- unlike "
-            "Manual Strategy Builder configs -- it always has something to save.",
+            "Every validated candidate -- whether it's a Manual Strategy Builder / Search Lab "
+            "config or an actual Python/PineScript/MQL5 file -- can be saved to the Strategy "
+            "Library, either automatically below or on demand from the Validated Candidates list.",
         )
         self.sr_save_to_library = LabeledCheckbox(
-            library_section, "Save the winning strategy to the Strategy Library when finished", True,
+            library_section, "Save every validated candidate to the Strategy Library when finished", True,
         )
 
         button_row = Frame(f, bg=BG)
@@ -9518,6 +9714,8 @@ class MainWindow:
         cand_btn_row = Frame(candidates_section, bg=PANEL)
         cand_btn_row.pack(anchor="w", padx=18, pady=(0, 12))
         self._button(cand_btn_row, "OPEN REPORT", self._open_speedrun_selected_candidate_report).pack(side="left")
+        self._button(cand_btn_row, "VIEW CODE", self._view_speedrun_selected_candidate_code).pack(side="left", padx=8)
+        self._button(cand_btn_row, "SAVE TO LIBRARY", self._save_speedrun_selected_candidate).pack(side="left")
 
         self._speedrun_candidates_cache: list[dict] = []
 
@@ -9569,6 +9767,99 @@ class MainWindow:
         html_path = row.get("html_path")
         if html_path:
             webbrowser.open(f"file://{html_path.resolve()}")
+
+    def _selected_speedrun_candidate(self) -> "SpeedRunCandidateResult | None":
+        sel = self.speedrun_candidates_listbox.curselection()
+        if not sel or not self._speedrun_candidates_cache:
+            return None
+        return self._speedrun_candidates_cache[sel[0]].get("row")
+
+    def _view_speedrun_selected_candidate_code(self):
+        """VIEW CODE for a Speed Run candidate. Full Pipeline's own
+        final_code_text now covers python/pinescript/mql5 winners (their
+        real patched source) AND manual-builder/Search-Lab winners (their
+        config serialized as JSON -- see the full_pipeline.py fix that
+        stopped manual configs from being treated as having 'nothing to
+        show'), so this works for every candidate that made it to
+        validation, not just code-strategy ones."""
+        r = self._selected_speedrun_candidate()
+        if r is None:
+            messagebox.showinfo("Select a candidate", "Select a validated candidate from the list above first.")
+            return
+        pr = r.pipeline_result
+        if pr is None or not pr.final_code_text:
+            messagebox.showinfo(
+                "No code available",
+                "This candidate has no code or configuration to show (it failed validation, "
+                "or produced no final configuration).",
+            )
+            return
+        kind_label = {
+            "python": "Python", "pinescript": "PineScript", "mql5": "MQL5",
+            "manual": "Manual Strategy Builder config (JSON)",
+        }.get(pr.final_source_type, pr.final_source_type)
+        self._show_text_viewer(f"{r.candidate_id} -- {kind_label}", pr.final_code_text)
+
+    def _save_speedrun_selected_candidate(self):
+        """SAVE TO LIBRARY for a Speed Run candidate, on demand. Full
+        Pipeline already auto-saves every validated candidate when 'Save
+        every validated candidate to the Strategy Library' is checked
+        above, so this is mainly for: that checkbox was off during the
+        run, or you want to re-confirm/re-save a specific candidate
+        without re-running Speed Run."""
+        r = self._selected_speedrun_candidate()
+        if r is None:
+            messagebox.showinfo("Select a candidate", "Select a validated candidate from the list above first.")
+            return
+        pr = r.pipeline_result
+        if pr is None:
+            messagebox.showwarning("Nothing to save", "This candidate failed validation, so there's nothing to save.")
+            return
+        if pr.saved_library_path:
+            messagebox.showinfo(
+                "Already saved",
+                f"This candidate was already saved to the Strategy Library as "
+                f"'{Path(pr.saved_library_path).name}'.",
+            )
+            return
+        source_type = pr.final_source_type
+        if source_type in ("python", "pinescript", "mql5") and pr.final_code_text:
+            ext = {"python": ".py", "pinescript": ".pine", "mql5": ".mq5"}[source_type]
+            text = pr.final_code_text
+        elif source_type == "manual" and (pr.final_code_text or pr.final_config):
+            ext = ".json"
+            text = pr.final_code_text or json.dumps(pr.final_config, indent=2)
+        else:
+            messagebox.showwarning("Nothing to save", "This candidate has no code or configuration to save.")
+            return
+        base_name = f"speedrun_{r.candidate_id}".replace(" ", "_")
+        filename = f"{base_name}{ext}"
+        try:
+            try:
+                path = save_strategy_text(text, filename, source_type, overwrite=False)
+            except StrategyAlreadyExists:
+                if not messagebox.askyesno(
+                    "Already in library", f"'{filename}' already exists in the Strategy Library. Overwrite it?",
+                ):
+                    return
+                path = save_strategy_text(text, filename, source_type, overwrite=True)
+            set_strategy_status(
+                source_type, filename, "tested_passed" if pr.verdict in ("READY", "MARGINAL") else "tested_failed",
+            )
+            record_backtest_result(source_type, filename, {
+                "trades": len(pr.final_bt.trades),
+                "net_profit": round(pr.final_bt.statistics.net_profit, 2),
+                "win_rate": round(pr.final_bt.statistics.win_rate, 1),
+                "max_dd": round(pr.final_bt.statistics.max_drawdown_pct, 2),
+                "eval_pass_probability": round(pr.final_mc.evaluation_pass_probability, 1),
+                "first_payout_probability": round(pr.final_mc.first_payout_probability, 1),
+                "verdict": pr.verdict,
+                "report_html": str(pr.report_paths.get("html", "")),
+            })
+            messagebox.showinfo("Saved", f"Saved to the Strategy Library as '{filename}' (in {path.parent}).")
+            self._refresh_strategy_library()
+        except Exception as exc:  # noqa: BLE001 -- surface it, don't crash the tab
+            messagebox.showerror("Save failed", str(exc))
 
     def _render_speedrun_candidates(self, result: SpeedRunResult):
         self.speedrun_candidates_listbox.delete(0, END)

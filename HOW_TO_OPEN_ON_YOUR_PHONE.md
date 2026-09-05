@@ -1,4 +1,4 @@
-# Using the T58 Prop Algo Backtester on your phone
+# Using the T58 Quant Algo Backtester on your phone
 
 This gives you the backtester on your Samsung (or any phone) as a
 home-screen app, with no Google Play, no app store review, and no

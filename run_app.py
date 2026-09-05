@@ -1,5 +1,5 @@
 """
-T58 Trading — Prop Algo Backtester
+T58 Trading — Quant Algo Backtester
 PyInstaller entry point.
 
 This file must stay at the repository root, *outside* the ``app`` package.

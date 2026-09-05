@@ -46,14 +46,14 @@ as a workflow artifact — no local Python install needed to get the `.exe`:
 
 1. Push this repo to GitHub.
 2. Go to **Actions → build-exe → (latest run)**.
-3. Download the **T58-Prop-Algo-Backtester-windows-exe** artifact — it contains `T58-Prop-Algo-Backtester.exe`.
+3. Download the **T58-Quant-Algo-Backtester-windows-exe** artifact — it contains `T58-Quant-Algo-Backtester.exe`.
 4. Tagging a release (`git tag v0.1.0 && git push --tags`) also attaches the `.exe` directly to a GitHub Release.
 
 To build it locally on Windows instead:
 
 ```bat
 pip install -r config/requirements.txt pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name T58-Prop-Algo-Backtester ^
+pyinstaller --noconfirm --onefile --windowed --name T58-Quant-Algo-Backtester ^
   --paths . --add-data "data/examples;data/examples" run_app.py
 ```
 
@@ -86,10 +86,10 @@ under the block below if either of those happens to you.
 #    INTO that folder -- every command after this assumes you're standing
 #    inside it. If you downloaded a "Code -> Download ZIP" from GitHub
 #    instead of using git clone, extract it first, then cd into the
-#    extracted folder (its name will look like T58-Prop-Algo-Backtester
-#    or T58-PROP-ALGO-BACKTESTER-main).
+#    extracted folder (its name will look like T58-Quant-Algo-Backtester
+#    or T58-QUANT-ALGO-BACKTESTER-main).
 git clone <this-repo-url>
-cd T58-Prop-Algo-Backtester
+cd T58-Quant-Algo-Backtester
 
 # 1. Create and activate a virtual environment (isolates this app's
 #    Python packages from everything else on your system).
@@ -994,7 +994,7 @@ also desktop-GUI-only for now; there's no CLI flag or web route for it yet.
 ## Project layout
 
 ```
-T58-Prop-Algo-Backtester/
+T58-Quant-Algo-Backtester/
 ├── run_app.py                  # PyInstaller entry point (must stay at repo root — see .exe section)
 ├── run_web.py                  # PyInstaller entry point, web/phone edition (must stay at repo root)
 ├── config/                     # pyproject.toml, requirements.txt

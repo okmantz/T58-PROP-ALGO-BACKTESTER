@@ -1,5 +1,5 @@
 [project]
-name = "t58-prop-algo-backtester"
+name = "t58-quant-algo-backtester"
 version = "0.1.0"
 description = "MVP desktop app for backtesting trading strategies against prop-firm evaluation rules and estimating probability of pass/payout via Monte Carlo simulation."
 authors = [{name = "T58 Trading"}]

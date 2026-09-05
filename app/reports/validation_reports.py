@@ -62,7 +62,7 @@ def _page(title: str, body: str) -> str:
 <html><head><meta charset="utf-8"><title>{title}</title><style>{_CSS}</style></head>
 <body>
 <div class="card"><h1>{title}</h1>
-<div class="sub">T58 Trading — Prop Algo Backtester — generated {datetime.now(timezone.utc).isoformat()}</div>
+<div class="sub">T58 Trading — Quant Algo Backtester — generated {datetime.now(timezone.utc).isoformat()}</div>
 </div>
 {body}
 </body></html>"""

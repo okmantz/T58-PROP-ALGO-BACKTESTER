@@ -110,7 +110,7 @@ def startup_banner_lines(url: str, qr_path: Path | None) -> list[str]:
     can never again drift into showing different information."""
     lines = [
         "=" * 64,
-        "  T58 PROP ALGO BACKTESTER -- now running as a website",
+        "  T58 QUANT ALGO BACKTESTER -- now running as a website",
         "=" * 64,
         f"  On THIS computer, it just opened at:\n      {url}",
         "",

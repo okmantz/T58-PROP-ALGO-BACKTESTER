@@ -1,5 +1,5 @@
 """
-T58 Trading — Prop Algo Backtester
+T58 Trading — Quant Algo Backtester
 Entry point.
 
 Usage:
@@ -831,7 +831,7 @@ def run_full_pipeline_cli(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="T58 Trading — Prop Algo Backtester")
+    parser = argparse.ArgumentParser(description="T58 Trading — Quant Algo Backtester")
     parser.add_argument("--cli", action="store_true", help="run headlessly instead of launching the GUI")
     parser.add_argument("--csv", default=None, help="path to a market data CSV (--cli mode); if omitted, uses the "
                                                        "most recently stored dataset in data/raw/, or the bundled sample")

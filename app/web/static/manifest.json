@@ -1,5 +1,5 @@
 {
-  "name": "T58 Prop Algo Backtester",
+  "name": "T58 Quant Algo Backtester",
   "short_name": "T58 Backtester",
   "description": "Backtest strategies against prop-firm rules and estimate pass/payout probability via Monte Carlo simulation.",
   "start_url": "/",

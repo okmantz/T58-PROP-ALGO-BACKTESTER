@@ -1,5 +1,5 @@
 """
-T58 Prop Algo Backtester — Mobile Web App.
+T58 Quant Algo Backtester — Mobile Web App.
 
 A thin Flask front end over the exact same engine used by the desktop GUI
 and the --cli entry point (app/backtest, app/prop, app/monte_carlo,

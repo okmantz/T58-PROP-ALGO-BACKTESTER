@@ -1,5 +1,5 @@
 """
-T58 Prop Algo Backtester — Desktop GUI.
+T58 Quant Algo Backtester — Desktop GUI.
 
 Dark T58 interface with a full visual Manual Strategy Builder. The builder
 creates a structured JSON-like strategy configuration consumed by
@@ -844,7 +844,7 @@ class _AdaptiveRuleDialog(Toplevel):
 class MainWindow:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("T58 Trading — Prop Algo Backtester")
+        self.root.title("T58 Trading — Quant Algo Backtester")
         try:
             icon_path = _asset_path("t58_mark_medium.png")
             if icon_path.exists():
@@ -954,7 +954,7 @@ class MainWindow:
             icon_shown = False
 
         title_lbl = Label(
-            bar, text="T58 Trading — Prop Algo Backtester", bg=PANEL_2, fg=TEXT_MUTED,
+            bar, text="T58 Trading — Quant Algo Backtester", bg=PANEL_2, fg=TEXT_MUTED,
             font=_safe_font(9, "bold"),
         )
         title_lbl.pack(side="left", padx=(0 if icon_shown else 10, 0))
@@ -11962,7 +11962,7 @@ class _SplashScreen(Toplevel):
         self._glow_color = NEON_CYAN
         self._bg = bg
         self._tick = 0
-        self._status = "Booting T58 Prop Algo Backtester..."
+        self._status = "Booting T58 Quant Algo Backtester..."
         self._draw()
         self._animate()
 
@@ -11995,7 +11995,7 @@ class _SplashScreen(Toplevel):
             font=_safe_font(46, "bold"),
         )
         c.create_text(
-            cx, cy + 44, text="PROP ALGO BACKTESTER", fill=self._glow_color,
+            cx, cy + 44, text="QUANT ALGO BACKTESTER", fill=self._glow_color,
             font=_safe_font(11, "bold"),
         )
         c.create_text(

@@ -1,5 +1,5 @@
 """
-T58 Prop Algo Backtester — phone-friendly launcher.
+T58 Quant Algo Backtester — phone-friendly launcher.
 
 This is the entry point behind the "T58-Web-App.exe" build. It exists so
 Owen (or anyone else) can:
@@ -87,7 +87,7 @@ def main() -> None:
     # indistinguishable from "nothing is happening" (the exact complaint
     # this fixes) -- a person has no way to tell "it's loading" apart from
     # "it silently died."
-    print("Starting T58 Prop Algo Backtester (web/phone edition)...", flush=True)
+    print("Starting T58 Quant Algo Backtester (web/phone edition)...", flush=True)
     print("(First launch can take a little while to unpack -- please wait.)", flush=True)
 
     # Import here (not at module top) so this launcher's own startup
@@ -167,7 +167,7 @@ def run() -> None:
 def _pause_on_abnormal_exit(reason: str) -> None:
     print(flush=True)
     print("=" * 64, flush=True)
-    print(f"  T58 Prop Algo Backtester {reason}", flush=True)
+    print(f"  T58 Quant Algo Backtester {reason}", flush=True)
     print("=" * 64, flush=True)
     try:
         input("Press Enter to close this window...")
